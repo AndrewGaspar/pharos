@@ -9,16 +9,15 @@
 # Ubisoft login tokens ("keep me logged in") are SINGLE USE with reuse detection: every login
 # rotates the token, and presenting an already-used token revokes the whole token family. The
 # revocation also kills LIVE sessions of that family at their next ticket refresh (~10-15 min later
-# Connect shows "You have been logged out: accessed from another location"). So:
-#   * gold's token is handed to exactly one booting instance at a time (flock),
-#   * once that instance's Connect logs in, its rotated token is copied back into gold,
-#   * if a boot fails to log in, gold's creds are marked dead and further boots refuse until
-#     `aco login` is redone.
+# Connect shows "You have been logged out: accessed from another location"). So a token must never
+# exist in two prefixes: instances are created WITHOUT credentials and each logs in on its own with
+# the stored password (`aco up`), keeping a private token chain from then on.
 #
 #   aco gold                 snapshot the user's Connect prefix as gold (credentials stripped)
-#   aco login                serve gold's Connect over VNC (gvncviewer localhost:99) for a manual login
+#   aco login                serve gold's Connect over VNC (gvncviewer localhost:99) for manual use
 #   aco create <name>        reflink-clone gold (free on btrfs)
-#   aco up <name> [--res WxH] [--vnc]   boot container + Connect (consumes/rotates gold's token)
+#   aco up <name> [--res WxH] [--vnc]   boot container + Connect, logging in with the stored
+#                                       password if needed (see CREDS_FILE below)
 #   aco game <name> [--mod <dir>]       (re)start the game inside a running container
 #   aco kill-game <name>
 #   aco shot <name> [file]   full-res screenshot of the instance display
@@ -60,8 +59,7 @@ cmd_gold() {
   cp -a --reflink=always "$SRC_PREFIX" "$GOLD/prefix"
   rm -f "$GOLD/prefix/pfx.lock" "$GOLD/prefix/$CONNECT_APPDATA/$CRED" "$GOLD/prefix/$CONNECT_APPDATA/user.vdat"
   harden_settings "$GOLD/prefix"
-  touch "$GOLD/.creds-dead"
-  echo "gold snapshot at $GOLD; now run: aco login"
+  echo "gold snapshot at $GOLD"
 }
 
 cmd_login() {
@@ -70,17 +68,18 @@ cmd_login() {
   echo "View with:  gvncviewer localhost:99   — log in (keep me logged in), wait for the game to start, then quit Connect."
   podman wait "$(ctr _gold)" >/dev/null 2>&1 || true
   harden_settings "$GOLD/prefix"
-  rm -f "$GOLD/.creds-dead"
-  log "_gold: manual login complete; gold creds fresh"
+  # Never let gold hold a live token: clones would share (and eventually revoke) it.
+  rm -f "$GOLD/prefix/$CONNECT_APPDATA/$CRED"
+  log "_gold: VNC session finished; token stripped"
 }
 
 cmd_create() {
   local name=$1 dst; dst=$(inst "$1")
   [[ -e $dst ]] && die "instance $name exists"
-  [[ -e $GOLD/prefix/$CONNECT_APPDATA/user.vdat ]] || die "gold has no login yet (run: aco login)"
+  [[ -d $GOLD/prefix ]] || die "no gold snapshot (aco gold)"
   mkdir -p "$dst/out" "$dst/orig"
   cp -a --reflink=always "$GOLD/prefix" "$dst/prefix"
-  rm -f "$dst/prefix/pfx.lock" "$dst/prefix/$CONNECT_APPDATA/$CRED"   # creds are handed over at boot
+  rm -f "$dst/prefix/pfx.lock" "$dst/prefix/$CONNECT_APPDATA/$CRED"   # each instance logs in itself
   harden_settings "$dst/prefix"
   echo "created $dst"
 }
@@ -135,39 +134,66 @@ start_container() {
       exec python3 "$ACO_PROTON/proton" waitforexitandrun "$ACO_CONNECT" >>/out/run.log 2>&1' >/dev/null
 }
 
+# Scripted password login. CREDS_FILE holds two lines: email, password (chmod 600, outside the
+# repo). Text is piped to xdotool over stdin so it never appears in argv or logs. If Ubisoft asks
+# for a 2FA code, we screenshot the prompt to <inst>/out/login-2fa.png and wait for the code to be
+# written to TWOFA_FILE.
+CREDS_FILE=${ACO_CREDS:-$HOME/.config/aco-dlss/credentials}
+TWOFA_FILE=${ACO_2FA:-$HOME/.config/aco-dlss/2fa-code}
+
+logged_in_since() {  # logged_in_since <name> <line-offset>
+  tail -n +"$(($2 + 1))" "$(launcher_log "$1")" 2>/dev/null | grep -q "AccountStartupUser.*User:"
+}
+
+xclick() { cmd_keys "$1" mousemove "$2" "$3" sleep 0.2 mousedown 1 sleep 0.12 mouseup 1 sleep 0.3; }
+
+type_secret() {  # type_secret <name> <line-number-in-creds>
+  sed -n "${2}p" "$CREDS_FILE" | tr -d '\n' | podman exec -i -e DISPLAY=:99 "$(ctr "$1")" xdotool type --delay 40 --file -
+}
+
+password_login() {
+  local name=$1 n0=$2 i
+  [[ -f $CREDS_FILE ]] || { log "$name: login screen but no $CREDS_FILE; use VNC (gvncviewer localhost:99 after aco up --vnc)"; return 1; }
+  [[ $(stat -c %a "$CREDS_FILE") == 600 ]] || die "$CREDS_FILE must be chmod 600"
+  log "$name: typing credentials into the Connect login screen"
+  # Login form (2560x1600 Xvfb): email field, password field, "Log in" button.
+  xclick "$name" 1280 660; cmd_keys "$name" key ctrl+a BackSpace; type_secret "$name" 1
+  xclick "$name" 1280 765; cmd_keys "$name" key ctrl+a BackSpace; type_secret "$name" 2
+  cmd_keys "$name" keydown Return sleep 0.15 keyup Return
+  for i in $(seq 25); do logged_in_since "$name" "$n0" && return 0; sleep 1; done
+  # Probably a 2FA prompt.
+  cmd_shot "$name" "$(inst "$name")/out/login-2fa.png" >/dev/null
+  rm -f "$TWOFA_FILE"
+  log "$name: waiting for 2FA code in $TWOFA_FILE (screenshot: $(inst "$name")/out/login-2fa.png)"
+  for i in $(seq 600); do [[ -s $TWOFA_FILE ]] && break; sleep 1; done
+  [[ -s $TWOFA_FILE ]] || { log "$name: no 2FA code provided"; return 1; }
+  head -1 "$TWOFA_FILE" | tr -dc '0-9' | podman exec -i -e DISPLAY=:99 "$(ctr "$name")" xdotool type --delay 80 --file -
+  rm -f "$TWOFA_FILE"
+  cmd_keys "$name" keydown Return sleep 0.15 keyup Return
+  for i in $(seq 30); do logged_in_since "$name" "$n0" && return 0; sleep 1; done
+  cmd_shot "$name" "$(inst "$name")/out/login-failed.png" >/dev/null
+  return 1
+}
+
+# Boot an instance's container and make sure Connect is logged in. Each instance keeps its own
+# token chain (create() strips creds; tokens are never copied between prefixes).
 cmd_up() {
   local name=$1; shift
   local dst; dst=$(inst "$name")
   [[ -d $dst ]] || die "no instance $name (aco create $name)"
-  [[ $name == _gold ]] && die "use aco login for gold"
   podman container exists "$(ctr "$name")" && die "$name already up"
-  exec 9>"$INST_ROOT/.login.lock"
-  flock -w 900 9 || die "timed out waiting for login lock"
-  [[ -e $GOLD/.creds-dead ]] && die "gold creds are dead/used; redo: aco login"
-  cp -a "$GOLD/prefix/$CONNECT_APPDATA/$CRED" "$GOLD/prefix/$CONNECT_APPDATA/user.vdat" "$dst/prefix/$CONNECT_APPDATA/"
-  # From here on gold's token is consumed until we copy back the rotated one.
-  touch "$GOLD/.creds-dead"
-  local ll; ll=$(launcher_log "$name"); local n0; n0=$(wc -l < "$ll" 2>/dev/null || echo 0)
+  local n0; n0=$(wc -l < "$(launcher_log "$name")" 2>/dev/null || echo 0)
   start_container "$name" "$@"
-  log "$name: booting with gold creds"
-  local i ok=0
-  for i in $(seq 120); do
-    if tail -n +"$((n0 + 1))" "$ll" 2>/dev/null | grep -q "AccountStartupUser.*User:"; then ok=1; break; fi
-    podman container exists "$(ctr "$name")" || break
+  log "$name: booting"
+  local i
+  for i in $(seq 60); do
+    logged_in_since "$name" "$n0" && { log "$name: logged in (stored token)"; return 0; }
+    # The CEF login page takes a while to render; give it time before typing.
     sleep 1
   done
-  ((ok)) || { log "$name: Connect did NOT log in; gold creds left marked dead (redo: aco login)"; return 1; }
-  # Connect writes the rotated token shortly after login; wait for the file to settle.
-  local m0 m1; m0=$(stat -c %Y "$dst/prefix/$CONNECT_APPDATA/$CRED")
-  for i in $(seq 30); do
-    sleep 2
-    m1=$(stat -c %Y "$dst/prefix/$CONNECT_APPDATA/$CRED")
-    [[ $m1 != "$m0" ]] && { m0=$m1; continue; }
-    ((i >= 5)) && break
-  done
-  cp -a "$dst/prefix/$CONNECT_APPDATA/$CRED" "$dst/prefix/$CONNECT_APPDATA/user.vdat" "$GOLD/prefix/$CONNECT_APPDATA/"
-  rm -f "$GOLD/.creds-dead"
-  log "$name: logged in; rotated creds copied back to gold"
+  password_login "$name" "$n0" && { log "$name: logged in (password)"; return 0; }
+  log "$name: login FAILED; see $dst/out/login-*.png"
+  return 1
 }
 
 cmd_kill_game() {
