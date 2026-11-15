@@ -1,32 +1,49 @@
 #!/usr/bin/env bash
 # aco — headless AC Origins instances in podman.
 #
-#   aco gold                     snapshot the user's Connect prefix as the golden source for
-#                                instances, with Ubisoft credentials stripped.
-#   aco login                    serve gold's Connect over VNC (localhost:5999) so the user can log in
-#                                once. This gives containers their OWN login session, so their
-#                                online runs never invalidate the user's Lutris session.
-#   aco create <name>            reflink-clone the gold snapshot (free on btrfs)
-#   aco run <name> [opts]        boot Connect + ACOrigins headless in a container
-#   aco shot <name> [file]       screenshot the instance's X display
-#   aco keys <name> <xdotool...> send input (e.g. `aco keys x key Return`)
-#   aco exec <name> <cmd...>     run a command inside the instance container
-#   aco stop <name>              kill the container
-#   aco rm <name>                delete instance
+# Model: an instance is a reflink clone of a "gold" prefix. `aco up` boots a long-lived container
+# running Ubisoft Connect (logged in) on a private Xvfb; `aco game` (re)starts only the game inside
+# it, optionally with mod files applied. Connect stays up between game restarts, so the Ubisoft
+# login is only exercised once per container boot.
 #
-# run options:
-#   --mod <dir>        copy files from <dir> into the game directory before launch
-#   --res WxH          Xvfb screen size (default 2560x1600)
-#   --direct           launch ACOrigins.exe directly (Connect is auto-spawned by the game)
-#   --fg               run attached instead of detached
-#   --offline          no network (Connect cannot validate ownership offline; mostly useless)
-#   --vnc              also serve the Xvfb display over VNC on 127.0.0.1:5999
+# Ubisoft login tokens ("keep me logged in") are SINGLE USE with reuse detection: every login
+# rotates the token, and presenting an already-used token revokes the whole token family (logging
+# out every holder). So:
+#   * gold's token is handed to exactly one booting instance at a time (flock),
+#   * once that instance's Connect logs in, its rotated token is copied back into gold,
+#   * if a boot fails to log in, gold's creds are marked dead and further boots refuse until
+#     `aco login` is redone.
+#
+#   aco gold                 snapshot the user's Connect prefix as gold (credentials stripped)
+#   aco login                serve gold's Connect over VNC (gvncviewer localhost:99) for a manual login
+#   aco create <name>        reflink-clone gold (free on btrfs)
+#   aco up <name> [--res WxH] [--vnc]   boot container + Connect (consumes/rotates gold's token)
+#   aco game <name> [--mod <dir>]       (re)start the game inside a running container
+#   aco kill-game <name>
+#   aco shot <name> [file]   full-res screenshot of the instance display
+#   aco keys <name> <xdotool args...>   e.g. aco keys t1 keydown Return sleep 0.15 keyup Return
+#   aco exec <name> <cmd...>
+#   aco down <name>          stop container
+#   aco rm <name>            delete instance
 set -euo pipefail
 
 SRC_PREFIX=${ACO_SRC_PREFIX:-/home/ajg/Games/ubisoft-connect}
 INST_ROOT=${ACO_INST_ROOT:-/home/ajg/Games/aco-dlss-instances}
+PROTON=${ACO_PROTON:-$HOME/.local/share/Steam/compatibilitytools.d/GE-Proton11-12-x86_64}
+IMAGE=${ACO_IMAGE:-localhost/aco-headless:latest}
 GOLD=$INST_ROOT/_gold
+GAME_REL="drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher/games/Assassin's Creed Origins"
+UPC_REL="drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher"
 CONNECT_APPDATA="drive_c/users/steamuser/AppData/Local/Ubisoft Game Launcher"
+CRED=ConnectSecureStorage.dat
+ACO_APPID=3539
+CONNECT_WIN='C:\Program Files (x86)\Ubisoft\Ubisoft Game Launcher\UbisoftConnect.exe'
+
+die() { echo "aco: $*" >&2; exit 1; }
+log() { echo "$(date -Is) $*" >> "$INST_ROOT/.aco.log"; echo "aco: $*" >&2; }
+ctr() { echo "aco-$1"; }
+inst() { echo "$INST_ROOT/$1"; }
+launcher_log() { echo "$(inst "$1")/prefix/$UPC_REL/logs/launcher_log.txt"; }
 
 # Instances must never sync saves over the user's real progress.
 harden_settings() {
@@ -34,64 +51,139 @@ harden_settings() {
   sed -i 's/^\(\s*syncsavegames:\).*/\1 false/; s/^\(\s*offline:\).*/\1 false/' "$f"
   grep -q "syncsavegames: false" "$f" || die "failed to disable save sync in $f"
 }
-PROTON=${ACO_PROTON:-$HOME/.local/share/Steam/compatibilitytools.d/GE-Proton11-12-x86_64}
-IMAGE=${ACO_IMAGE:-localhost/aco-headless:latest}
-GAME_REL="drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher/games/Assassin's Creed Origins"
-UPC_REL="drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher"
-ACO_APPID=3539
-
-die() { echo "aco: $*" >&2; exit 1; }
-ctr() { echo "aco-$1"; }
 
 cmd_gold() {
   pgrep -i "ubisoftconnect|upc.exe|acorigins|uplaywebcore|wineserver" >/dev/null && die "quit Connect/wine on the host first"
-  if [[ -e $GOLD ]]; then mv "$GOLD" "$GOLD.old.$(date +%s)"; fi
+  [[ -e $GOLD ]] && mv "$GOLD" "$GOLD.old.$(date +%s)"
   mkdir -p "$GOLD/out" "$GOLD/orig"
   cp -a --reflink=always "$SRC_PREFIX" "$GOLD/prefix"
-  rm -f "$GOLD/prefix/pfx.lock"
-  # Strip the user's login so the containers get their own session chain.
-  rm -f "$GOLD/prefix/$CONNECT_APPDATA/ConnectSecureStorage.dat" "$GOLD/prefix/$CONNECT_APPDATA/user.vdat"
+  rm -f "$GOLD/prefix/pfx.lock" "$GOLD/prefix/$CONNECT_APPDATA/$CRED" "$GOLD/prefix/$CONNECT_APPDATA/user.vdat"
   harden_settings "$GOLD/prefix"
+  touch "$GOLD/.creds-dead"
   echo "gold snapshot at $GOLD; now run: aco login"
 }
 
 cmd_login() {
-  cmd_run _gold --vnc >/dev/null
-  echo "Connect is starting. View it with:  gvncviewer localhost:99   (log in, start Origins to the menu, quit Connect)"
+  podman container exists "$(ctr _gold)" && die "gold container already running"
+  start_container _gold --vnc
+  echo "View with:  gvncviewer localhost:99   — log in (keep me logged in), wait for the game to start, then quit Connect."
   podman wait "$(ctr _gold)" >/dev/null 2>&1 || true
   harden_settings "$GOLD/prefix"
-  echo "login session finished"
+  rm -f "$GOLD/.creds-dead"
+  log "_gold: manual login complete; gold creds fresh"
 }
 
 cmd_create() {
-  local name=$1 dst=$INST_ROOT/$1
+  local name=$1 dst; dst=$(inst "$1")
   [[ -e $dst ]] && die "instance $name exists"
-  [[ -d $GOLD ]] || die "no gold snapshot (run: aco gold)"
-  mkdir -p "$dst/out"
   [[ -e $GOLD/prefix/$CONNECT_APPDATA/user.vdat ]] || die "gold has no login yet (run: aco login)"
+  mkdir -p "$dst/out" "$dst/orig"
   cp -a --reflink=always "$GOLD/prefix" "$dst/prefix"
-  rm -f "$dst/prefix/pfx.lock"
+  rm -f "$dst/prefix/pfx.lock" "$dst/prefix/$CONNECT_APPDATA/$CRED"   # creds are handed over at boot
   harden_settings "$dst/prefix"
-  # Keep a pristine copy of every game file we may overwrite with mod files.
-  mkdir -p "$dst/orig"
   echo "created $dst"
 }
 
-cmd_run() {
+# start_container <name> [--res WxH] [--vnc]: boots Xvfb + Connect (no game launch).
+start_container() {
   local name=$1; shift
-  local dst=$INST_ROOT/$name mod="" res=2560x1600 direct=0 fg=0 net=pasta vnc=0
-  [[ -d $dst ]] || die "no instance $name (aco create $name)"
+  local dst res=2560x1600 vnc=0; dst=$(inst "$name")
   while (($#)); do
     case $1 in
-      --mod) mod=$(realpath "$2"); shift 2;;
       --res) res=$2; shift 2;;
-      --direct) direct=1; shift;;
-      --fg) fg=1; shift;;
-      --offline) net=none; shift;;
       --vnc) vnc=1; shift;;
       *) die "unknown option $1";;
     esac
   done
+  podman rm -f "$(ctr "$name")" >/dev/null 2>&1 || true
+  # CDI only injects 64-bit driver libs; 32-bit Connect helpers (upc.exe) need lib32 Vulkan.
+  local lib32=() f
+  for f in /usr/lib32/libGLX_nvidia.so* /usr/lib32/libnvidia-*.so* /usr/lib32/libEGL_nvidia.so* /usr/lib32/libcuda.so*; do
+    lib32+=(-v "$f:$f:ro")
+  done
+  local vncopt=(); ((vnc)) && vncopt=(-p 127.0.0.1:5999:5900)
+  podman run -d --rm --name "$(ctr "$name")" \
+    --hostname "$(cat /etc/hostname)" \
+    --device nvidia.com/gpu=all --userns=keep-id --user 1000:1000 --shm-size=2g \
+    --security-opt label=disable \
+    "${vncopt[@]}" \
+    -v "$dst/prefix:$SRC_PREFIX" \
+    -v "$PROTON:$PROTON:ro" \
+    -v /usr/lib/nvidia/wine:/usr/lib/nvidia/wine:ro \
+    -v "$dst/out:/out" \
+    "${lib32[@]}" \
+    -v /etc/machine-id:/etc/machine-id:ro \
+    -e HOME=/home/steamuser -e USER=steamuser \
+    -e DISPLAY=:99 -e XDG_RUNTIME_DIR=/tmp/xdg \
+    -e WINEPREFIX="$SRC_PREFIX" \
+    -e STEAM_COMPAT_DATA_PATH="$SRC_PREFIX" \
+    -e STEAM_COMPAT_CLIENT_INSTALL_PATH=/tmp/steam \
+    -e STEAM_COMPAT_APP_ID=0 -e SteamAppId=0 -e SteamGameId=0 \
+    -e PROTON_ENABLE_NVAPI=1 -e DXVK_ENABLE_NVAPI=1 -e PROTON_ENABLE_NGX_UPDATER=0 \
+    -e DXVK_LOG_PATH=/out -e DXVK_NVAPI_LOG_PATH=/out -e DXVK_NVAPI_LOG_LEVEL=info \
+    -e WINEDEBUG="${ACO_WINEDEBUG:--all}" \
+    -e WINEDLLOVERRIDES="${ACO_DLLOVERRIDES:-d3d11=n,b}" \
+    -e PROTON_LOG=1 -e PROTON_LOG_DIR=/out \
+    -e ACO_RES="$res" -e ACO_VNC="$vnc" -e ACO_PROTON="$PROTON" -e ACO_CONNECT="$CONNECT_WIN" \
+    "$IMAGE" bash -c '
+      mkdir -p /tmp/xdg /tmp/steam; chmod 700 /tmp/xdg
+      Xvfb :99 -screen 0 ${ACO_RES}x24 -nolisten tcp >/out/xvfb.log 2>&1 &
+      for i in $(seq 50); do xdpyinfo >/dev/null 2>&1 && break; sleep 0.1; done
+      [ "$ACO_VNC" = 1 ] && x11vnc -display :99 -forever -shared -nopw -quiet -rfbport 5900 >/out/vnc.log 2>&1 &
+      echo "boot $(date -Is)" >> /out/run.log
+      exec python3 "$ACO_PROTON/proton" waitforexitandrun "$ACO_CONNECT" >>/out/run.log 2>&1' >/dev/null
+}
+
+cmd_up() {
+  local name=$1; shift
+  local dst; dst=$(inst "$name")
+  [[ -d $dst ]] || die "no instance $name (aco create $name)"
+  [[ $name == _gold ]] && die "use aco login for gold"
+  podman container exists "$(ctr "$name")" && die "$name already up"
+  exec 9>"$INST_ROOT/.login.lock"
+  flock -w 900 9 || die "timed out waiting for login lock"
+  [[ -e $GOLD/.creds-dead ]] && die "gold creds are dead/used; redo: aco login"
+  cp -a "$GOLD/prefix/$CONNECT_APPDATA/$CRED" "$GOLD/prefix/$CONNECT_APPDATA/user.vdat" "$dst/prefix/$CONNECT_APPDATA/"
+  # From here on gold's token is consumed until we copy back the rotated one.
+  touch "$GOLD/.creds-dead"
+  local ll; ll=$(launcher_log "$name"); local n0; n0=$(wc -l < "$ll" 2>/dev/null || echo 0)
+  start_container "$name" "$@"
+  log "$name: booting with gold creds"
+  local i ok=0
+  for i in $(seq 120); do
+    if tail -n +"$((n0 + 1))" "$ll" 2>/dev/null | grep -q "AccountStartupUser.*User:"; then ok=1; break; fi
+    podman container exists "$(ctr "$name")" || break
+    sleep 1
+  done
+  ((ok)) || { log "$name: Connect did NOT log in; gold creds left marked dead (redo: aco login)"; return 1; }
+  # Connect writes the rotated token shortly after login; wait for the file to settle.
+  local m0 m1; m0=$(stat -c %Y "$dst/prefix/$CONNECT_APPDATA/$CRED")
+  for i in $(seq 30); do
+    sleep 2
+    m1=$(stat -c %Y "$dst/prefix/$CONNECT_APPDATA/$CRED")
+    [[ $m1 != "$m0" ]] && { m0=$m1; continue; }
+    ((i >= 5)) && break
+  done
+  cp -a "$dst/prefix/$CONNECT_APPDATA/$CRED" "$dst/prefix/$CONNECT_APPDATA/user.vdat" "$GOLD/prefix/$CONNECT_APPDATA/"
+  rm -f "$GOLD/.creds-dead"
+  log "$name: logged in; rotated creds copied back to gold"
+}
+
+cmd_kill_game() {
+  podman exec "$(ctr "$1")" bash -c 'pkill -f "ACOrigins.exe" || true; for i in $(seq 30); do pgrep -f "ACOrigins.exe" | xargs -r ps -o stat= -p | grep -qv Z || exit 0; sleep 0.5; done'
+}
+
+cmd_game() {
+  local name=$1; shift
+  local dst mod=""; dst=$(inst "$name")
+  while (($#)); do
+    case $1 in
+      --mod) mod=$(realpath "$2"); shift 2;;
+      *) die "unknown option $1";;
+    esac
+  done
+  podman container exists "$(ctr "$name")" || die "$name is not up (aco up $name)"
+  cmd_kill_game "$name"
   local game="$dst/prefix/$GAME_REL"
   # Restore originals from previous mod runs, then apply the new mod.
   if [[ -f $dst/mod-files ]]; then
@@ -102,67 +194,30 @@ cmd_run() {
   fi
   if [[ -n $mod ]]; then
     (cd "$mod" && find . -type f -printf '%P\n') | while IFS= read -r f; do
-      [[ -e "$game/$f" && ! -e "$dst/orig/$f" ]] && { mkdir -p "$(dirname "$dst/orig/$f")"; cp -a --reflink=auto "$game/$f" "$dst/orig/$f"; }
+      if [[ -e "$game/$f" && ! -e "$dst/orig/$f" ]]; then
+        mkdir -p "$(dirname "$dst/orig/$f")"; cp -a --reflink=auto "$game/$f" "$dst/orig/$f"
+      fi
       mkdir -p "$(dirname "$game/$f")"; cp -a "$mod/$f" "$game/$f"; echo "$f" >> "$dst/mod-files"
     done
   fi
-  podman rm -f "$(ctr "$name")" >/dev/null 2>&1 || true
-  local exe args
-  if ((direct)); then exe="C:\\Program Files (x86)\\Ubisoft\\Ubisoft Game Launcher\\games\\Assassin's Creed Origins\\ACOrigins.exe"; args=""
-  else exe="C:\\Program Files (x86)\\Ubisoft\\Ubisoft Game Launcher\\UbisoftConnect.exe"; args="uplay://launch/$ACO_APPID/0"; fi
-  local detach=(-d); ((fg)) && detach=()
-  # CDI only injects 64-bit driver libs; 32-bit Connect helpers (upc.exe) need lib32 Vulkan.
-  local lib32=() f
-  for f in /usr/lib32/libGLX_nvidia.so* /usr/lib32/libnvidia-*.so* /usr/lib32/libEGL_nvidia.so* /usr/lib32/libcuda.so*; do
-    lib32+=(-v "$f:$f:ro")
-  done
-  local vncopt=()
-  ((vnc)) && vncopt=(-p 127.0.0.1:5999:5900)
-  podman run "${detach[@]}" --rm --name "$(ctr "$name")" \
-    --network "$net" \
-    --device nvidia.com/gpu=all --userns=keep-id --user 1000:1000 --shm-size=2g \
-    --security-opt label=disable \
-    -v "$dst/prefix:$SRC_PREFIX" \
-    -v "$PROTON:$PROTON:ro" \
-    -v /usr/lib/nvidia/wine:/usr/lib/nvidia/wine:ro \
-    -v "$dst/out:/out" \
-    "${lib32[@]}" \
-    -v /etc/machine-id:/etc/machine-id:ro \
-    -e HOME=/home/steamuser -e USER=steamuser \
-    "${vncopt[@]}" -e ACO_VNC=$vnc \
-    -e DISPLAY=:99 -e XDG_RUNTIME_DIR=/tmp/xdg \
-    -e WINEPREFIX="$SRC_PREFIX" \
-    -e STEAM_COMPAT_DATA_PATH="$SRC_PREFIX" \
-    -e STEAM_COMPAT_CLIENT_INSTALL_PATH=/tmp/steam \
-    -e STEAM_COMPAT_APP_ID=0 -e SteamAppId=0 -e SteamGameId=0 \
-    -e PROTON_ENABLE_NVAPI=1 -e DXVK_ENABLE_NVAPI=1 -e PROTON_ENABLE_NGX_UPDATER=0 \
-    -e DXVK_LOG_PATH=/out -e DXVK_NVAPI_LOG_PATH=/out -e DXVK_NVAPI_LOG_LEVEL=info \
-    -e WINEDEBUG=${ACO_WINEDEBUG:--all} \
-    -e WINEDLLOVERRIDES="${ACO_DLLOVERRIDES:-d3d11=n,b}" \
-    -e PROTON_LOG=1 -e PROTON_LOG_DIR=/out \
-    -e ACO_RES="$res" \
-    "$IMAGE" bash -c '
-      mkdir -p /tmp/xdg /tmp/steam; chmod 700 /tmp/xdg
-      Xvfb :99 -screen 0 ${ACO_RES}x24 -nolisten tcp >/out/xvfb.log 2>&1 &
-      for i in $(seq 50); do xdpyinfo >/dev/null 2>&1 && break; sleep 0.1; done
-      [ "$ACO_VNC" = 1 ] && x11vnc -display :99 -forever -shared -nopw -quiet -rfbport 5900 >/out/vnc.log 2>&1 &
-      echo "launch $(date -Is)" > /out/run.log
-      exec python3 "'"$PROTON"'/proton" waitforexitandrun "'"$exe"'" '"$args"' >>/out/run.log 2>&1'
-  ((fg)) || echo "started $(ctr "$name"); logs in $dst/out"
+  podman exec -d -e ACO_PROTON="$PROTON" -e ACO_CONNECT="$CONNECT_WIN" "$(ctr "$name")" bash -c \
+    'echo "game $(date -Is)" >> /out/run.log; exec python3 "$ACO_PROTON/proton" run "$ACO_CONNECT" uplay://launch/'"$ACO_APPID"'/0 >>/out/run.log 2>&1'
+  echo "game launching in $name"
 }
 
 cmd_shot() {
-  local name=$1 out=${2:-$INST_ROOT/$1/out/shot-$(date +%H%M%S).png}
+  local name=$1 out=${2:-$(inst "$1")/out/shot-$(date +%H%M%S).png}
   podman exec "$(ctr "$name")" bash -c 'DISPLAY=:99 import -window root png:-' > "$out"
   echo "$out"
 }
 cmd_keys() { local name=$1; shift; podman exec -e DISPLAY=:99 "$(ctr "$name")" xdotool "$@"; }
 cmd_exec() { local name=$1; shift; podman exec -e DISPLAY=:99 "$(ctr "$name")" "$@"; }
-cmd_stop() { podman rm -f -t 3 "$(ctr "$1")"; }
-cmd_rm() { cmd_stop "$1" 2>/dev/null || true; rm -rf --one-file-system "${INST_ROOT:?}/$1"; }
+cmd_down() { podman rm -f -t 5 "$(ctr "$1")" >/dev/null; }
+cmd_rm() { cmd_down "$1" 2>/dev/null || true; rm -rf --one-file-system "${INST_ROOT:?}/${1:?}"; }
 
 c=${1:-}; shift || true
 case $c in
-  gold|login|create|run|shot|keys|exec|stop|rm) "cmd_$c" "$@";;
-  *) sed -n '2,20p' "$0"; exit 1;;
+  gold|login|create|up|game|shot|keys|exec|down|rm) "cmd_$c" "$@";;
+  kill-game) cmd_kill_game "$@";;
+  *) sed -n '2,32p' "$0"; exit 1;;
 esac
