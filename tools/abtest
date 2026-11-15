@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# abtest <instance> <crop WxH+X+Y> <label=key:val,key:val> ...
+# For each variant: patch the live aco_dlss.ini, wait for reload + DLSS convergence, take 4 shots,
+# report sharpness (Laplacian std-dev, higher = sharper) and temporal noise (mean abs diff between
+# consecutive shots, lower = more stable) on the crop.
+set -euo pipefail
+name=$1 crop=$2; shift 2
+here=$(cd "$(dirname "$0")/.." && pwd)
+ini="/home/ajg/Games/aco-dlss-instances/$name/prefix/drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher/games/Assassin's Creed Origins/aco_dlss.ini"
+out=${ABTEST_OUT:-$here/build/abtest}; mkdir -p "$out"
+for variant in "$@"; do
+  label=${variant%%=*}; kvs=${variant#*=}
+  IFS=',' read -ra pairs <<< "$kvs"
+  for kv in "${pairs[@]}"; do k=${kv%%:*}; v=${kv#*:}; sed -i "s/^$k=.*/$k=$v/" "$ini"; done
+  sleep 4
+  sharp=0; noise=0
+  for i in 0 1 2 3; do
+    "$here/scripts/aco" shot "$name" "$out/$label-$i.png" >/dev/null
+    magick "$out/$label-$i.png" -crop "$crop" +repage -colorspace gray "$out/$label-$i-c.png"
+    s=$(magick "$out/$label-$i-c.png" -morphology Convolve Laplacian:0 -format "%[fx:standard_deviation*1000]" info:)
+    sharp=$(awk "BEGIN{print $sharp + $s/4}")
+    if ((i > 0)); then
+      d=$( (magick compare -metric MAE "$out/$label-$((i-1))-c.png" "$out/$label-$i-c.png" null: 2>&1 || true) | sed -n 's/.*(\(.*\)).*/\1/p')
+      noise=$(awk "BEGIN{print $noise + $d*1000/3}")
+    fi
+    sleep 0.35
+  done
+  printf "%-14s sharpness=%7.2f  temporal_noise=%6.2f\n" "$label" "$sharp" "$noise"
+done

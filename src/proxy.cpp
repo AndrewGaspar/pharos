@@ -48,12 +48,27 @@ T real_proc(const char* name) {
 
 // ---- DXGI hooks --------------------------------------------------------------------------------
 
+// Time spent inside the real Present (presentation/back-pressure), reported every ~2 s.
+double g_present_ms = 0;
+int g_present_n = 0;
+
 HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain* self, UINT sync, UINT flags) {
   if (!(flags & DXGI_PRESENT_TEST)) {
     trace_on_present(self);
     upscaler_on_present(self);
   }
-  return orig<decltype(hk_Present)>(self, SwapChain_Present)(self, sync, flags);
+  LARGE_INTEGER a, b, f;
+  QueryPerformanceCounter(&a);
+  HRESULT hr = orig<decltype(hk_Present)>(self, SwapChain_Present)(self, sync, flags);
+  QueryPerformanceCounter(&b);
+  QueryPerformanceFrequency(&f);
+  g_present_ms += 1000.0 * double(b.QuadPart - a.QuadPart) / double(f.QuadPart);
+  if (++g_present_n == 128) {
+    ACO_LOG("perf: Present() avg %.2f ms (sync=%u)", g_present_ms / g_present_n, sync);
+    g_present_ms = 0;
+    g_present_n = 0;
+  }
+  return hr;
 }
 HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1* self, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* p) {
   if (!(flags & DXGI_PRESENT_TEST)) {

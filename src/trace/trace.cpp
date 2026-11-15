@@ -28,7 +28,6 @@ constexpr int kCaptureFrames = 3;
 
 std::atomic<int> g_capture_left{0};  // frames left to capture (0 = idle)
 std::atomic<uint64_t> g_frame{0};
-std::atomic<uint64_t> g_draws_imm{0}, g_draws_def{0}, g_dispatch_imm{0}, g_dispatch_def{0};
 ID3D11DeviceContext* g_immediate = nullptr;
 
 std::mutex g_cap_mutex;
@@ -314,12 +313,10 @@ bool trace_capturing() { return capturing(); }
 void trace_set_immediate(ID3D11DeviceContext* ctx) { g_immediate = ctx; }
 
 void trace_draw(ID3D11DeviceContext* ctx, const char* op, const char* args) {
-  (ctx == g_immediate ? g_draws_imm : g_draws_def).fetch_add(1, std::memory_order_relaxed);
   if (capturing()) record_draw(ctx, op, args);
 }
 
 void trace_dispatch(ID3D11DeviceContext* ctx, const char* op, const char* args) {
-  (ctx == g_immediate ? g_dispatch_imm : g_dispatch_def).fetch_add(1, std::memory_order_relaxed);
   if (capturing()) record_dispatch(ctx, op, args);
 }
 
@@ -407,11 +404,6 @@ void trace_execute_command_list(ID3D11DeviceContext* ctx, ID3D11CommandList* cl)
 
 void trace_on_present(IDXGISwapChain* sc) {
   uint64_t frame = g_frame.fetch_add(1) + 1;
-  if (frame == 300 || frame == 3000) {
-    ACO_LOG("frame %llu: draws imm=%llu def=%llu dispatch imm=%llu def=%llu", (unsigned long long)frame,
-            (unsigned long long)g_draws_imm.load(), (unsigned long long)g_draws_def.load(),
-            (unsigned long long)g_dispatch_imm.load(), (unsigned long long)g_dispatch_def.load());
-  }
   if (g_preroll) {
     g_preroll = false;
     g_capture_left.store(kCaptureFrames);

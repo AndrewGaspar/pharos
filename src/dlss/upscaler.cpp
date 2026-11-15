@@ -98,6 +98,60 @@ struct Chain final : IUnknown {
 // {6b1e0f6a-6f0e-4a63-9a0e-acd1550c0de5}
 constexpr GUID kChainGuid = {0x6b1e0f6a, 0x6f0e, 0x4a63, {0x9a, 0x0e, 0xac, 0xd1, 0x55, 0x0c, 0x0d, 0xe5}};
 
+// GPU timing of our work on the immediate context (ring of timestamp query sets, read back
+// without stalling a few frames later).
+struct GpuTimer {
+  static constexpr int kRing = 8;
+  ID3D11Query* disjoint[kRing] = {};
+  ID3D11Query* begin[kRing] = {};
+  ID3D11Query* end[kRing] = {};
+  bool pending[kRing] = {};
+  int next = 0;
+  double total_ms = 0;
+  int samples = 0;
+
+  void init(ID3D11Device* dev) {
+    D3D11_QUERY_DESC d = {D3D11_QUERY_TIMESTAMP_DISJOINT, 0};
+    D3D11_QUERY_DESC t = {D3D11_QUERY_TIMESTAMP, 0};
+    for (int i = 0; i < kRing; ++i) {
+      dev->CreateQuery(&d, &disjoint[i]);
+      dev->CreateQuery(&t, &begin[i]);
+      dev->CreateQuery(&t, &end[i]);
+    }
+  }
+  void collect(ID3D11DeviceContext* c) {
+    for (int i = 0; i < kRing; ++i) {
+      if (!pending[i]) continue;
+      D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj;
+      UINT64 b, e;
+      if (c->GetData(disjoint[i], &dj, sizeof(dj), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) continue;
+      if (c->GetData(begin[i], &b, sizeof(b), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) continue;
+      if (c->GetData(end[i], &e, sizeof(e), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) continue;
+      pending[i] = false;
+      if (!dj.Disjoint && dj.Frequency) {
+        total_ms += 1000.0 * double(e - b) / double(dj.Frequency);
+        ++samples;
+      }
+    }
+  }
+  int start(ID3D11DeviceContext* c) {
+    if (!disjoint[0]) return -1;
+    collect(c);
+    int i = next;
+    if (pending[i]) return -1;  // ring full; skip timing this frame
+    next = (next + 1) % kRing;
+    c->Begin(disjoint[i]);
+    c->End(begin[i]);
+    return i;
+  }
+  void stop(ID3D11DeviceContext* c, int i) {
+    if (i < 0) return;
+    c->End(end[i]);
+    c->End(disjoint[i]);
+    pending[i] = true;
+  }
+};
+
 struct State {
   ID3D11Device* dev = nullptr;
   ID3D11Device1* dev1 = nullptr;
@@ -134,6 +188,12 @@ struct State {
   uint64_t last_job_frame = 0;
   int eval_failures = 0;
   LARGE_INTEGER last_eval_time{};
+
+  GpuTimer gpu_timer;
+  LARGE_INTEGER perf_last{};
+  uint64_t perf_frames = 0;
+  double perf_max_ms = 0;
+  LARGE_INTEGER frame_last{};
 
   std::atomic<uint32_t> display_w{0}, display_h{0};
   std::atomic<uint64_t> frame{0};
@@ -377,6 +437,7 @@ void run_job(const Job& job) {
 
   const Config& cfg = config();
   bool done = false;
+  int timer = S.gpu_timer.start(S.imm);
   if (cfg.debug == "motion") {
     blit(S.mv_srv, job.render_w, job.render_h, kernels::kBlitMotion, 0.05f);
     done = true;
@@ -387,6 +448,7 @@ void run_job(const Job& job) {
     done = evaluate_dlss(job);
   }
   if (!done) blit(srv_for(job.color), job.render_w, job.render_h, kernels::kBlitColor, 1.0f);
+  S.gpu_timer.stop(S.imm, timer);
 
   S.imm1->SwapDeviceContextState(prev, nullptr);
   if (prev) prev->Release();
@@ -632,11 +694,38 @@ void upscaler_init(ID3D11Device* dev, ID3D11DeviceContext* immediate) {
   HRESULT hr = S.dev1 ? S.dev1->CreateDeviceContextState(0, &fl, 1, D3D11_SDK_VERSION, __uuidof(ID3D11Device1), nullptr,
                                                          &S.own_state)
                       : E_NOINTERFACE;
+  S.gpu_timer = GpuTimer();
+  S.gpu_timer.init(dev);
   ACO_LOG("upscaler: init (device context state 0x%08lx)", hr);
 }
 
 void upscaler_on_present(IDXGISwapChain* sc) {
   uint64_t f = S.frame.fetch_add(1) + 1;
+  // Perf report every ~2 s: CPU frame pacing and GPU time spent in our upscaling work.
+  LARGE_INTEGER now, freq;
+  QueryPerformanceCounter(&now);
+  QueryPerformanceFrequency(&freq);
+  if (S.frame_last.QuadPart) {
+    double ms = 1000.0 * double(now.QuadPart - S.frame_last.QuadPart) / double(freq.QuadPart);
+    if (ms > S.perf_max_ms) S.perf_max_ms = ms;
+  }
+  S.frame_last = now;
+  ++S.perf_frames;
+  if (!S.perf_last.QuadPart) S.perf_last = now;
+  double elapsed = double(now.QuadPart - S.perf_last.QuadPart) / double(freq.QuadPart);
+  if (elapsed >= 2.0) {
+    const Config& cfg = config();
+    double gpu = S.gpu_timer.samples ? S.gpu_timer.total_ms / S.gpu_timer.samples : 0.0;
+    ACO_LOG("perf: %.1f fps (%.2f ms avg, %.2f ms worst) | upscale gpu %.3f ms [%s%s] render %ux%u -> %ux%u",
+            S.perf_frames / elapsed, 1000.0 * elapsed / S.perf_frames, S.perf_max_ms, gpu,
+            cfg.enabled ? cfg.backend.c_str() : "game-taa", cfg.debug == "none" ? "" : (" debug=" + cfg.debug).c_str(),
+            S.mv_w, S.mv_h, S.out_w, S.out_h);
+    S.perf_last = now;
+    S.perf_frames = 0;
+    S.perf_max_ms = 0;
+    S.gpu_timer.total_ms = 0;
+    S.gpu_timer.samples = 0;
+  }
   if (f == 1 || f % 64 == 0) {
     DXGI_SWAP_CHAIN_DESC d;
     if (SUCCEEDED(sc->GetDesc(&d))) {

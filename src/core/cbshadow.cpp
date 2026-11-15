@@ -37,25 +37,31 @@ struct Shadow {
 };
 
 std::atomic<bool> g_all{false};
+// Watched buffers: tiny lock-free array checked before doing any work in Map (hot path).
+constexpr size_t kMaxWatched = 32;
+std::atomic<ID3D11Resource*> g_watch_list[kMaxWatched];
 std::atomic<size_t> g_watch_count{0};
+
+bool is_watched(ID3D11Resource* r) {
+  size_t n = g_watch_count.load(std::memory_order_acquire);
+  for (size_t i = 0; i < n; ++i)
+    if (g_watch_list[i].load(std::memory_order_relaxed) == r) return true;
+  return false;
+}
 std::mutex g_mutex;
 std::unordered_map<Key, Shadow, KeyHash> g_shadows;
-std::unordered_set<ID3D11Resource*> g_watched;
 std::unordered_map<ID3D11Resource*, ID3D11DeviceContext*> g_last_writer;
 
 // Returns the buffer's size if it should be shadowed, else 0.
 uint32_t shadow_size(ID3D11Resource* res) {
-  if (!g_all.load(std::memory_order_relaxed) && g_watch_count.load(std::memory_order_relaxed) == 0) return 0;
+  bool all = g_all.load(std::memory_order_relaxed);
+  if (!all && !is_watched(res)) return 0;
   D3D11_RESOURCE_DIMENSION dim;
   res->GetType(&dim);
   if (dim != D3D11_RESOURCE_DIMENSION_BUFFER) return 0;
   D3D11_BUFFER_DESC d;
   static_cast<ID3D11Buffer*>(res)->GetDesc(&d);
   if (!(d.BindFlags & D3D11_BIND_CONSTANT_BUFFER) || d.ByteWidth > kMaxShadowBytes) return 0;
-  if (!g_all.load(std::memory_order_relaxed)) {
-    std::lock_guard lock(g_mutex);
-    if (!g_watched.count(res)) return 0;
-  }
   return d.ByteWidth;
 }
 
@@ -74,7 +80,7 @@ HRESULT STDMETHODCALLTYPE hk_Map(ID3D11DeviceContext* self, ID3D11Resource* res,
 }
 
 void STDMETHODCALLTYPE hk_Unmap(ID3D11DeviceContext* self, ID3D11Resource* res, UINT sub) {
-  {
+  if (g_all.load(std::memory_order_relaxed) || is_watched(res)) {
     std::lock_guard lock(g_mutex);
     auto it = g_shadows.find({self, res});
     if (it != g_shadows.end() && it->second.mapped) {
@@ -88,7 +94,7 @@ void STDMETHODCALLTYPE hk_Unmap(ID3D11DeviceContext* self, ID3D11Resource* res, 
 
 void STDMETHODCALLTYPE hk_UpdateSubresource(ID3D11DeviceContext* self, ID3D11Resource* res, UINT sub, const D3D11_BOX* box,
                                             const void* data, UINT rowpitch, UINT depthpitch) {
-  if (data) {
+  if (data && (g_all.load(std::memory_order_relaxed) || is_watched(res))) {
     if (uint32_t size = shadow_size(res)) {
       std::lock_guard lock(g_mutex);
       auto& s = g_shadows[{self, res}];
@@ -113,8 +119,13 @@ void cbshadow_install(ID3D11DeviceContext* ctx) {
 void cbshadow_set_all(bool enabled) { g_all.store(enabled); }
 
 void cbshadow_watch(ID3D11Buffer* buf) {
+  if (is_watched(buf)) return;
   std::lock_guard lock(g_mutex);
-  if (g_watched.insert(buf).second) g_watch_count.store(g_watched.size());
+  if (is_watched(buf)) return;
+  size_t n = g_watch_count.load();
+  if (n >= kMaxWatched) return;
+  g_watch_list[n].store(buf, std::memory_order_relaxed);
+  g_watch_count.store(n + 1, std::memory_order_release);
 }
 
 bool cbshadow_read(ID3D11DeviceContext* ctx, ID3D11Buffer* buf, uint32_t offset, uint32_t size, void* out) {

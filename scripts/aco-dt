@@ -18,7 +18,7 @@ STATES=(
   "menu|600x110+205+537|menu.png"
 )
 
-grab() { podman exec "aco-$name" bash -c 'DISPLAY=:99 import -window root png:-' > "$tmp/full.png"; }
+grab() { "$aco" shot "$name" "$tmp/full.png" >/dev/null; }
 
 # Prints the matching state name, or "unknown".
 classify() {

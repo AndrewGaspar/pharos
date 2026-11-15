@@ -26,3 +26,6 @@ WORKDIR /home/steamuser
 # VNC for the one-time interactive login (Wine text input via Hyprland's Xwayland is unreliable).
 USER root
 RUN pacman -Sy --noconfirm --needed x11vnc && pacman -Scc --noconfirm
+
+# gamescope headless: GPU-native presentation (Xvfb forces a ~70 ms/frame CPU copy on NVIDIA).
+RUN pacman -Sy --noconfirm --needed gamescope xorg-xwayland && pacman -Scc --noconfirm

@@ -84,14 +84,20 @@ cmd_create() {
   echo "created $dst"
 }
 
-# start_container <name> [--res WxH] [--vnc]: boots Xvfb + Connect (no game launch).
+# start_container <name> [--res WxH] [--vnc] [--xvfb]: boots the display + Connect (no game).
+#
+# Display: gamescope --backend headless by default. Its WSI layer presents GPU-side, so frame
+# rates are representative (Xvfb makes NVIDIA's Vulkan present do a ~70 ms CPU copy per frame).
+# --xvfb (implied by --vnc) uses Xvfb instead; the scripted login's click coordinates assume it.
+# Either way the X display is :0 inside the container.
 start_container() {
   local name=$1; shift
-  local dst res=2560x1600 vnc=0; dst=$(inst "$name")
+  local dst res=2560x1600 vnc=0 xvfb=0; dst=$(inst "$name")
   while (($#)); do
     case $1 in
       --res) res=$2; shift 2;;
-      --vnc) vnc=1; shift;;
+      --vnc) vnc=1; xvfb=1; shift;;
+      --xvfb) xvfb=1; shift;;
       *) die "unknown option $1";;
     esac
   done
@@ -114,7 +120,7 @@ start_container() {
     "${lib32[@]}" \
     -v /etc/machine-id:/etc/machine-id:ro \
     -e HOME=/home/steamuser -e USER=steamuser \
-    -e DISPLAY=:99 -e XDG_RUNTIME_DIR=/tmp/xdg \
+    -e DISPLAY=:0 -e XDG_RUNTIME_DIR=/tmp/xdg -e ACO_XVFB="$xvfb" \
     -e WINEPREFIX="$SRC_PREFIX" \
     -e STEAM_COMPAT_DATA_PATH="$SRC_PREFIX" \
     -e STEAM_COMPAT_CLIENT_INSTALL_PATH=/tmp/steam \
@@ -127,11 +133,18 @@ start_container() {
     -e ACO_RES="$res" -e ACO_VNC="$vnc" -e ACO_PROTON="$PROTON" -e ACO_CONNECT="$CONNECT_WIN" \
     "$IMAGE" bash -c '
       mkdir -p /tmp/xdg /tmp/steam; chmod 700 /tmp/xdg
-      Xvfb :99 -screen 0 ${ACO_RES}x24 -nolisten tcp >/out/xvfb.log 2>&1 &
-      for i in $(seq 50); do xdpyinfo >/dev/null 2>&1 && break; sleep 0.1; done
-      [ "$ACO_VNC" = 1 ] && x11vnc -display :99 -forever -shared -nopw -quiet -rfbport 5900 >/out/vnc.log 2>&1 &
-      echo "boot $(date -Is)" >> /out/run.log
-      exec python3 "$ACO_PROTON/proton" waitforexitandrun "$ACO_CONNECT" >>/out/run.log 2>&1' >/dev/null
+      echo "boot $(date -Is) xvfb=$ACO_XVFB" >> /out/run.log
+      run_connect() { exec python3 "$ACO_PROTON/proton" waitforexitandrun "$ACO_CONNECT" >>/out/run.log 2>&1; }
+      if [ "$ACO_XVFB" = 1 ]; then
+        Xvfb :0 -screen 0 ${ACO_RES}x24 -nolisten tcp >/out/xvfb.log 2>&1 &
+        for i in $(seq 50); do xdpyinfo >/dev/null 2>&1 && break; sleep 0.1; done
+        [ "$ACO_VNC" = 1 ] && x11vnc -display :0 -forever -shared -nopw -quiet -rfbport 5900 >/out/vnc.log 2>&1 &
+        run_connect
+      else
+        W=${ACO_RES%x*}; H=${ACO_RES#*x}
+        export -f run_connect
+        exec gamescope --backend headless -W $W -H $H -w $W -h $H -r 165 -- bash -c run_connect >/out/gamescope.log 2>&1
+      fi' >/dev/null
 }
 
 # Scripted password login. CREDS_FILE holds two lines: email, password (chmod 600, outside the
@@ -148,7 +161,7 @@ logged_in_since() {  # logged_in_since <name> <line-offset>
 xclick() { cmd_keys "$1" mousemove "$2" "$3" sleep 0.2 mousedown 1 sleep 0.12 mouseup 1 sleep 0.3; }
 
 type_secret() {  # type_secret <name> <line-number-in-creds>
-  sed -n "${2}p" "$CREDS_FILE" | tr -d '\n' | podman exec -i -e DISPLAY=:99 "$(ctr "$1")" xdotool type --delay 40 --file -
+  sed -n "${2}p" "$CREDS_FILE" | tr -d '\n' | podman exec -i "$(ctr "$1")" xdotool type --delay 40 --file -
 }
 
 password_login() {
@@ -169,7 +182,7 @@ password_login() {
   xclick "$name" 1092 842; sleep 0.5; xclick "$name" 1280 685  # ticking adds a "Device name" field and re-centers the form
   for i in $(seq 600); do [[ -s $TWOFA_FILE ]] && break; sleep 1; done
   [[ -s $TWOFA_FILE ]] || { log "$name: no 2FA code provided"; return 1; }
-  head -1 "$TWOFA_FILE" | tr -dc '0-9' | podman exec -i -e DISPLAY=:99 "$(ctr "$name")" xdotool type --delay 80 --file -
+  head -1 "$TWOFA_FILE" | tr -dc '0-9' | podman exec -i "$(ctr "$name")" xdotool type --delay 80 --file -
   rm -f "$TWOFA_FILE"
   cmd_keys "$name" keydown Return sleep 0.15 keyup Return
   for i in $(seq 30); do logged_in_since "$name" "$n0" && return 0; sleep 1; done
@@ -230,18 +243,30 @@ cmd_game() {
       mkdir -p "$(dirname "$game/$f")"; cp -a "$mod/$f" "$game/$f"; echo "$f" >> "$dst/mod-files"
     done
   fi
-  podman exec -d -e ACO_DLSS_OUT='Z:\out' -e ACO_PROTON="$PROTON" -e ACO_CONNECT="$CONNECT_WIN" "$(ctr "$name")" bash -c \
+  podman exec -d ${DXVK_HUD:+-e DXVK_HUD=$DXVK_HUD} -e ACO_DLSS_OUT='Z:\out' -e ACO_PROTON="$PROTON" -e ACO_CONNECT="$CONNECT_WIN" "$(ctr "$name")" bash -c \
     'echo "game $(date -Is)" >> /out/run.log; exec python3 "$ACO_PROTON/proton" run "$ACO_CONNECT" uplay://launch/'"$ACO_APPID"'/0 >>/out/run.log 2>&1'
   echo "game launching in $name"
 }
 
+# Screenshot of what the display shows. Under gamescope we ask it for a composited screenshot
+# (the X root window doesn't contain GPU-presented content there).
 cmd_shot() {
   local name=$1 out=${2:-$(inst "$1")/out/shot-$(date +%H%M%S).png}
-  podman exec "$(ctr "$name")" bash -c 'DISPLAY=:99 import -window root png:-' > "$out"
+  podman exec "$(ctr "$name")" bash -c '
+    if [ "$ACO_XVFB" = 1 ]; then exec import -window root png:-; fi
+    rm -f /tmp/gamescope.png
+    xprop -root -f GAMESCOPECTRL_REQUEST_SCREENSHOT 32c -set GAMESCOPECTRL_REQUEST_SCREENSHOT 1
+    for i in $(seq 100); do
+      if [ -s /tmp/gamescope.png ]; then s1=$(stat -c %s /tmp/gamescope.png); sleep 0.05
+        [ "$s1" = "$(stat -c %s /tmp/gamescope.png)" ] && break; fi
+      sleep 0.05
+    done
+    cat /tmp/gamescope.png' > "$out"
+  [[ -s $out ]] || die "screenshot failed"
   echo "$out"
 }
-cmd_keys() { local name=$1; shift; podman exec -e DISPLAY=:99 "$(ctr "$name")" xdotool "$@"; }
-cmd_exec() { local name=$1; shift; podman exec -e DISPLAY=:99 "$(ctr "$name")" "$@"; }
+cmd_keys() { local name=$1; shift; podman exec "$(ctr "$name")" xdotool "$@"; }
+cmd_exec() { local name=$1; shift; podman exec "$(ctr "$name")" "$@"; }
 cmd_down() { podman rm -f -t 5 "$(ctr "$1")" >/dev/null; }
 cmd_rm() { cmd_down "$1" 2>/dev/null || true; rm -rf --one-file-system "${INST_ROOT:?}/${1:?}"; }
 
