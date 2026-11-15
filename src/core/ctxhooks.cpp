@@ -1,0 +1,265 @@
+#include "core/ctxhooks.h"
+
+#include <windows.h>
+#include <d3d11_1.h>
+
+#include <atomic>
+#include <cstdio>
+#include <mutex>
+
+#include "core/cbshadow.h"
+#include "core/hook.h"
+#include "core/log.h"
+#include "core/shaders.h"
+#include "core/vtidx.h"
+#include "dlss/upscaler.h"
+#include "trace/trace.h"
+
+namespace aco {
+
+namespace {
+
+using namespace vt;
+
+ID3D11DeviceContext* g_immediate = nullptr;
+
+// Per-context class of the bound pixel shader. Contexts are few (immediate + ~9 deferred), so a
+// small linear table keeps lookups lock-free.
+struct CtxState {
+  std::atomic<ID3D11DeviceContext*> ctx{nullptr};
+  std::atomic<ShaderClass> ps{ShaderClass::None};
+};
+constexpr size_t kMaxContexts = 64;
+CtxState g_ctx[kMaxContexts];
+std::mutex g_ctx_mutex;
+
+CtxState* state_for(ID3D11DeviceContext* ctx) {
+  for (auto& s : g_ctx) {
+    ID3D11DeviceContext* c = s.ctx.load(std::memory_order_acquire);
+    if (c == ctx) return &s;
+    if (!c) break;
+  }
+  std::lock_guard lock(g_ctx_mutex);
+  for (auto& s : g_ctx) {
+    ID3D11DeviceContext* c = s.ctx.load();
+    if (c == ctx) return &s;
+    if (!c) {
+      s.ps.store(ShaderClass::None);
+      s.ctx.store(ctx, std::memory_order_release);
+      return &s;
+    }
+  }
+  return nullptr;
+}
+
+inline ShaderClass ps_class(ID3D11DeviceContext* ctx) {
+  CtxState* s = state_for(ctx);
+  return s ? s->ps.load(std::memory_order_relaxed) : ShaderClass::None;
+}
+
+#define ORIG(T, slot) orig<T>(self, slot)
+
+// ---- context hooks ---------------------------------------------------------------------------
+
+void STDMETHODCALLTYPE hk_PSSetShader(ID3D11DeviceContext* self, ID3D11PixelShader* ps, ID3D11ClassInstance* const* ci, UINT n) {
+  if (CtxState* s = state_for(self)) s->ps.store(shader_class_fast(ps), std::memory_order_relaxed);
+  ORIG(decltype(hk_PSSetShader), Context_PSSetShader)(self, ps, ci, n);
+}
+
+void STDMETHODCALLTYPE hk_ClearState(ID3D11DeviceContext* self) {
+  if (CtxState* s = state_for(self)) s->ps.store(ShaderClass::None, std::memory_order_relaxed);
+  ORIG(decltype(hk_ClearState), Context_ClearState)(self);
+}
+
+// Common draw path: trace, then let the upscaler intercept classified passes.
+template <typename F>
+inline void draw_common(ID3D11DeviceContext* self, const char* op, const char* args, F&& issue) {
+  trace_draw(self, op, args);
+  ShaderClass c = ps_class(self);
+  if (c != ShaderClass::None && upscaler_on_draw(self, c, issue)) return;
+  issue();
+}
+
+void STDMETHODCALLTYPE hk_Draw(ID3D11DeviceContext* self, UINT a, UINT b) {
+  char args[64] = "";
+  if (trace_capturing()) snprintf(args, sizeof(args), "%u,%u", a, b);
+  draw_common(self, "Draw", args, [&] { ORIG(decltype(hk_Draw), Context_Draw)(self, a, b); });
+}
+void STDMETHODCALLTYPE hk_DrawIndexed(ID3D11DeviceContext* self, UINT a, UINT b, INT c) {
+  char args[64] = "";
+  if (trace_capturing()) snprintf(args, sizeof(args), "%u,%u,%d", a, b, c);
+  draw_common(self, "DrawIndexed", args, [&] { ORIG(decltype(hk_DrawIndexed), Context_DrawIndexed)(self, a, b, c); });
+}
+void STDMETHODCALLTYPE hk_DrawInstanced(ID3D11DeviceContext* self, UINT a, UINT b, UINT c, UINT d) {
+  char args[64] = "";
+  if (trace_capturing()) snprintf(args, sizeof(args), "%u,%u,%u,%u", a, b, c, d);
+  draw_common(self, "DrawInstanced", args,
+              [&] { ORIG(decltype(hk_DrawInstanced), Context_DrawInstanced)(self, a, b, c, d); });
+}
+void STDMETHODCALLTYPE hk_DrawIndexedInstanced(ID3D11DeviceContext* self, UINT a, UINT b, UINT c, INT d, UINT e) {
+  char args[80] = "";
+  if (trace_capturing()) snprintf(args, sizeof(args), "%u,%u,%u,%d,%u", a, b, c, d, e);
+  draw_common(self, "DrawIndexedInstanced", args,
+              [&] { ORIG(decltype(hk_DrawIndexedInstanced), Context_DrawIndexedInstanced)(self, a, b, c, d, e); });
+}
+void STDMETHODCALLTYPE hk_DrawIndexedInstancedIndirect(ID3D11DeviceContext* self, ID3D11Buffer* buf, UINT off) {
+  char args[64] = "";
+  if (trace_capturing()) snprintf(args, sizeof(args), "\"%p\",%u", static_cast<void*>(buf), off);
+  draw_common(self, "DrawIndexedInstancedIndirect", args, [&] {
+    ORIG(decltype(hk_DrawIndexedInstancedIndirect), Context_DrawIndexedInstancedIndirect)(self, buf, off);
+  });
+}
+void STDMETHODCALLTYPE hk_DrawInstancedIndirect(ID3D11DeviceContext* self, ID3D11Buffer* buf, UINT off) {
+  char args[64] = "";
+  if (trace_capturing()) snprintf(args, sizeof(args), "\"%p\",%u", static_cast<void*>(buf), off);
+  draw_common(self, "DrawInstancedIndirect", args,
+              [&] { ORIG(decltype(hk_DrawInstancedIndirect), Context_DrawInstancedIndirect)(self, buf, off); });
+}
+void STDMETHODCALLTYPE hk_Dispatch(ID3D11DeviceContext* self, UINT x, UINT y, UINT z) {
+  if (trace_capturing()) {
+    char args[64];
+    snprintf(args, sizeof(args), "%u,%u,%u", x, y, z);
+    trace_dispatch(self, "Dispatch", args);
+  } else {
+    trace_dispatch(self, "Dispatch", "");
+  }
+  ORIG(decltype(hk_Dispatch), Context_Dispatch)(self, x, y, z);
+}
+void STDMETHODCALLTYPE hk_DispatchIndirect(ID3D11DeviceContext* self, ID3D11Buffer* buf, UINT off) {
+  char args[64] = "";
+  if (trace_capturing()) snprintf(args, sizeof(args), "\"%p\",%u", static_cast<void*>(buf), off);
+  trace_dispatch(self, "DispatchIndirect", args);
+  ORIG(decltype(hk_DispatchIndirect), Context_DispatchIndirect)(self, buf, off);
+}
+void STDMETHODCALLTYPE hk_CopyResource(ID3D11DeviceContext* self, ID3D11Resource* dst, ID3D11Resource* src) {
+  trace_copy_resource(self, dst, src);
+  ORIG(decltype(hk_CopyResource), Context_CopyResource)(self, dst, src);
+}
+void STDMETHODCALLTYPE hk_CopySubresourceRegion(ID3D11DeviceContext* self, ID3D11Resource* dst, UINT dsub, UINT x, UINT y,
+                                                UINT z, ID3D11Resource* src, UINT ssub, const D3D11_BOX* box) {
+  trace_copy_subresource(self, dst, dsub, x, y, z, src, ssub, box);
+  ORIG(decltype(hk_CopySubresourceRegion), Context_CopySubresourceRegion)(self, dst, dsub, x, y, z, src, ssub, box);
+}
+void STDMETHODCALLTYPE hk_ClearRenderTargetView(ID3D11DeviceContext* self, ID3D11RenderTargetView* v, const FLOAT c[4]) {
+  trace_clear_rtv(self, v, c);
+  ORIG(decltype(hk_ClearRenderTargetView), Context_ClearRenderTargetView)(self, v, c);
+}
+void STDMETHODCALLTYPE hk_ClearDepthStencilView(ID3D11DeviceContext* self, ID3D11DepthStencilView* v, UINT f, FLOAT d,
+                                                UINT8 st) {
+  trace_clear_dsv(self, v, f, d, st);
+  ORIG(decltype(hk_ClearDepthStencilView), Context_ClearDepthStencilView)(self, v, f, d, st);
+}
+void STDMETHODCALLTYPE hk_ClearUAVFloat(ID3D11DeviceContext* self, ID3D11UnorderedAccessView* v, const FLOAT c[4]) {
+  trace_clear_uav(self, v, true);
+  ORIG(decltype(hk_ClearUAVFloat), Context_ClearUnorderedAccessViewFloat)(self, v, c);
+}
+void STDMETHODCALLTYPE hk_ClearUAVUint(ID3D11DeviceContext* self, ID3D11UnorderedAccessView* v, const UINT c[4]) {
+  trace_clear_uav(self, v, false);
+  ORIG(decltype(hk_ClearUAVUint), Context_ClearUnorderedAccessViewUint)(self, v, c);
+}
+HRESULT STDMETHODCALLTYPE hk_FinishCommandList(ID3D11DeviceContext* self, BOOL restore, ID3D11CommandList** out) {
+  HRESULT hr = ORIG(decltype(hk_FinishCommandList), Context_FinishCommandList)(self, restore, out);
+  if (!restore)
+    if (CtxState* s = state_for(self)) s->ps.store(ShaderClass::None, std::memory_order_relaxed);
+  if (SUCCEEDED(hr) && out && *out) {
+    trace_finish_command_list(self, *out);
+    upscaler_on_finish_command_list(self, *out);
+  }
+  return hr;
+}
+void STDMETHODCALLTYPE hk_ExecuteCommandList(ID3D11DeviceContext* self, ID3D11CommandList* cl, BOOL restore) {
+  trace_execute_command_list(self, cl);
+  if (!upscaler_on_execute_command_list(self, cl, restore))
+    ORIG(decltype(hk_ExecuteCommandList), Context_ExecuteCommandList)(self, cl, restore);
+  if (!restore)
+    if (CtxState* s = state_for(self)) s->ps.store(ShaderClass::None, std::memory_order_relaxed);
+}
+
+// ---- device hooks ----------------------------------------------------------------------------
+
+HRESULT STDMETHODCALLTYPE hk_CreateVertexShader(ID3D11Device* self, const void* bc, SIZE_T n, ID3D11ClassLinkage* l,
+                                                ID3D11VertexShader** out) {
+  HRESULT hr = ORIG(decltype(hk_CreateVertexShader), Device_CreateVertexShader)(self, bc, n, l, out);
+  if (SUCCEEDED(hr) && out) shaders_register(*out, ShaderKind::VS, bc, n);
+  return hr;
+}
+HRESULT STDMETHODCALLTYPE hk_CreatePixelShader(ID3D11Device* self, const void* bc, SIZE_T n, ID3D11ClassLinkage* l,
+                                               ID3D11PixelShader** out) {
+  HRESULT hr = ORIG(decltype(hk_CreatePixelShader), Device_CreatePixelShader)(self, bc, n, l, out);
+  if (SUCCEEDED(hr) && out) shaders_register(*out, ShaderKind::PS, bc, n);
+  return hr;
+}
+HRESULT STDMETHODCALLTYPE hk_CreateComputeShader(ID3D11Device* self, const void* bc, SIZE_T n, ID3D11ClassLinkage* l,
+                                                 ID3D11ComputeShader** out) {
+  HRESULT hr = ORIG(decltype(hk_CreateComputeShader), Device_CreateComputeShader)(self, bc, n, l, out);
+  if (SUCCEEDED(hr) && out) shaders_register(*out, ShaderKind::CS, bc, n);
+  return hr;
+}
+HRESULT STDMETHODCALLTYPE hk_CreateDeferredContext(ID3D11Device* self, UINT flags, ID3D11DeviceContext** out) {
+  HRESULT hr = ORIG(decltype(hk_CreateDeferredContext), Device_CreateDeferredContext)(self, flags, out);
+  if (SUCCEEDED(hr) && out && *out) {
+    static std::atomic<int> n{0};
+    ACO_LOG("CreateDeferredContext #%d -> %p", ++n, static_cast<void*>(*out));
+    ctxhooks_install_context(*out);
+  }
+  return hr;
+}
+HRESULT STDMETHODCALLTYPE hk_CreateSamplerState(ID3D11Device* self, const D3D11_SAMPLER_DESC* desc,
+                                                ID3D11SamplerState** out) {
+  if (desc) {
+    D3D11_SAMPLER_DESC d = *desc;
+    upscaler_adjust_sampler(&d);
+    return ORIG(decltype(hk_CreateSamplerState), Device_CreateSamplerState)(self, &d, out);
+  }
+  return ORIG(decltype(hk_CreateSamplerState), Device_CreateSamplerState)(self, desc, out);
+}
+
+} // namespace
+
+void ctxhooks_install_context(ID3D11DeviceContext* ctx) {
+  cbshadow_install(ctx);
+  hook_vtable(ctx, Context_PSSetShader, reinterpret_cast<void*>(hk_PSSetShader));
+  hook_vtable(ctx, Context_ClearState, reinterpret_cast<void*>(hk_ClearState));
+  hook_vtable(ctx, Context_Draw, reinterpret_cast<void*>(hk_Draw));
+  hook_vtable(ctx, Context_DrawIndexed, reinterpret_cast<void*>(hk_DrawIndexed));
+  hook_vtable(ctx, Context_DrawInstanced, reinterpret_cast<void*>(hk_DrawInstanced));
+  hook_vtable(ctx, Context_DrawIndexedInstanced, reinterpret_cast<void*>(hk_DrawIndexedInstanced));
+  hook_vtable(ctx, Context_DrawIndexedInstancedIndirect, reinterpret_cast<void*>(hk_DrawIndexedInstancedIndirect));
+  hook_vtable(ctx, Context_DrawInstancedIndirect, reinterpret_cast<void*>(hk_DrawInstancedIndirect));
+  hook_vtable(ctx, Context_Dispatch, reinterpret_cast<void*>(hk_Dispatch));
+  hook_vtable(ctx, Context_DispatchIndirect, reinterpret_cast<void*>(hk_DispatchIndirect));
+  hook_vtable(ctx, Context_CopyResource, reinterpret_cast<void*>(hk_CopyResource));
+  hook_vtable(ctx, Context_CopySubresourceRegion, reinterpret_cast<void*>(hk_CopySubresourceRegion));
+  hook_vtable(ctx, Context_ClearRenderTargetView, reinterpret_cast<void*>(hk_ClearRenderTargetView));
+  hook_vtable(ctx, Context_ClearDepthStencilView, reinterpret_cast<void*>(hk_ClearDepthStencilView));
+  hook_vtable(ctx, Context_ClearUnorderedAccessViewFloat, reinterpret_cast<void*>(hk_ClearUAVFloat));
+  hook_vtable(ctx, Context_ClearUnorderedAccessViewUint, reinterpret_cast<void*>(hk_ClearUAVUint));
+  hook_vtable(ctx, Context_FinishCommandList, reinterpret_cast<void*>(hk_FinishCommandList));
+  hook_vtable(ctx, Context_ExecuteCommandList, reinterpret_cast<void*>(hk_ExecuteCommandList));
+}
+
+void ctxhooks_install_device(ID3D11Device* dev) {
+  hook_vtable(dev, Device_CreateVertexShader, reinterpret_cast<void*>(hk_CreateVertexShader));
+  hook_vtable(dev, Device_CreatePixelShader, reinterpret_cast<void*>(hk_CreatePixelShader));
+  hook_vtable(dev, Device_CreateComputeShader, reinterpret_cast<void*>(hk_CreateComputeShader));
+  hook_vtable(dev, Device_CreateDeferredContext, reinterpret_cast<void*>(hk_CreateDeferredContext));
+  hook_vtable(dev, Device_CreateSamplerState, reinterpret_cast<void*>(hk_CreateSamplerState));
+  ID3D11DeviceContext* imm = nullptr;
+  dev->GetImmediateContext(&imm);
+  g_immediate = imm;
+  trace_set_immediate(imm);
+  ctxhooks_install_context(imm);
+  upscaler_init(dev, imm);
+  imm->Release();
+}
+
+ID3D11DeviceContext* immediate_context() { return g_immediate; }
+
+HRESULT orig_FinishCommandList(ID3D11DeviceContext* ctx, BOOL restore, ID3D11CommandList** out) {
+  return orig<decltype(hk_FinishCommandList)>(ctx, Context_FinishCommandList)(ctx, restore, out);
+}
+void orig_ExecuteCommandList(ID3D11DeviceContext* ctx, ID3D11CommandList* cl, BOOL restore) {
+  orig<decltype(hk_ExecuteCommandList)>(ctx, Context_ExecuteCommandList)(ctx, cl, restore);
+}
+
+} // namespace aco

@@ -4,6 +4,8 @@
 #include <d3d11.h>
 #include <d3dcompiler.h>
 
+#include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -25,6 +27,31 @@ PFN_Disassemble disassembler() {
     return m ? reinterpret_cast<PFN_Disassemble>(GetProcAddress(m, "D3DDisassemble")) : nullptr;
   }();
   return fn;
+}
+
+// Open-addressing hash set of classified shader objects: lock-free probes on the hot path
+// (PSSetShader), inserts serialised by g_mutex. Origins has ~60 TAA permutations alone.
+constexpr size_t kInterestingCap = 4096;  // power of two
+std::atomic<ID3D11DeviceChild*> g_interesting[kInterestingCap];
+std::atomic<ShaderClass> g_interesting_cls[kInterestingCap];
+std::atomic<size_t> g_interesting_n{0};
+
+inline size_t slot_of(ID3D11DeviceChild* p) {
+  return ((reinterpret_cast<uintptr_t>(p) >> 4) * 0x9E3779B97F4A7C15ull >> 20) & (kInterestingCap - 1);
+}
+
+bool contains(const std::vector<uint8_t>& bc, const char* needle) {
+  size_t n = strlen(needle);
+  if (bc.size() < n) return false;
+  return std::search(bc.begin(), bc.end(), needle, needle + n) != bc.end();
+}
+
+ShaderClass classify(ShaderKind kind, const std::vector<uint8_t>& bc) {
+  if (kind != ShaderKind::PS) return ShaderClass::None;
+  if (contains(bc, "TemporalAA_ColorAccumulation")) return ShaderClass::TemporalAA;
+  if (contains(bc, "ConvertLinearZParams_DepthBufferSampler")) return ShaderClass::LinearZ;
+  if (contains(bc, "UICompositingParameters_cbuffer")) return ShaderClass::UIComposite;
+  return ShaderClass::None;
 }
 
 const char* kind_ext(ShaderKind k) {
@@ -50,8 +77,45 @@ void shaders_register(ID3D11DeviceChild* shader, ShaderKind kind, const void* by
   // DXBC header: "DXBC" + 16-byte checksum.
   memcpy(&info.hash, static_cast<const uint8_t*>(bytecode) + 4, sizeof(info.hash));
   info.bytecode.assign(static_cast<const uint8_t*>(bytecode), static_cast<const uint8_t*>(bytecode) + size);
+  info.cls = classify(kind, info.bytecode);
   std::unique_lock lock(g_mutex);
+  if (info.cls != ShaderClass::None) {
+    // Serialised by g_mutex; readers are lock-free and only see published entries.
+    if (g_interesting_n.load() < kInterestingCap / 2) {
+      size_t i = slot_of(shader);
+      while (true) {
+        ID3D11DeviceChild* k = g_interesting[i].load(std::memory_order_relaxed);
+        if (!k || k == shader) break;
+        i = (i + 1) & (kInterestingCap - 1);
+      }
+      g_interesting_cls[i].store(info.cls, std::memory_order_relaxed);
+      g_interesting[i].store(shader, std::memory_order_release);
+      g_interesting_n.fetch_add(1);
+      ACO_LOG("shader %s classified as %s", hex64(info.hash).c_str(), shader_class_name(info.cls));
+    } else {
+      ACO_LOG("shader %s: classification table full", hex64(info.hash).c_str());
+    }
+  }
   g_shaders[shader] = std::move(info);
+}
+
+ShaderClass shader_class_fast(ID3D11DeviceChild* shader) {
+  if (!shader) return ShaderClass::None;
+  for (size_t i = slot_of(shader);; i = (i + 1) & (kInterestingCap - 1)) {
+    ID3D11DeviceChild* k = g_interesting[i].load(std::memory_order_acquire);
+    if (k == shader) return g_interesting_cls[i].load(std::memory_order_relaxed);
+    if (!k) return ShaderClass::None;
+  }
+}
+
+const char* shader_class_name(ShaderClass c) {
+  switch (c) {
+    case ShaderClass::None: return "none";
+    case ShaderClass::TemporalAA: return "TemporalAA";
+    case ShaderClass::LinearZ: return "LinearZ";
+    case ShaderClass::UIComposite: return "UIComposite";
+  }
+  return "?";
 }
 
 uint64_t shader_hash(ID3D11DeviceChild* shader) {

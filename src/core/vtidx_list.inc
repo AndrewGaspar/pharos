@@ -30,6 +30,7 @@ ACO_VT(Context, ClearUnorderedAccessViewUint)
 ACO_VT(Context, ExecuteCommandList)
 ACO_VT(Context, FinishCommandList)
 ACO_VT(Context, Map)
+ACO_VT(Context, ClearState)
 ACO_VT(Context, Unmap)
 ACO_VT(Context, UpdateSubresource)
 

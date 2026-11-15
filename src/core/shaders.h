@@ -9,9 +9,19 @@ namespace aco {
 
 enum class ShaderKind : uint8_t { VS, PS, CS };
 
+// Engine passes we care about, recognised by resource/cbuffer names in the shader's reflection
+// data (robust across permutations and patches, unlike bytecode hashes).
+enum class ShaderClass : uint8_t {
+  None,
+  TemporalAA,   // TAA resolve ("TemporalAA_ColorAccumulation")
+  LinearZ,      // depth linearisation; RT0 = linear Z, RT1 = raw device depth copy
+  UIComposite,  // final scene + UI composite ("UICompositingParameters_cbuffer")
+};
+
 struct ShaderInfo {
   uint64_t hash = 0;  // first 8 bytes of the DXBC container checksum
   ShaderKind kind = ShaderKind::PS;
+  ShaderClass cls = ShaderClass::None;
   std::vector<uint8_t> bytecode;
 };
 
@@ -24,5 +34,10 @@ const ShaderInfo* shader_info(ID3D11DeviceChild* shader);
 void shader_dump(const ShaderInfo& info, const std::wstring& dir);
 
 std::string hex64(uint64_t v);
+
+// Lock-free check used on hot paths (PSSetShader): class of a shader object, None for anything
+// that isn't one of the few interesting shaders.
+ShaderClass shader_class_fast(ID3D11DeviceChild* shader);
+const char* shader_class_name(ShaderClass c);
 
 } // namespace aco

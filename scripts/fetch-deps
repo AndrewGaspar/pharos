@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Fetch third-party SDKs (not vendored in git).
+set -euo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd)
+mkdir -p "$root/third_party"
+cd "$root/third_party"
+if [[ ! -d DLSS-310.9.16 ]]; then
+  curl -L https://github.com/NVIDIA/DLSS/archive/refs/tags/v310.9.16.tar.gz | tar xz
+fi

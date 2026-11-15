@@ -289,203 +289,6 @@ void record_dispatch(ID3D11DeviceContext* ctx, const char* op, const char* args)
   stream_for(ctx).push_back(std::move(s));
 }
 
-// ---- hooks -------------------------------------------------------------------------------------
-
-using namespace vt;
-
-#define ORIG(T, slot) orig<T>(self, slot)
-
-void STDMETHODCALLTYPE hk_Draw(ID3D11DeviceContext* self, UINT a, UINT b) {
-  (self == g_immediate ? g_draws_imm : g_draws_def).fetch_add(1, std::memory_order_relaxed);
-  if (capturing()) {
-    char args[64];
-    snprintf(args, sizeof(args), "%u,%u", a, b);
-    record_draw(self, "Draw", args);
-  }
-  ORIG(decltype(hk_Draw), Context_Draw)(self, a, b);
-}
-void STDMETHODCALLTYPE hk_DrawIndexed(ID3D11DeviceContext* self, UINT a, UINT b, INT c) {
-  (self == g_immediate ? g_draws_imm : g_draws_def).fetch_add(1, std::memory_order_relaxed);
-  if (capturing()) {
-    char args[64];
-    snprintf(args, sizeof(args), "%u,%u,%d", a, b, c);
-    record_draw(self, "DrawIndexed", args);
-  }
-  ORIG(decltype(hk_DrawIndexed), Context_DrawIndexed)(self, a, b, c);
-}
-void STDMETHODCALLTYPE hk_DrawInstanced(ID3D11DeviceContext* self, UINT a, UINT b, UINT c, UINT d) {
-  (self == g_immediate ? g_draws_imm : g_draws_def).fetch_add(1, std::memory_order_relaxed);
-  if (capturing()) {
-    char args[64];
-    snprintf(args, sizeof(args), "%u,%u,%u,%u", a, b, c, d);
-    record_draw(self, "DrawInstanced", args);
-  }
-  ORIG(decltype(hk_DrawInstanced), Context_DrawInstanced)(self, a, b, c, d);
-}
-void STDMETHODCALLTYPE hk_DrawIndexedInstanced(ID3D11DeviceContext* self, UINT a, UINT b, UINT c, INT d, UINT e) {
-  (self == g_immediate ? g_draws_imm : g_draws_def).fetch_add(1, std::memory_order_relaxed);
-  if (capturing()) {
-    char args[80];
-    snprintf(args, sizeof(args), "%u,%u,%u,%d,%u", a, b, c, d, e);
-    record_draw(self, "DrawIndexedInstanced", args);
-  }
-  ORIG(decltype(hk_DrawIndexedInstanced), Context_DrawIndexedInstanced)(self, a, b, c, d, e);
-}
-void STDMETHODCALLTYPE hk_DrawIndexedInstancedIndirect(ID3D11DeviceContext* self, ID3D11Buffer* buf, UINT off) {
-  (self == g_immediate ? g_draws_imm : g_draws_def).fetch_add(1, std::memory_order_relaxed);
-  if (capturing()) {
-    char args[64];
-    snprintf(args, sizeof(args), "\"%p\",%u", static_cast<void*>(buf), off);
-    record_draw(self, "DrawIndexedInstancedIndirect", args);
-  }
-  ORIG(decltype(hk_DrawIndexedInstancedIndirect), Context_DrawIndexedInstancedIndirect)(self, buf, off);
-}
-void STDMETHODCALLTYPE hk_DrawInstancedIndirect(ID3D11DeviceContext* self, ID3D11Buffer* buf, UINT off) {
-  (self == g_immediate ? g_draws_imm : g_draws_def).fetch_add(1, std::memory_order_relaxed);
-  if (capturing()) {
-    char args[64];
-    snprintf(args, sizeof(args), "\"%p\",%u", static_cast<void*>(buf), off);
-    record_draw(self, "DrawInstancedIndirect", args);
-  }
-  ORIG(decltype(hk_DrawInstancedIndirect), Context_DrawInstancedIndirect)(self, buf, off);
-}
-void STDMETHODCALLTYPE hk_Dispatch(ID3D11DeviceContext* self, UINT x, UINT y, UINT z) {
-  (self == g_immediate ? g_dispatch_imm : g_dispatch_def).fetch_add(1, std::memory_order_relaxed);
-  if (capturing()) {
-    char args[64];
-    snprintf(args, sizeof(args), "%u,%u,%u", x, y, z);
-    record_dispatch(self, "Dispatch", args);
-  }
-  ORIG(decltype(hk_Dispatch), Context_Dispatch)(self, x, y, z);
-}
-void STDMETHODCALLTYPE hk_DispatchIndirect(ID3D11DeviceContext* self, ID3D11Buffer* buf, UINT off) {
-  (self == g_immediate ? g_dispatch_imm : g_dispatch_def).fetch_add(1, std::memory_order_relaxed);
-  if (capturing()) {
-    char args[64];
-    snprintf(args, sizeof(args), "\"%p\",%u", static_cast<void*>(buf), off);
-    record_dispatch(self, "DispatchIndirect", args);
-  }
-  ORIG(decltype(hk_DispatchIndirect), Context_DispatchIndirect)(self, buf, off);
-}
-void STDMETHODCALLTYPE hk_CopyResource(ID3D11DeviceContext* self, ID3D11Resource* dst, ID3D11Resource* src) {
-  if (capturing()) {
-    std::string s = "{\"op\":\"CopyResource\",\"dst\":{";
-    describe_resource(s, dst);
-    s += "},\"src\":{";
-    describe_resource(s, src);
-    s += "}}";
-    record(self, std::move(s));
-  }
-  ORIG(decltype(hk_CopyResource), Context_CopyResource)(self, dst, src);
-}
-void STDMETHODCALLTYPE hk_CopySubresourceRegion(ID3D11DeviceContext* self, ID3D11Resource* dst, UINT dsub, UINT x,
-                                                UINT y, UINT z, ID3D11Resource* src, UINT ssub, const D3D11_BOX* box) {
-  if (capturing()) {
-    std::string s;
-    appendf(s, "{\"op\":\"CopySubresourceRegion\",\"dsub\":%u,\"ssub\":%u,\"at\":[%u,%u,%u],\"dst\":{", dsub, ssub, x, y, z);
-    describe_resource(s, dst);
-    s += "},\"src\":{";
-    describe_resource(s, src);
-    s += "}";
-    if (box) appendf(s, ",\"box\":[%u,%u,%u,%u]", box->left, box->top, box->right, box->bottom);
-    s += "}";
-    record(self, std::move(s));
-  }
-  ORIG(decltype(hk_CopySubresourceRegion), Context_CopySubresourceRegion)(self, dst, dsub, x, y, z, src, ssub, box);
-}
-void STDMETHODCALLTYPE hk_ClearRenderTargetView(ID3D11DeviceContext* self, ID3D11RenderTargetView* v, const FLOAT c[4]) {
-  if (capturing() && v) {
-    std::string s;
-    appendf(s, "{\"op\":\"ClearRTV\",\"color\":[%g,%g,%g,%g],\"view\":", c[0], c[1], c[2], c[3]);
-    describe_rtv(s, v);
-    s += "}";
-    record(self, std::move(s));
-  }
-  ORIG(decltype(hk_ClearRenderTargetView), Context_ClearRenderTargetView)(self, v, c);
-}
-void STDMETHODCALLTYPE hk_ClearDepthStencilView(ID3D11DeviceContext* self, ID3D11DepthStencilView* v, UINT f, FLOAT d, UINT8 st) {
-  if (capturing() && v) {
-    std::string s;
-    appendf(s, "{\"op\":\"ClearDSV\",\"flags\":%u,\"depth\":%g,\"stencil\":%u,\"view\":", f, d, st);
-    describe_dsv(s, v);
-    s += "}";
-    record(self, std::move(s));
-  }
-  ORIG(decltype(hk_ClearDepthStencilView), Context_ClearDepthStencilView)(self, v, f, d, st);
-}
-void STDMETHODCALLTYPE hk_ClearUAVFloat(ID3D11DeviceContext* self, ID3D11UnorderedAccessView* v, const FLOAT c[4]) {
-  if (capturing() && v) {
-    std::string s = "{\"op\":\"ClearUAVFloat\",\"view\":";
-    describe_uav(s, v);
-    s += "}";
-    record(self, std::move(s));
-  }
-  ORIG(decltype(hk_ClearUAVFloat), Context_ClearUnorderedAccessViewFloat)(self, v, c);
-}
-void STDMETHODCALLTYPE hk_ClearUAVUint(ID3D11DeviceContext* self, ID3D11UnorderedAccessView* v, const UINT c[4]) {
-  if (capturing() && v) {
-    std::string s = "{\"op\":\"ClearUAVUint\",\"view\":";
-    describe_uav(s, v);
-    s += "}";
-    record(self, std::move(s));
-  }
-  ORIG(decltype(hk_ClearUAVUint), Context_ClearUnorderedAccessViewUint)(self, v, c);
-}
-HRESULT STDMETHODCALLTYPE hk_FinishCommandList(ID3D11DeviceContext* self, BOOL restore, ID3D11CommandList** out) {
-  HRESULT hr = ORIG(decltype(hk_FinishCommandList), Context_FinishCommandList)(self, restore, out);
-  if (SUCCEEDED(hr) && out && *out) {
-    std::lock_guard lock(g_cap_mutex);
-    auto it = g_deferred.find(self);
-    if (it != g_deferred.end()) {
-      if (!it->second.empty()) g_cmdlists[*out] = std::move(it->second);
-      g_deferred.erase(it);
-    }
-  }
-  return hr;
-}
-void STDMETHODCALLTYPE hk_ExecuteCommandList(ID3D11DeviceContext* self, ID3D11CommandList* cl, BOOL restore) {
-  {
-    std::lock_guard lock(g_cap_mutex);
-    auto it = g_cmdlists.find(cl);
-    if (capturing()) {
-      std::string s;
-      appendf(s, "{\"op\":\"ExecuteCommandList\",\"cl\":\"%p\",\"n\":%zu}", static_cast<void*>(cl),
-              it == g_cmdlists.end() ? (size_t)0 : it->second.size());
-      auto& out = stream_for(self);
-      out.push_back(std::move(s));
-      if (it != g_cmdlists.end())
-        for (auto& e : it->second) out.push_back("{\"in_cl\":1," + e.substr(1));
-    }
-    if (it != g_cmdlists.end()) g_cmdlists.erase(it);
-  }
-  ORIG(decltype(hk_ExecuteCommandList), Context_ExecuteCommandList)(self, cl, restore);
-}
-
-HRESULT STDMETHODCALLTYPE hk_CreateVertexShader(ID3D11Device* self, const void* bc, SIZE_T n, ID3D11ClassLinkage* l, ID3D11VertexShader** out) {
-  HRESULT hr = ORIG(decltype(hk_CreateVertexShader), Device_CreateVertexShader)(self, bc, n, l, out);
-  if (SUCCEEDED(hr) && out) shaders_register(*out, ShaderKind::VS, bc, n);
-  return hr;
-}
-HRESULT STDMETHODCALLTYPE hk_CreatePixelShader(ID3D11Device* self, const void* bc, SIZE_T n, ID3D11ClassLinkage* l, ID3D11PixelShader** out) {
-  HRESULT hr = ORIG(decltype(hk_CreatePixelShader), Device_CreatePixelShader)(self, bc, n, l, out);
-  if (SUCCEEDED(hr) && out) shaders_register(*out, ShaderKind::PS, bc, n);
-  return hr;
-}
-HRESULT STDMETHODCALLTYPE hk_CreateComputeShader(ID3D11Device* self, const void* bc, SIZE_T n, ID3D11ClassLinkage* l, ID3D11ComputeShader** out) {
-  HRESULT hr = ORIG(decltype(hk_CreateComputeShader), Device_CreateComputeShader)(self, bc, n, l, out);
-  if (SUCCEEDED(hr) && out) shaders_register(*out, ShaderKind::CS, bc, n);
-  return hr;
-}
-HRESULT STDMETHODCALLTYPE hk_CreateDeferredContext(ID3D11Device* self, UINT flags, ID3D11DeviceContext** out) {
-  HRESULT hr = ORIG(decltype(hk_CreateDeferredContext), Device_CreateDeferredContext)(self, flags, out);
-  if (SUCCEEDED(hr) && out && *out) {
-    static std::atomic<int> n{0};
-    ACO_LOG("CreateDeferredContext #%d -> %p", ++n, static_cast<void*>(*out));
-    trace_install_context(*out);
-  }
-  return hr;
-}
-
 void finish_capture() {
   std::lock_guard lock(g_cap_mutex);
   std::wstring dir = g_cap_dir;
@@ -507,36 +310,99 @@ void finish_capture() {
 
 } // namespace
 
-void trace_install_context(ID3D11DeviceContext* ctx) {
-  cbshadow_install(ctx);
-  hook_vtable(ctx, Context_Draw, reinterpret_cast<void*>(hk_Draw));
-  hook_vtable(ctx, Context_DrawIndexed, reinterpret_cast<void*>(hk_DrawIndexed));
-  hook_vtable(ctx, Context_DrawInstanced, reinterpret_cast<void*>(hk_DrawInstanced));
-  hook_vtable(ctx, Context_DrawIndexedInstanced, reinterpret_cast<void*>(hk_DrawIndexedInstanced));
-  hook_vtable(ctx, Context_DrawIndexedInstancedIndirect, reinterpret_cast<void*>(hk_DrawIndexedInstancedIndirect));
-  hook_vtable(ctx, Context_DrawInstancedIndirect, reinterpret_cast<void*>(hk_DrawInstancedIndirect));
-  hook_vtable(ctx, Context_Dispatch, reinterpret_cast<void*>(hk_Dispatch));
-  hook_vtable(ctx, Context_DispatchIndirect, reinterpret_cast<void*>(hk_DispatchIndirect));
-  hook_vtable(ctx, Context_CopyResource, reinterpret_cast<void*>(hk_CopyResource));
-  hook_vtable(ctx, Context_CopySubresourceRegion, reinterpret_cast<void*>(hk_CopySubresourceRegion));
-  hook_vtable(ctx, Context_ClearRenderTargetView, reinterpret_cast<void*>(hk_ClearRenderTargetView));
-  hook_vtable(ctx, Context_ClearDepthStencilView, reinterpret_cast<void*>(hk_ClearDepthStencilView));
-  hook_vtable(ctx, Context_ClearUnorderedAccessViewFloat, reinterpret_cast<void*>(hk_ClearUAVFloat));
-  hook_vtable(ctx, Context_ClearUnorderedAccessViewUint, reinterpret_cast<void*>(hk_ClearUAVUint));
-  hook_vtable(ctx, Context_FinishCommandList, reinterpret_cast<void*>(hk_FinishCommandList));
-  hook_vtable(ctx, Context_ExecuteCommandList, reinterpret_cast<void*>(hk_ExecuteCommandList));
+bool trace_capturing() { return capturing(); }
+void trace_set_immediate(ID3D11DeviceContext* ctx) { g_immediate = ctx; }
+
+void trace_draw(ID3D11DeviceContext* ctx, const char* op, const char* args) {
+  (ctx == g_immediate ? g_draws_imm : g_draws_def).fetch_add(1, std::memory_order_relaxed);
+  if (capturing()) record_draw(ctx, op, args);
 }
 
-void trace_install_device(ID3D11Device* dev) {
-  hook_vtable(dev, Device_CreateVertexShader, reinterpret_cast<void*>(hk_CreateVertexShader));
-  hook_vtable(dev, Device_CreatePixelShader, reinterpret_cast<void*>(hk_CreatePixelShader));
-  hook_vtable(dev, Device_CreateComputeShader, reinterpret_cast<void*>(hk_CreateComputeShader));
-  hook_vtable(dev, Device_CreateDeferredContext, reinterpret_cast<void*>(hk_CreateDeferredContext));
-  ID3D11DeviceContext* imm = nullptr;
-  dev->GetImmediateContext(&imm);
-  g_immediate = imm;
-  trace_install_context(imm);
-  imm->Release();
+void trace_dispatch(ID3D11DeviceContext* ctx, const char* op, const char* args) {
+  (ctx == g_immediate ? g_dispatch_imm : g_dispatch_def).fetch_add(1, std::memory_order_relaxed);
+  if (capturing()) record_dispatch(ctx, op, args);
+}
+
+void trace_copy_resource(ID3D11DeviceContext* ctx, ID3D11Resource* dst, ID3D11Resource* src) {
+  if (!capturing()) return;
+  std::string s = "{\"op\":\"CopyResource\",\"dst\":{";
+  describe_resource(s, dst);
+  s += "},\"src\":{";
+  describe_resource(s, src);
+  s += "}}";
+  record(ctx, std::move(s));
+}
+
+void trace_copy_subresource(ID3D11DeviceContext* ctx, ID3D11Resource* dst, UINT dsub, UINT x, UINT y, UINT z,
+                            ID3D11Resource* src, UINT ssub, const D3D11_BOX* box) {
+  if (!capturing()) return;
+  std::string s;
+  appendf(s, "{\"op\":\"CopySubresourceRegion\",\"dsub\":%u,\"ssub\":%u,\"at\":[%u,%u,%u],\"dst\":{", dsub, ssub, x, y, z);
+  describe_resource(s, dst);
+  s += "},\"src\":{";
+  describe_resource(s, src);
+  s += "}";
+  if (box) appendf(s, ",\"box\":[%u,%u,%u,%u]", box->left, box->top, box->right, box->bottom);
+  s += "}";
+  record(ctx, std::move(s));
+}
+
+void trace_clear_rtv(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* v, const FLOAT c[4]) {
+  if (!capturing() || !v) return;
+  std::string s;
+  appendf(s, "{\"op\":\"ClearRTV\",\"color\":[%g,%g,%g,%g],\"view\":", c[0], c[1], c[2], c[3]);
+  describe_rtv(s, v);
+  s += "}";
+  record(ctx, std::move(s));
+}
+
+void trace_clear_dsv(ID3D11DeviceContext* ctx, ID3D11DepthStencilView* v, UINT f, FLOAT d, UINT8 st) {
+  if (!capturing() || !v) return;
+  std::string s;
+  appendf(s, "{\"op\":\"ClearDSV\",\"flags\":%u,\"depth\":%g,\"stencil\":%u,\"view\":", f, d, st);
+  describe_dsv(s, v);
+  s += "}";
+  record(ctx, std::move(s));
+}
+
+void trace_clear_uav(ID3D11DeviceContext* ctx, ID3D11UnorderedAccessView* v, bool is_float) {
+  if (!capturing() || !v) return;
+  std::string s = is_float ? "{\"op\":\"ClearUAVFloat\",\"view\":" : "{\"op\":\"ClearUAVUint\",\"view\":";
+  describe_uav(s, v);
+  s += "}";
+  record(ctx, std::move(s));
+}
+
+void trace_note(ID3D11DeviceContext* ctx, const std::string& json_fields) {
+  if (!capturing()) return;
+  record(ctx, "{\"op\":\"Note\"," + json_fields + "}");
+}
+
+void trace_finish_command_list(ID3D11DeviceContext* ctx, ID3D11CommandList* cl) {
+  std::lock_guard lock(g_cap_mutex);
+  auto it = g_deferred.find(ctx);
+  if (it != g_deferred.end()) {
+    if (!it->second.empty()) {
+      auto& dst = g_cmdlists[cl];
+      dst.insert(dst.end(), std::make_move_iterator(it->second.begin()), std::make_move_iterator(it->second.end()));
+    }
+    g_deferred.erase(it);
+  }
+}
+
+void trace_execute_command_list(ID3D11DeviceContext* ctx, ID3D11CommandList* cl) {
+  std::lock_guard lock(g_cap_mutex);
+  auto it = g_cmdlists.find(cl);
+  if (capturing()) {
+    std::string s;
+    appendf(s, "{\"op\":\"ExecuteCommandList\",\"cl\":\"%p\",\"n\":%zu}", static_cast<void*>(cl),
+            it == g_cmdlists.end() ? (size_t)0 : it->second.size());
+    auto& out = stream_for(ctx);
+    out.push_back(std::move(s));
+    if (it != g_cmdlists.end())
+      for (auto& e : it->second) out.push_back("{\"in_cl\":1," + e.substr(1));
+  }
+  if (it != g_cmdlists.end()) g_cmdlists.erase(it);
 }
 
 void trace_on_present(IDXGISwapChain* sc) {

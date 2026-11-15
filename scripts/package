@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Build and assemble the mod into build/mod (contents go next to ACOrigins.exe).
+set -euo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd)
+sdk=$root/third_party/DLSS-310.9.16
+[[ -d $sdk ]] || { echo "DLSS SDK missing: run scripts/fetch-deps" >&2; exit 1; }
+[[ -f $root/build/build.ninja ]] || cmake -S "$root" -B "$root/build" -G Ninja -DCMAKE_TOOLCHAIN_FILE="$root/cmake/mingw-w64.cmake" -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+ninja -C "$root/build"
+mkdir -p "$root/build/mod"
+cp "$root/build/d3d11.dll" "$root/build/mod/"
+cp "$sdk/lib/Windows_x86_64/rel/nvngx_dlss.dll" "$root/build/mod/"
+[[ -f $root/build/mod/aco_dlss.ini ]] || cp "$root/dist/aco_dlss.ini" "$root/build/mod/"
+echo "build/mod: $(ls "$root/build/mod" | tr '\n' ' ')"

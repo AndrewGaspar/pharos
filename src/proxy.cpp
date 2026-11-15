@@ -11,6 +11,9 @@
 #include "core/hook.h"
 #include "core/log.h"
 #include "core/vtidx.h"
+#include "core/config.h"
+#include "core/ctxhooks.h"
+#include "dlss/upscaler.h"
 #include "trace/trace.h"
 
 extern "C" IMAGE_DOS_HEADER __ImageBase;
@@ -46,11 +49,17 @@ T real_proc(const char* name) {
 // ---- DXGI hooks --------------------------------------------------------------------------------
 
 HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain* self, UINT sync, UINT flags) {
-  if (!(flags & DXGI_PRESENT_TEST)) trace_on_present(self);
+  if (!(flags & DXGI_PRESENT_TEST)) {
+    trace_on_present(self);
+    upscaler_on_present(self);
+  }
   return orig<decltype(hk_Present)>(self, SwapChain_Present)(self, sync, flags);
 }
 HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1* self, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* p) {
-  if (!(flags & DXGI_PRESENT_TEST)) trace_on_present(self);
+  if (!(flags & DXGI_PRESENT_TEST)) {
+    trace_on_present(self);
+    upscaler_on_present(self);
+  }
   return orig<decltype(hk_Present1)>(self, SwapChain1_Present1)(self, sync, flags, p);
 }
 HRESULT STDMETHODCALLTYPE hk_ResizeBuffers(IDXGISwapChain* self, UINT n, UINT w, UINT h, DXGI_FORMAT f, UINT fl) {
@@ -115,7 +124,7 @@ void on_device(ID3D11Device* dev, const char* via) {
   if (g_device_installed.exchange(true)) {
     ACO_LOG("additional device created; hooks are per-class so it is covered");
   }
-  trace_install_device(dev);
+  ctxhooks_install_device(dev);
   install_factory_hooks(dev);
 }
 
@@ -167,6 +176,8 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
     wchar_t exe[MAX_PATH];
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
     ACO_LOG("aco-dlss loaded into %ls", exe);
+    config_reload();
+    upscaler_preinit();
   }
   return TRUE;
 }
