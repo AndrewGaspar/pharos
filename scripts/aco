@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 # aco — headless AC Origins instances in podman.
 #
-#   aco create <name>            reflink-clone the user's Ubisoft Connect prefix (free on btrfs)
+#   aco gold                     snapshot the user's Connect prefix as the golden source for
+#                                instances, with Ubisoft credentials stripped.
+#   aco login                    serve gold's Connect over VNC (localhost:5999) so the user can log in
+#                                once. This gives containers their OWN login session, so their
+#                                online runs never invalidate the user's Lutris session.
+#   aco create <name>            reflink-clone the gold snapshot (free on btrfs)
 #   aco run <name> [opts]        boot Connect + ACOrigins headless in a container
 #   aco shot <name> [file]       screenshot the instance's X display
 #   aco keys <name> <xdotool...> send input (e.g. `aco keys x key Return`)
@@ -14,12 +19,21 @@
 #   --res WxH          Xvfb screen size (default 2560x1600)
 #   --direct           launch ACOrigins.exe directly (Connect is auto-spawned by the game)
 #   --fg               run attached instead of detached
-#   --online           give the container network access (DEFAULT IS OFFLINE: online runs
-#                      rotate the Ubisoft login token and can sync saves/sessions)
+#   --offline          no network (Connect cannot validate ownership offline; mostly useless)
+#   --vnc              also serve the Xvfb display over VNC on 127.0.0.1:5999
 set -euo pipefail
 
 SRC_PREFIX=${ACO_SRC_PREFIX:-/home/ajg/Games/ubisoft-connect}
 INST_ROOT=${ACO_INST_ROOT:-/home/ajg/Games/aco-dlss-instances}
+GOLD=$INST_ROOT/_gold
+CONNECT_APPDATA="drive_c/users/steamuser/AppData/Local/Ubisoft Game Launcher"
+
+# Instances must never sync saves over the user's real progress.
+harden_settings() {
+  local f="$1/$CONNECT_APPDATA/settings.yaml"
+  sed -i 's/^\(\s*syncsavegames:\).*/\1 false/; s/^\(\s*offline:\).*/\1 false/' "$f"
+  grep -q "syncsavegames: false" "$f" || die "failed to disable save sync in $f"
+}
 PROTON=${ACO_PROTON:-$HOME/.local/share/Steam/compatibilitytools.d/GE-Proton11-12-x86_64}
 IMAGE=${ACO_IMAGE:-localhost/aco-headless:latest}
 GAME_REL="drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher/games/Assassin's Creed Origins"
@@ -29,17 +43,35 @@ ACO_APPID=3539
 die() { echo "aco: $*" >&2; exit 1; }
 ctr() { echo "aco-$1"; }
 
+cmd_gold() {
+  pgrep -i "ubisoftconnect|upc.exe|acorigins|uplaywebcore|wineserver" >/dev/null && die "quit Connect/wine on the host first"
+  if [[ -e $GOLD ]]; then mv "$GOLD" "$GOLD.old.$(date +%s)"; fi
+  mkdir -p "$GOLD/out" "$GOLD/orig"
+  cp -a --reflink=always "$SRC_PREFIX" "$GOLD/prefix"
+  rm -f "$GOLD/prefix/pfx.lock"
+  # Strip the user's login so the containers get their own session chain.
+  rm -f "$GOLD/prefix/$CONNECT_APPDATA/ConnectSecureStorage.dat" "$GOLD/prefix/$CONNECT_APPDATA/user.vdat"
+  harden_settings "$GOLD/prefix"
+  echo "gold snapshot at $GOLD; now run: aco login"
+}
+
+cmd_login() {
+  cmd_run _gold --vnc >/dev/null
+  echo "Connect is starting. View it with:  gvncviewer localhost:99   (log in, start Origins to the menu, quit Connect)"
+  podman wait "$(ctr _gold)" >/dev/null 2>&1 || true
+  harden_settings "$GOLD/prefix"
+  echo "login session finished"
+}
+
 cmd_create() {
   local name=$1 dst=$INST_ROOT/$1
   [[ -e $dst ]] && die "instance $name exists"
+  [[ -d $GOLD ]] || die "no gold snapshot (run: aco gold)"
   mkdir -p "$dst/out"
-  pgrep -i "ubisoftconnect|upc.exe|acorigins|uplaywebcore" >/dev/null && echo "aco: warning: Connect/game running on host; clone may be mid-write" >&2
-  cp -a --reflink=always "$SRC_PREFIX" "$dst/prefix"
+  [[ -e $GOLD/prefix/$CONNECT_APPDATA/user.vdat ]] || die "gold has no login yet (run: aco login)"
+  cp -a --reflink=always "$GOLD/prefix" "$dst/prefix"
   rm -f "$dst/prefix/pfx.lock"
-  # Never let an instance push cloud saves over the user's real progress, and keep Connect in
-  # explicit offline mode so it never refreshes (rotates) the shared login token.
-  sed -i 's/^\(\s*syncsavegames:\).*/\1 false/; s/^\(\s*offline:\).*/\1 true/' "$dst/prefix/drive_c/users/steamuser/AppData/Local/Ubisoft Game Launcher/settings.yaml"
-  grep -q "syncsavegames: false" "$dst/prefix/drive_c/users/steamuser/AppData/Local/Ubisoft Game Launcher/settings.yaml" || die "failed to disable save sync"
+  harden_settings "$dst/prefix"
   # Keep a pristine copy of every game file we may overwrite with mod files.
   mkdir -p "$dst/orig"
   echo "created $dst"
@@ -47,7 +79,7 @@ cmd_create() {
 
 cmd_run() {
   local name=$1; shift
-  local dst=$INST_ROOT/$name mod="" res=2560x1600 direct=0 fg=0 net=none
+  local dst=$INST_ROOT/$name mod="" res=2560x1600 direct=0 fg=0 net=pasta vnc=0
   [[ -d $dst ]] || die "no instance $name (aco create $name)"
   while (($#)); do
     case $1 in
@@ -55,7 +87,8 @@ cmd_run() {
       --res) res=$2; shift 2;;
       --direct) direct=1; shift;;
       --fg) fg=1; shift;;
-      --online) net=slirp4netns; shift;;
+      --offline) net=none; shift;;
+      --vnc) vnc=1; shift;;
       *) die "unknown option $1";;
     esac
   done
@@ -83,9 +116,11 @@ cmd_run() {
   for f in /usr/lib32/libGLX_nvidia.so* /usr/lib32/libnvidia-*.so* /usr/lib32/libEGL_nvidia.so* /usr/lib32/libcuda.so*; do
     lib32+=(-v "$f:$f:ro")
   done
+  local vncopt=()
+  ((vnc)) && vncopt=(-p 127.0.0.1:5999:5900)
   podman run "${detach[@]}" --rm --name "$(ctr "$name")" \
     --network "$net" \
-    --device nvidia.com/gpu=all --userns=keep-id --shm-size=2g \
+    --device nvidia.com/gpu=all --userns=keep-id --user 1000:1000 --shm-size=2g \
     --security-opt label=disable \
     -v "$dst/prefix:$SRC_PREFIX" \
     -v "$PROTON:$PROTON:ro" \
@@ -94,6 +129,7 @@ cmd_run() {
     "${lib32[@]}" \
     -v /etc/machine-id:/etc/machine-id:ro \
     -e HOME=/home/steamuser -e USER=steamuser \
+    "${vncopt[@]}" -e ACO_VNC=$vnc \
     -e DISPLAY=:99 -e XDG_RUNTIME_DIR=/tmp/xdg \
     -e WINEPREFIX="$SRC_PREFIX" \
     -e STEAM_COMPAT_DATA_PATH="$SRC_PREFIX" \
@@ -109,6 +145,7 @@ cmd_run() {
       mkdir -p /tmp/xdg /tmp/steam; chmod 700 /tmp/xdg
       Xvfb :99 -screen 0 ${ACO_RES}x24 -nolisten tcp >/out/xvfb.log 2>&1 &
       for i in $(seq 50); do xdpyinfo >/dev/null 2>&1 && break; sleep 0.1; done
+      [ "$ACO_VNC" = 1 ] && x11vnc -display :99 -forever -shared -nopw -quiet -rfbport 5900 >/out/vnc.log 2>&1 &
       echo "launch $(date -Is)" > /out/run.log
       exec python3 "'"$PROTON"'/proton" waitforexitandrun "'"$exe"'" '"$args"' >>/out/run.log 2>&1'
   ((fg)) || echo "started $(ctr "$name"); logs in $dst/out"
@@ -126,6 +163,6 @@ cmd_rm() { cmd_stop "$1" 2>/dev/null || true; rm -rf --one-file-system "${INST_R
 
 c=${1:-}; shift || true
 case $c in
-  create|run|shot|keys|exec|stop|rm) "cmd_$c" "$@";;
+  gold|login|create|run|shot|keys|exec|stop|rm) "cmd_$c" "$@";;
   *) sed -n '2,20p' "$0"; exit 1;;
 esac

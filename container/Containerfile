@@ -22,3 +22,7 @@ RUN printf '\n[multilib]\nInclude = /etc/pacman.d/mirrorlist\n' >> /etc/pacman.c
 RUN useradd -u 1000 -m -s /bin/bash steamuser
 ENV HOME=/home/steamuser
 WORKDIR /home/steamuser
+
+# VNC for the one-time interactive login (Wine text input via Hyprland's Xwayland is unreliable).
+USER root
+RUN pacman -Sy --noconfirm --needed x11vnc && pacman -Scc --noconfirm
