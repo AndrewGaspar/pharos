@@ -219,7 +219,7 @@ void record_draw(ID3D11DeviceContext* ctx, const char* op, const char* args) {
     describe_dsv(s, dsv);
     dsv->Release();
   }
-  srv_list<ID3D11ShaderResourceView>(s, "srv", [&](UINT a, UINT b, ID3D11ShaderResourceView** v) { ctx->PSGetShaderResources(a, b, v); }, 32);
+  srv_list<ID3D11ShaderResourceView>(s, "srv", [&](UINT a, UINT b, ID3D11ShaderResourceView** v) { ctx->PSGetShaderResources(a, b, v); }, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT);
   cb_list(s, "pscb", ctx, false, true);
   cb_list(s, "vscb", ctx, false, false);
   D3D11_VIEWPORT vp[1];
@@ -239,7 +239,7 @@ void record_dispatch(ID3D11DeviceContext* ctx, const char* op, const char* args)
   ID3D11ComputeShader* cs = nullptr;
   ctx->CSGetShader(&cs, nullptr, nullptr);
   note_shader(s, "cs", cs);
-  srv_list<ID3D11ShaderResourceView>(s, "srv", [&](UINT a, UINT b, ID3D11ShaderResourceView** v) { ctx->CSGetShaderResources(a, b, v); }, 32);
+  srv_list<ID3D11ShaderResourceView>(s, "srv", [&](UINT a, UINT b, ID3D11ShaderResourceView** v) { ctx->CSGetShaderResources(a, b, v); }, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT);
   srv_list<ID3D11UnorderedAccessView>(s, "uav", [&](UINT a, UINT b, ID3D11UnorderedAccessView** v) { ctx->CSGetUnorderedAccessViews(a, b, v); }, 8);
   cb_list(s, "cscb", ctx, true, false);
   s += "}";

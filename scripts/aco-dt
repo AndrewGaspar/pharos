@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# aco-dt <instance> — drive a freshly launched game (aco game ...) into Discovery Tour free roam.
+#
+# Screen states are recognised by comparing fixed regions of the 2560x1600 display against
+# reference crops in tools/ref/. Input is only sent when a state is positively recognised, so we
+# never press Return on an unknown screen (which could e.g. load a story save).
+set -euo pipefail
+name=${1:?instance}
+here=$(cd "$(dirname "$0")/.." && pwd)
+ref=$here/tools/ref
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+aco=$here/scripts/aco
+
+# state name | crop geometry | reference file
+STATES=(
+  "title|400x60+1080+1412|title.png"
+  "menu|600x110+205+537|menu.png"
+)
+
+grab() { podman exec "aco-$name" bash -c 'DISPLAY=:99 import -window root png:-' > "$tmp/full.png"; }
+
+# Prints the matching state name, or "unknown".
+classify() {
+  local s st geo file d
+  for s in "${STATES[@]}"; do
+    IFS='|' read -r st geo file <<< "$s"
+    [[ -f $ref/$file ]] || continue
+    magick "$tmp/full.png" -crop "$geo" +repage -colorspace gray "$tmp/c.png"
+    d=$(magick compare -metric RMSE "$ref/$file" "$tmp/c.png" null: 2>&1 | sed -n 's/.*(\(.*\)).*/\1/p')
+    if awk "BEGIN{exit !(${d:-1} < 0.08)}"; then echo "$st"; return; fi
+  done
+  echo unknown
+}
+
+press() { "$aco" keys "$name" keydown "$1" sleep 0.15 keyup "$1"; }
+click() { "$aco" keys "$name" mousemove "$1" "$2" sleep 0.3 mousedown 1 sleep 0.12 mouseup 1; }
+
+deadline=$((SECONDS + 300))
+while ((SECONDS < deadline)); do
+  grab
+  st=$(classify)
+  case $st in
+    title) echo "aco-dt: title -> pressing Return"; press Return; sleep 8;;
+    menu)  echo "aco-dt: main menu -> Discovery Tour"; click 380 592; sleep 3
+           # Wait for the world to load, then let streaming settle.
+           sleep 45; echo "aco-dt: in Discovery Tour"; exit 0;;
+    *)     sleep 3;;
+  esac
+done
+echo "aco-dt: timed out (last frame: $tmp/full.png)" >&2
+cp "$tmp/full.png" "$here/build/aco-dt-timeout.png" 2>/dev/null || true
+exit 1
