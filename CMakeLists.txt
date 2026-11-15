@@ -15,6 +15,7 @@ add_library(aco_d3d11 SHARED
   src/core/hook.cpp
   src/core/vtidx.cpp
   src/core/shaders.cpp
+  src/core/cbshadow.cpp
   src/trace/trace.cpp
   src/proxy.cpp
   src/d3d11.def)

@@ -62,6 +62,18 @@ def binds(m):
                     if v.get("r") not in GLOBAL)
 
 
+def load_events(cap):
+    out, bad = [], 0
+    for l in open(Path(cap) / "events.jsonl"):
+        try:
+            out.append(json.loads(l))
+        except json.JSONDecodeError:
+            bad += 1
+    if bad:
+        print(f"warning: {bad} unparseable events skipped", file=sys.stderr)
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("cap")
@@ -70,7 +82,7 @@ def main():
     ap.add_argument("--grep", help="only lines mentioning this text")
     args = ap.parse_args()
 
-    events = [json.loads(l) for l in open(Path(args.cap) / "events.jsonl")]
+    events = load_events(args.cap)
     frames, cur = [], []
     for e in events:
         if e["op"] == "Present":

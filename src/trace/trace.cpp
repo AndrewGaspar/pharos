@@ -5,6 +5,7 @@
 #include <dxgi1_2.h>
 
 #include <atomic>
+#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <mutex>
@@ -13,6 +14,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "core/cbshadow.h"
 #include "core/hook.h"
 #include "core/log.h"
 #include "core/shaders.h"
@@ -36,6 +38,29 @@ std::unordered_map<ID3D11CommandList*, std::vector<std::string>> g_cmdlists;
 std::set<ID3D11DeviceChild*> g_used_shaders;
 std::wstring g_cap_dir;
 int g_cap_index = 0;
+std::vector<std::string> g_cb_watch;  // shader hash prefixes whose constant buffer contents we dump
+bool g_preroll = false;               // shadowing enabled, capture starts next frame
+
+bool cb_watched(ID3D11DeviceChild* sh) {
+  if (!sh || g_cb_watch.empty()) return false;
+  std::string h = hex64(shader_hash(sh));
+  for (auto& w : g_cb_watch)
+    if (h.compare(0, w.size(), w) == 0) return true;
+  return false;
+}
+
+void load_cb_watch() {
+  g_cb_watch.clear();
+  if (FILE* f = _wfopen((out_dir() + L"\\cbwatch.txt").c_str(), L"r")) {
+    char line[128];
+    while (fgets(line, sizeof(line), f)) {
+      std::string w(line);
+      while (!w.empty() && (w.back() == '\n' || w.back() == '\r' || w.back() == ' ')) w.pop_back();
+      if (!w.empty()) g_cb_watch.push_back(w);
+    }
+    fclose(f);
+  }
+}
 
 bool capturing() { return g_capture_left.load(std::memory_order_relaxed) > 0; }
 
@@ -154,7 +179,7 @@ void srv_list(std::string& s, const char* key, Fn getter, UINT count) {
   if (!first) s += "}";
 }
 
-void cb_list(std::string& s, const char* key, ID3D11DeviceContext* ctx, bool compute, bool pixel) {
+void cb_list(std::string& s, const char* key, ID3D11DeviceContext* ctx, bool compute, bool pixel, bool data = false) {
   ID3D11DeviceContext1* c1 = nullptr;
   ctx->QueryInterface(__uuidof(ID3D11DeviceContext1), reinterpret_cast<void**>(&c1));
   ID3D11Buffer* b[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT] = {};
@@ -171,6 +196,7 @@ void cb_list(std::string& s, const char* key, ID3D11DeviceContext* ctx, bool com
     else ctx->VSGetConstantBuffers(0, n, b);
   }
   bool any = false;
+  std::string dump;
   for (UINT i = 0; i < n; ++i) {
     if (!b[i]) continue;
     D3D11_BUFFER_DESC d;
@@ -178,9 +204,24 @@ void cb_list(std::string& s, const char* key, ID3D11DeviceContext* ctx, bool com
     appendf(s, "%s\"%u\":[\"%p\",%u,%u,%u]", any ? "," : (std::string(",\"") + key + "\":{").c_str(), i,
             static_cast<void*>(b[i]), d.ByteWidth, first[i] * 16, num[i] * 16);
     any = true;
+    if (data) {
+      uint32_t off = first[i] * 16, size = num[i] ? num[i] * 16 : d.ByteWidth;
+      if (off + size > d.ByteWidth) size = d.ByteWidth > off ? d.ByteWidth - off : 0;
+      std::vector<float> f(size / 4);
+      if (size && cbshadow_read(ctx, b[i], off, size, f.data())) {
+        appendf(dump, "%s\"%u\":[", dump.empty() ? "" : ",", i);
+        for (size_t k = 0; k < f.size(); ++k) {
+          if (k) dump += ",";
+          if (std::isfinite(f[k])) appendf(dump, "%.9g", f[k]);
+          else dump += "null";
+        }
+        dump += "]";
+      }
+    }
     b[i]->Release();
   }
   if (any) s += "}";
+  if (!dump.empty()) s += std::string(",\"") + key + "d\":{" + dump + "}";
 }
 
 std::vector<std::string>& stream_for(ID3D11DeviceContext* ctx) {
@@ -220,8 +261,9 @@ void record_draw(ID3D11DeviceContext* ctx, const char* op, const char* args) {
     dsv->Release();
   }
   srv_list<ID3D11ShaderResourceView>(s, "srv", [&](UINT a, UINT b, ID3D11ShaderResourceView** v) { ctx->PSGetShaderResources(a, b, v); }, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT);
-  cb_list(s, "pscb", ctx, false, true);
-  cb_list(s, "vscb", ctx, false, false);
+  bool watched = cb_watched(ps);
+  cb_list(s, "pscb", ctx, false, true, watched);
+  cb_list(s, "vscb", ctx, false, false, watched);
   D3D11_VIEWPORT vp[1];
   UINT nvp = 1;
   ctx->RSGetViewports(&nvp, vp);
@@ -241,7 +283,7 @@ void record_dispatch(ID3D11DeviceContext* ctx, const char* op, const char* args)
   note_shader(s, "cs", cs);
   srv_list<ID3D11ShaderResourceView>(s, "srv", [&](UINT a, UINT b, ID3D11ShaderResourceView** v) { ctx->CSGetShaderResources(a, b, v); }, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT);
   srv_list<ID3D11UnorderedAccessView>(s, "uav", [&](UINT a, UINT b, ID3D11UnorderedAccessView** v) { ctx->CSGetUnorderedAccessViews(a, b, v); }, 8);
-  cb_list(s, "cscb", ctx, true, false);
+  cb_list(s, "cscb", ctx, true, false, cb_watched(cs));
   s += "}";
   if (cs) cs->Release();
   stream_for(ctx).push_back(std::move(s));
@@ -466,6 +508,7 @@ void finish_capture() {
 } // namespace
 
 void trace_install_context(ID3D11DeviceContext* ctx) {
+  cbshadow_install(ctx);
   hook_vtable(ctx, Context_Draw, reinterpret_cast<void*>(hk_Draw));
   hook_vtable(ctx, Context_DrawIndexed, reinterpret_cast<void*>(hk_DrawIndexed));
   hook_vtable(ctx, Context_DrawInstanced, reinterpret_cast<void*>(hk_DrawInstanced));
@@ -503,6 +546,12 @@ void trace_on_present(IDXGISwapChain* sc) {
             (unsigned long long)g_draws_imm.load(), (unsigned long long)g_draws_def.load(),
             (unsigned long long)g_dispatch_imm.load(), (unsigned long long)g_dispatch_def.load());
   }
+  if (g_preroll) {
+    g_preroll = false;
+    g_capture_left.store(kCaptureFrames);
+    ACO_LOG("capture %d started at frame %llu", g_cap_index, (unsigned long long)frame);
+    return;
+  }
   int left = g_capture_left.load();
   if (left > 0) {
     {
@@ -511,7 +560,10 @@ void trace_on_present(IDXGISwapChain* sc) {
       appendf(s, "{\"op\":\"Present\",\"frame\":%llu}", (unsigned long long)frame);
       g_events.push_back(std::move(s));
     }
-    if (left == 1) finish_capture();
+    if (left == 1) {
+      finish_capture();
+      cbshadow_set_all(false);
+    }
     g_capture_left.store(left - 1);
     return;
   }
@@ -531,8 +583,12 @@ void trace_on_present(IDXGISwapChain* sc) {
         g_cmdlists.clear();
         g_used_shaders.clear();
       }
-      ACO_LOG("capture %d armed at frame %llu", g_cap_index, (unsigned long long)frame);
-      g_capture_left.store(kCaptureFrames);
+      load_cb_watch();
+      ACO_LOG("capture %d armed at frame %llu (%zu cb watch entries)", g_cap_index, (unsigned long long)frame, g_cb_watch.size());
+      // One frame of constant-buffer shadowing before recording, so draws early in the captured
+      // frames can see buffers written in the previous frame.
+      cbshadow_set_all(true);
+      g_preroll = true;
     }
   }
 }
