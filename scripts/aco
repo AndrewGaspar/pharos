@@ -33,11 +33,12 @@ cmd_create() {
   local name=$1 dst=$INST_ROOT/$1
   [[ -e $dst ]] && die "instance $name exists"
   mkdir -p "$dst/out"
-  pgrep -f "UbisoftConnect.exe|ACOrigins" >/dev/null && echo "aco: warning: Connect/game running on host; clone may be mid-write" >&2
+  pgrep -i "ubisoftconnect|upc.exe|acorigins|uplaywebcore" >/dev/null && echo "aco: warning: Connect/game running on host; clone may be mid-write" >&2
   cp -a --reflink=always "$SRC_PREFIX" "$dst/prefix"
   rm -f "$dst/prefix/pfx.lock"
-  # Never let an instance push cloud saves over the user's real progress.
-  sed -i 's/^\(\s*syncsavegames:\).*/\1 false/' "$dst/prefix/drive_c/users/steamuser/AppData/Local/Ubisoft Game Launcher/settings.yaml"
+  # Never let an instance push cloud saves over the user's real progress, and keep Connect in
+  # explicit offline mode so it never refreshes (rotates) the shared login token.
+  sed -i 's/^\(\s*syncsavegames:\).*/\1 false/; s/^\(\s*offline:\).*/\1 true/' "$dst/prefix/drive_c/users/steamuser/AppData/Local/Ubisoft Game Launcher/settings.yaml"
   grep -q "syncsavegames: false" "$dst/prefix/drive_c/users/steamuser/AppData/Local/Ubisoft Game Launcher/settings.yaml" || die "failed to disable save sync"
   # Keep a pristine copy of every game file we may overwrite with mod files.
   mkdir -p "$dst/orig"
