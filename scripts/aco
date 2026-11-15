@@ -165,6 +165,8 @@ password_login() {
   cmd_shot "$name" "$(inst "$name")/out/login-2fa.png" >/dev/null
   rm -f "$TWOFA_FILE"
   log "$name: waiting for 2FA code in $TWOFA_FILE (screenshot: $(inst "$name")/out/login-2fa.png)"
+  # 2FA form: tick "Trust this device" (so later logins can skip the code), focus the code field.
+  xclick "$name" 1092 842; sleep 0.5; xclick "$name" 1280 685  # ticking adds a "Device name" field and re-centers the form
   for i in $(seq 600); do [[ -s $TWOFA_FILE ]] && break; sleep 1; done
   [[ -s $TWOFA_FILE ]] || { log "$name: no 2FA code provided"; return 1; }
   head -1 "$TWOFA_FILE" | tr -dc '0-9' | podman exec -i -e DISPLAY=:99 "$(ctr "$name")" xdotool type --delay 80 --file -
