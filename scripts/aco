@@ -243,7 +243,9 @@ cmd_game() {
       mkdir -p "$(dirname "$game/$f")"; cp -a "$mod/$f" "$game/$f"; echo "$f" >> "$dst/mod-files"
     done
   fi
-  podman exec -d ${DXVK_HUD:+-e DXVK_HUD=$DXVK_HUD} -e ACO_DLSS_OUT='Z:\out' -e ACO_PROTON="$PROTON" -e ACO_CONNECT="$CONNECT_WIN" "$(ctr "$name")" bash -c \
+  # NB: the game is spawned by the long-running Connect, so env vars set here do not reach it
+  # (use dxvk.conf in the mod dir for DXVK options, e.g. "dxvk.hud = fps").
+  podman exec -d -e ACO_DLSS_OUT='Z:\out' -e ACO_PROTON="$PROTON" -e ACO_CONNECT="$CONNECT_WIN" "$(ctr "$name")" bash -c \
     'echo "game $(date -Is)" >> /out/run.log; exec python3 "$ACO_PROTON/proton" run "$ACO_CONNECT" uplay://launch/'"$ACO_APPID"'/0 >>/out/run.log 2>&1'
   echo "game launching in $name"
 }
