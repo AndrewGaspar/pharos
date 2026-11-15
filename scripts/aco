@@ -7,8 +7,9 @@
 # login is only exercised once per container boot.
 #
 # Ubisoft login tokens ("keep me logged in") are SINGLE USE with reuse detection: every login
-# rotates the token, and presenting an already-used token revokes the whole token family (logging
-# out every holder). So:
+# rotates the token, and presenting an already-used token revokes the whole token family. The
+# revocation also kills LIVE sessions of that family at their next ticket refresh (~10-15 min later
+# Connect shows "You have been logged out: accessed from another location"). So:
 #   * gold's token is handed to exactly one booting instance at a time (flock),
 #   * once that instance's Connect logs in, its rotated token is copied back into gold,
 #   * if a boot fails to log in, gold's creds are marked dead and further boots refuse until
@@ -123,7 +124,7 @@ start_container() {
     -e DXVK_LOG_PATH=/out -e DXVK_NVAPI_LOG_PATH=/out -e DXVK_NVAPI_LOG_LEVEL=info \
     -e WINEDEBUG="${ACO_WINEDEBUG:--all}" \
     -e WINEDLLOVERRIDES="${ACO_DLLOVERRIDES:-d3d11=n,b}" \
-    -e PROTON_LOG=1 -e PROTON_LOG_DIR=/out \
+    -e PROTON_LOG=1 -e PROTON_LOG_DIR=/out -e ACO_DLSS_OUT='Z:\out' \
     -e ACO_RES="$res" -e ACO_VNC="$vnc" -e ACO_PROTON="$PROTON" -e ACO_CONNECT="$CONNECT_WIN" \
     "$IMAGE" bash -c '
       mkdir -p /tmp/xdg /tmp/steam; chmod 700 /tmp/xdg
@@ -170,7 +171,8 @@ cmd_up() {
 }
 
 cmd_kill_game() {
-  podman exec "$(ctr "$1")" bash -c 'pkill -f "ACOrigins.exe" || true; for i in $(seq 30); do pgrep -f "ACOrigins.exe" | xargs -r ps -o stat= -p | grep -qv Z || exit 0; sleep 0.5; done'
+  # Match the process name exactly (-x): -f would also match this very bash -c command line.
+  podman exec "$(ctr "$1")" bash -c 'pkill -x ACOrigins.exe || true; for i in $(seq 40); do pgrep -x ACOrigins.exe | xargs -r ps -o stat= -p | grep -qv Z || exit 0; sleep 0.5; done; pkill -9 -x ACOrigins.exe; true'
 }
 
 cmd_game() {
@@ -200,7 +202,7 @@ cmd_game() {
       mkdir -p "$(dirname "$game/$f")"; cp -a "$mod/$f" "$game/$f"; echo "$f" >> "$dst/mod-files"
     done
   fi
-  podman exec -d -e ACO_PROTON="$PROTON" -e ACO_CONNECT="$CONNECT_WIN" "$(ctr "$name")" bash -c \
+  podman exec -d -e ACO_DLSS_OUT='Z:\out' -e ACO_PROTON="$PROTON" -e ACO_CONNECT="$CONNECT_WIN" "$(ctr "$name")" bash -c \
     'echo "game $(date -Is)" >> /out/run.log; exec python3 "$ACO_PROTON/proton" run "$ACO_CONNECT" uplay://launch/'"$ACO_APPID"'/0 >>/out/run.log 2>&1'
   echo "game launching in $name"
 }
