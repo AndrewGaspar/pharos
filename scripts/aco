@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# aco — headless AC Origins instances in podman.
+#
+#   aco create <name>            reflink-clone the user's Ubisoft Connect prefix (free on btrfs)
+#   aco run <name> [opts]        boot Connect + ACOrigins headless in a container
+#   aco shot <name> [file]       screenshot the instance's X display
+#   aco keys <name> <xdotool...> send input (e.g. `aco keys x key Return`)
+#   aco exec <name> <cmd...>     run a command inside the instance container
+#   aco stop <name>              kill the container
+#   aco rm <name>                delete instance
+#
+# run options:
+#   --mod <dir>        copy files from <dir> into the game directory before launch
+#   --res WxH          Xvfb screen size (default 2560x1600)
+#   --direct           launch ACOrigins.exe directly (Connect is auto-spawned by the game)
+#   --fg               run attached instead of detached
+#   --online           give the container network access (DEFAULT IS OFFLINE: online runs
+#                      rotate the Ubisoft login token and can sync saves/sessions)
+set -euo pipefail
+
+SRC_PREFIX=${ACO_SRC_PREFIX:-/home/ajg/Games/ubisoft-connect}
+INST_ROOT=${ACO_INST_ROOT:-/home/ajg/Games/aco-dlss-instances}
+PROTON=${ACO_PROTON:-$HOME/.local/share/Steam/compatibilitytools.d/GE-Proton11-12-x86_64}
+IMAGE=${ACO_IMAGE:-localhost/aco-headless:latest}
+GAME_REL="drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher/games/Assassin's Creed Origins"
+UPC_REL="drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher"
+ACO_APPID=3539
+
+die() { echo "aco: $*" >&2; exit 1; }
+ctr() { echo "aco-$1"; }
+
+cmd_create() {
+  local name=$1 dst=$INST_ROOT/$1
+  [[ -e $dst ]] && die "instance $name exists"
+  mkdir -p "$dst/out"
+  pgrep -f "UbisoftConnect.exe|ACOrigins" >/dev/null && echo "aco: warning: Connect/game running on host; clone may be mid-write" >&2
+  cp -a --reflink=always "$SRC_PREFIX" "$dst/prefix"
+  rm -f "$dst/prefix/pfx.lock"
+  # Never let an instance push cloud saves over the user's real progress.
+  sed -i 's/^\(\s*syncsavegames:\).*/\1 false/' "$dst/prefix/drive_c/users/steamuser/AppData/Local/Ubisoft Game Launcher/settings.yaml"
+  grep -q "syncsavegames: false" "$dst/prefix/drive_c/users/steamuser/AppData/Local/Ubisoft Game Launcher/settings.yaml" || die "failed to disable save sync"
+  # Keep a pristine copy of every game file we may overwrite with mod files.
+  mkdir -p "$dst/orig"
+  echo "created $dst"
+}
+
+cmd_run() {
+  local name=$1; shift
+  local dst=$INST_ROOT/$name mod="" res=2560x1600 direct=0 fg=0 net=none
+  [[ -d $dst ]] || die "no instance $name (aco create $name)"
+  while (($#)); do
+    case $1 in
+      --mod) mod=$(realpath "$2"); shift 2;;
+      --res) res=$2; shift 2;;
+      --direct) direct=1; shift;;
+      --fg) fg=1; shift;;
+      --online) net=slirp4netns; shift;;
+      *) die "unknown option $1";;
+    esac
+  done
+  local game="$dst/prefix/$GAME_REL"
+  # Restore originals from previous mod runs, then apply the new mod.
+  if [[ -f $dst/mod-files ]]; then
+    while IFS= read -r f; do
+      if [[ -e "$dst/orig/$f" ]]; then cp -a --reflink=auto "$dst/orig/$f" "$game/$f"; else rm -f "$game/$f"; fi
+    done < "$dst/mod-files"
+    rm -f "$dst/mod-files"
+  fi
+  if [[ -n $mod ]]; then
+    (cd "$mod" && find . -type f -printf '%P\n') | while IFS= read -r f; do
+      [[ -e "$game/$f" && ! -e "$dst/orig/$f" ]] && { mkdir -p "$(dirname "$dst/orig/$f")"; cp -a --reflink=auto "$game/$f" "$dst/orig/$f"; }
+      mkdir -p "$(dirname "$game/$f")"; cp -a "$mod/$f" "$game/$f"; echo "$f" >> "$dst/mod-files"
+    done
+  fi
+  podman rm -f "$(ctr "$name")" >/dev/null 2>&1 || true
+  local exe args
+  if ((direct)); then exe="C:\\Program Files (x86)\\Ubisoft\\Ubisoft Game Launcher\\games\\Assassin's Creed Origins\\ACOrigins.exe"; args=""
+  else exe="C:\\Program Files (x86)\\Ubisoft\\Ubisoft Game Launcher\\UbisoftConnect.exe"; args="uplay://launch/$ACO_APPID/0"; fi
+  local detach=(-d); ((fg)) && detach=()
+  # CDI only injects 64-bit driver libs; 32-bit Connect helpers (upc.exe) need lib32 Vulkan.
+  local lib32=() f
+  for f in /usr/lib32/libGLX_nvidia.so* /usr/lib32/libnvidia-*.so* /usr/lib32/libEGL_nvidia.so* /usr/lib32/libcuda.so*; do
+    lib32+=(-v "$f:$f:ro")
+  done
+  podman run "${detach[@]}" --rm --name "$(ctr "$name")" \
+    --network "$net" \
+    --device nvidia.com/gpu=all --userns=keep-id --shm-size=2g \
+    --security-opt label=disable \
+    -v "$dst/prefix:$SRC_PREFIX" \
+    -v "$PROTON:$PROTON:ro" \
+    -v /usr/lib/nvidia/wine:/usr/lib/nvidia/wine:ro \
+    -v "$dst/out:/out" \
+    "${lib32[@]}" \
+    -v /etc/machine-id:/etc/machine-id:ro \
+    -e HOME=/home/steamuser -e USER=steamuser \
+    -e DISPLAY=:99 -e XDG_RUNTIME_DIR=/tmp/xdg \
+    -e WINEPREFIX="$SRC_PREFIX" \
+    -e STEAM_COMPAT_DATA_PATH="$SRC_PREFIX" \
+    -e STEAM_COMPAT_CLIENT_INSTALL_PATH=/tmp/steam \
+    -e STEAM_COMPAT_APP_ID=0 -e SteamAppId=0 -e SteamGameId=0 \
+    -e PROTON_ENABLE_NVAPI=1 -e DXVK_ENABLE_NVAPI=1 -e PROTON_ENABLE_NGX_UPDATER=0 \
+    -e DXVK_LOG_PATH=/out -e DXVK_NVAPI_LOG_PATH=/out -e DXVK_NVAPI_LOG_LEVEL=info \
+    -e WINEDEBUG=${ACO_WINEDEBUG:--all} \
+    -e WINEDLLOVERRIDES="${ACO_DLLOVERRIDES:-d3d11=n,b}" \
+    -e PROTON_LOG=1 -e PROTON_LOG_DIR=/out \
+    -e ACO_RES="$res" \
+    "$IMAGE" bash -c '
+      mkdir -p /tmp/xdg /tmp/steam; chmod 700 /tmp/xdg
+      Xvfb :99 -screen 0 ${ACO_RES}x24 -nolisten tcp >/out/xvfb.log 2>&1 &
+      for i in $(seq 50); do xdpyinfo >/dev/null 2>&1 && break; sleep 0.1; done
+      echo "launch $(date -Is)" > /out/run.log
+      exec python3 "'"$PROTON"'/proton" waitforexitandrun "'"$exe"'" '"$args"' >>/out/run.log 2>&1'
+  ((fg)) || echo "started $(ctr "$name"); logs in $dst/out"
+}
+
+cmd_shot() {
+  local name=$1 out=${2:-$INST_ROOT/$1/out/shot-$(date +%H%M%S).png}
+  podman exec "$(ctr "$name")" bash -c 'DISPLAY=:99 import -window root png:-' > "$out"
+  echo "$out"
+}
+cmd_keys() { local name=$1; shift; podman exec -e DISPLAY=:99 "$(ctr "$name")" xdotool "$@"; }
+cmd_exec() { local name=$1; shift; podman exec -e DISPLAY=:99 "$(ctr "$name")" "$@"; }
+cmd_stop() { podman rm -f -t 3 "$(ctr "$1")"; }
+cmd_rm() { cmd_stop "$1" 2>/dev/null || true; rm -rf --one-file-system "${INST_ROOT:?}/$1"; }
+
+c=${1:-}; shift || true
+case $c in
+  create|run|shot|keys|exec|stop|rm) "cmd_$c" "$@";;
+  *) sed -n '2,20p' "$0"; exit 1;;
+esac

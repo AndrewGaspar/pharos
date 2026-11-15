@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# peek <instance> [out.png] — quarter-res screenshot for quick inspection
+set -e
+out=${2:-/tmp/claude-1000/-home-ajg-code-ac-dlss/249d0810-7bc6-42cc-9509-5599a9b80e14/scratchpad/peek-$1.png}
+podman exec "aco-$1" bash -c 'DISPLAY=:99 import -window root png:-' | magick - -resize 40% "$out"
+echo "$out"
