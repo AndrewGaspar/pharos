@@ -35,6 +35,8 @@
 #   aco kill-game <name>
 #   aco shot <name> [file]   full-res screenshot of the instance display
 #   aco keys <name> <xdotool args...>   e.g. aco keys t1 keydown Return sleep 0.15 keyup Return
+#   aco fixture <name> <fixture>        install a story-save fixture ($INST_ROOT/fixtures/<fixture>; game stopped)
+#   aco fixture-save <name> <fixture> [note]   archive the instance's current save slots as a fixture
 #   aco exec <name> <cmd...>
 #   aco down <name>          stop container
 #   aco rm <name>            delete instance
@@ -399,6 +401,48 @@ cmd_shot() {
   [[ -s $out ]] || die "screenshot failed"
   echo "$out"
 }
+# Story-save fixtures: $INST_ROOT/fixtures/<fixture>/{1..6}.save (+ README). The game keeps all of
+# its slots in these six files (pairs: file + backup) in the instance prefix's own savegame dir;
+# bridge mode never uploads them. Never point this at the user's prefixes.
+FIXTURES=$INST_ROOT/fixtures
+savedir() { echo "$(inst "$1")/prefix/$UPC_REL/savegames/$(cat "$(inst "$1")/account_id")/$ACO_APPID"; }
+game_running() { podman exec "$(ctr "$1")" pgrep -x ACOrigins.exe >/dev/null 2>&1; }
+
+cmd_fixture() {  # fixture <name> <fixture>: install a fixture (game must be stopped)
+  local name=$1 fx=$2 d i; d=$(savedir "$name")
+  [[ -f $FIXTURES/$fx/1.save ]] || die "no fixture $FIXTURES/$fx"
+  [[ -d $d ]] || die "no savegame dir $d"
+  game_running "$name" && die "stop the game first (aco kill-game $name): it rewrites its saves on exit"
+  if [[ ! -d $(inst "$name")/savegame-orig ]]; then mkdir -p "$(inst "$name")/savegame-orig" && cp -a "$d"/. "$(inst "$name")/savegame-orig/"; fi
+  for i in 1 2 3 4 5 6; do cp "$FIXTURES/$fx/$i.save" "$d/$i.save"; chmod 644 "$d/$i.save"; done
+  log "$name: installed save fixture $fx"
+  echo "fixture $fx installed in $name; launch with: scripts/aco game $name ... && scripts/aco-dt $name --story [location]"
+}
+
+cmd_fixture_save() {  # fixture-save <name> <fixture> [note]: archive the instance's current slots
+  local name=$1 fx=$2 note=${3:-} d i; d=$(savedir "$name")
+  [[ $fx =~ ^[a-z0-9][a-z0-9_-]*$ ]] || die "fixture names: lowercase letters, digits, - and _"
+  [[ -e $FIXTURES/$fx ]] && die "fixture $fx exists (remove it first to replace it)"
+  mkdir -p "$FIXTURES/$fx"
+  for i in 1 2 3 4 5 6; do cp "$d/$i.save" "$FIXTURES/$fx/$i.save"; done
+  local where=""
+  if game_running "$name"; then
+    where=$("$HERE/tools/where" "$name" 2>/dev/null || true)
+    cmd_shot "$name" "$FIXTURES/$fx/fixture.png" >/dev/null || true
+  fi
+  { echo "# Save fixture: $fx"; echo; echo "Archived $(date -Is) from instance $name."
+    [[ -n $note ]] && { echo; echo "$note"; }
+    [[ -n $where ]] && { echo; echo "Player when archived (tools/where: x y z yaw camera x y z yaw pitch): $where"; }
+    [[ -f $FIXTURES/$fx/fixture.png ]] && { echo; echo "fixture.png: the game when archived (768x480)."; }
+    echo; echo "Install: scripts/aco fixture <instance> $fx   (game stopped), then"
+    echo "scripts/aco game <instance> --mod build/mod && scripts/aco-dt <instance> --story [location]"
+    echo; echo "Loading puts the player at the region's spawn point (e.g. Alexandria: -749.7 3574.2), not"
+    echo "the exact saved spot; pass a tools/teleport location to aco-dt to go there."; } > "$FIXTURES/$fx/README.md"
+  chmod 444 "$FIXTURES/$fx"/*; chmod 555 "$FIXTURES/$fx"
+  game_running "$name" && echo "note: the game was running; slot files are as of its last save" >&2
+  echo "archived $FIXTURES/$fx"
+}
+
 cmd_keys() { local name=$1; shift; xexec "$name" xdotool "$@"; }
 cmd_exec() { local name=$1; shift; xexec "$name" "$@"; }
 cmd_down() { podman rm -f -t 5 "$(ctr "$1")" >/dev/null; }
@@ -408,6 +452,8 @@ c=${1:-}; shift || true
 case $c in
   gold|login|create|up|game|shot|keys|exec|down|rm) "cmd_$c" "$@";;
   kill-game) cmd_kill_game "$@";;
+  fixture) cmd_fixture "$@";;
+  fixture-save) cmd_fixture_save "$@";;
   2fa) cmd_2fa "$@";;
-  *) sed -n '2,32p' "$0"; exit 1;;
+  *) sed -n '2,34p' "$0"; exit 1;;
 esac
