@@ -1,6 +1,86 @@
 # DLSS Frame Generation for a D3D11 game under Proton
 
-Status: **blocked on the Vulkan route; recommend the D3D12 (vkd3d-proton) route next.** No generated frame has been produced yet.
+Status (2026-11-16): **working through the D3D12 route (`[fg] mode=d3d12`)**: genuinely
+interpolated frames in game. The Vulkan route below (`mode=on`) still never generates and is kept
+for reference.
+
+## D3D12 route (`src/fg/fg_d3d12.cpp`, `[fg] mode=d3d12`)
+
+DLSS-G runs through NGX's **D3D12** API on a vkd3d-proton device of our own, next to the game's
+DXVK D3D11 device:
+
+1. **Device**: `LoadLibrary("d3d12.dll")` (the prefix's vkd3d-proton) and `D3D12CreateDevice` on the
+   DXGI adapter of the game's D3D11 device. Created with `VKD3D_CONFIG=descriptor_heap` (appended
+   before our device's creation, `[fg] descriptor_heap=1`): in vkd3d-proton 3.1's default
+   descriptor-buffer mode, `NvAPI_D3D12_GetCudaIndependentDescriptorObject` fails (`E_INVALIDARG`,
+   no image view) for two raw buffer UAVs DLSS-G creates (R32 typeless, 256 KB); heap mode resolves
+   any heap slot through `vkGetDeviceCombinedImageSamplerIndexNVX`. (Generation worked without it
+   in the synthetic test, but heap mode removes the errors.)
+2. **Sharing**: D3D11 textures created with `D3D11_RESOURCE_MISC_SHARED_NTHANDLE | SHARED`, NT
+   handle → `ID3D12Device::OpenSharedHandle`; one `ID3D11Fence` (`D3D11_FENCE_FLAG_SHARED`) opened as
+   `ID3D12Fence`. Verified first with `tools/interop-test/interop_test.cpp` (D3D11 writes → D3D12
+   copies → D3D11 reads back, all 32768 pixels correct).
+3. **Per frame**: D3D11 copies backbuffer, depth (R32_TYPELESS → shared R32_FLOAT), motion vectors
+   and the HUD-less DLSS output into the shared textures, `Signal(v)`, flush; the D3D12 queue
+   `Wait(v)`, evaluates DLSS-G, `Signal(v+1)`; the D3D11 context `Wait(v+1)` before copying the
+   generated frame out. No CPU waits in steady state (ring of 3 allocators).
+4. **NGX**: the core's `NVSDK_NGX_D3D12_Init` export takes *(app id, path, device, version,
+   feature info)* — the version before the feature info, unlike the SDK header's inline overload
+   (passing them in header order gives "installed NGX API is older than the one used by client").
+5. **Presenting** (`[fg] present_thread=1`, default): the game renders into a *proxy backbuffer*
+   (our `IDXGISwapChain::GetBuffer` hook returns our texture; the swapchain's own backbuffer is only
+   written right before each real Present). A present thread presents the generated frame, waits
+   half a (real) frame interval, then presents the real frame, while the game already renders the
+   next frame. The game's blt-model swapchain has a single backbuffer, so without the proxy the
+   game would overwrite it before the deferred real present. The D3D11 immediate context is shared
+   by both threads → multithread protection (`ID3D10Multithread`). **DXVK's
+   `SwapDeviceContextState` doesn't take that lock** (all other context methods do), so the DLSS-SR
+   upscaler holds it explicitly around its job; without that the game crashed within seconds in
+   DXVK's CS chunk emission (null chunk, two threads emitting). `present_thread=0` presents both
+   inline with the pacing wait on the render thread (which then settles at frame time = 2x work,
+   halving the base rate); `=2` uses the proxy with inline presents (a bisecting aid).
+6. **Init** (D3D12 device + NGX, ~1 s) runs on its own thread; presents stay normal until ready.
+
+Verification (`[fg] verify=1`: every 2 s reads back previous real, generated and current real
+frame, logs their differences and writes `out/fgverify/*.ppm`). Running in Discovery Tour:
+`|gen-prev| 10.5, |gen-cur| 10.5, |prev-cur| 15.0` (mean abs, 0..255) — the generated frame differs
+from both neighbours symmetrically and is not a blend (that would give 7.5 + 7.5 = 15); the images
+show the scene (background props, the character's arm) between the two real positions, sharp, no
+double images. Synthetic check (`tools/interop-test/dlssg_d3d12_test.cpp`): a square moving 16 px
+per frame is generated at x = 226 between real 220 and 236 (count 1 and 2).
+
+DLSS-G on D3D12 costs ~1.55 ms GPU per evaluation at 768x480 (count=1). `count=1` (one generated
+frame per real frame) generates on D3D12; the "last index is the real-frame call" reading from the
+Vulkan-route reverse engineering below doesn't hold here.
+
+### D3D12 route measurements (2026-11-16)
+
+`tools/gpu-exclusive t3 tools/latency-bench t3 <label> upscaler.render_scale=0.5 ...` — DLSS
+Performance (preset M), Reflex on, t3 at 768x480 ultra-high, Discovery Tour, 40 mouse-look
+injections each, fresh launch per configuration:
+
+| | FG off | FG on (`mode=d3d12`, count 1, present thread) |
+|---|---|---|
+| real (game) frames/s | 139.0 | 110.1 |
+| presented frames/s | 139 | ~220 (110 real + 110 generated) |
+| input → frame done (GPU), median / p10 / p90 ms | 26.8 / 23.5 / 30.1 | 35.3 / 29.2 / 54.9 |
+| generated frame presented after the game's Present | – | +1.3–2.1 ms |
+| real frame presented after the game's Present | – | +5.6–6.9 ms (half-interval pacing) |
+| DLSS-G GPU time per frame | – | 1.55 ms |
+
+So the base rate drops by ~21 % (the DLSS-G evaluation plus copies on a GPU-bound frame), it is no
+longer halved; output is ~1.6x FG-off. Input latency to the real frame grows by roughly
+8.5 ms (frame done) + 6 ms (pacing delay) ≈ 15 ms at the median, with a long p90 tail (55 ms vs
+30 ms) — the present thread sometimes blocks the game (6–12 joins per 2 s at ~5–9 ms). At the
+target 2560x1600 the DLSS-G cost per frame is higher in absolute terms but smaller relative to the
+frame; not measured yet (instances run at 768x480).
+
+Still open on this route: frame pacing quality not measured on a real display (this is headless
+gamescope); the p90 latency tail; HUD-less/UI handling (the HUD-less input is the DLSS output, the
+UI is interpolated with the scene); camera matrices are identity (DLSS-G relies on motion vectors).
+
+## Vulkan route (`mode=on`, not working)
+
 Everything up to the generated image works: DLSS-G is created and evaluated on DXVK's VkDevice every
 frame (~2.1–2.7 ms GPU at 768x480), reports interpolation enabled, copies the real frame to
 `OutputReal`, and the mod presents generated + real frames. But DLSS-G's *generation kernels* never

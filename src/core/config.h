@@ -46,7 +46,7 @@ struct Config {
   bool fg_swap_outputs = false;         // [fg] swap_outputs (debug)
   bool fg_hudless = true;
   float fg_refresh_hz = 165.0f;
-  int fg_count = 2;       // [fg] count: DLSS-G MultiFrameCount (310.9: last index = real frame, see docs)
+  int fg_count = 1;       // [fg] count: DLSS-G MultiFrameCount (generated frames evaluated per real frame)
   int fg_show_index = 1;
   bool fg_raw_output = false;  // [fg] raw_output (debug)
   bool fg_trace_cu = false;
