@@ -7,3 +7,8 @@ cd "$root/third_party"
 if [[ ! -d DLSS-310.9.16 ]]; then
   curl -L https://github.com/NVIDIA/DLSS/archive/refs/tags/v310.9.16.tar.gz | tar xz
 fi
+# NVAPI SDK headers (MIT) for Reflex: function IDs (nvapi_interface.h) and structs (nvapi.h).
+NVAPI_COMMIT=51e5aae4bc40c3ccd3fb7d4dfd94256e7bfc496e
+if [[ ! -d nvapi-$NVAPI_COMMIT ]]; then
+  curl -L https://github.com/NVIDIA/nvapi/archive/$NVAPI_COMMIT.tar.gz | tar xz
+fi

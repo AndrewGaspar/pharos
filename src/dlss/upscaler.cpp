@@ -730,6 +730,13 @@ void upscaler_init(ID3D11Device* dev, ID3D11DeviceContext* immediate) {
 
 void upscaler_on_present(IDXGISwapChain* sc) {
   uint64_t f = S.frame.fetch_add(1) + 1;
+  // Hotkey: DLSS <-> the game's own TAA, for A/B comparisons in play (edge-triggered).
+  static bool key_was_down = false;
+  if (int vk = config_toggle_vk()) {
+    bool down = (GetAsyncKeyState(vk) & 0x8000) != 0;
+    if (down && !key_was_down) config_toggle_upscaler();
+    key_was_down = down;
+  }
   // Perf report every ~2 s: CPU frame pacing and GPU time spent in our upscaling work.
   LARGE_INTEGER now, freq;
   QueryPerformanceCounter(&now);

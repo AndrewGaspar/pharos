@@ -280,6 +280,11 @@ cmd_up() {
 cmd_kill_game() {
   # Match the process name exactly (-x): -f would also match this very bash -c command line.
   podman exec "$(ctr "$1")" bash -c 'pkill -x ACOrigins.exe || true; for i in $(seq 40); do pgrep -x ACOrigins.exe | xargs -r ps -o stat= -p | grep -qv Z || exit 0; sleep 0.5; done; pkill -9 -x ACOrigins.exe; true'
+  if [[ $(cat "$(inst "$1")/mode" 2>/dev/null) != connect ]]; then
+    # Bridge mode: nothing else should outlive the game. A leftover wineserver/bridge from the
+    # previous run can leave the next game hanging before it ever reaches the SDK.
+    podman exec -e ACO_PROTON="$PROTON" "$(ctr "$1")" bash -c '"$ACO_PROTON/files/bin/wineserver" -k; sleep 1; pkill -9 -x ubi-bridge.exe; pkill -9 -f "proton run" ; true' 2>/dev/null || true
+  fi
 }
 
 # Bridge mode launch (see header): fresh launch context from ubid, restart ubi-bridge.exe, then

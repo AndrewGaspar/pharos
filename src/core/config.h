@@ -18,6 +18,10 @@ namespace aco {
 // mip_bias=auto         ; auto = log2(render/display) + mip_bias_offset, or a fixed number
 // mip_bias_offset=0
 // latency_log=0        ; 1 = write latency_taa.csv / latency_present.csv (see core/latency.h)
+//
+// [reflex]
+// mode=on               ; off | on | boost (on + keep GPU clocks high)
+// fps_limit=0           ; >0: Reflex frame rate cap (e.g. 160 just below a 165 Hz refresh)
 struct Config {
   bool enabled = true;
   std::string backend = "dlss";
@@ -29,11 +33,21 @@ struct Config {
   std::string mip_bias = "auto";
   float mip_bias_offset = 0.0f;
   bool latency_log = false;
+  std::string toggle_key = "F10";  // [upscaler] toggle_key: F1..F24 or none (DLSS <-> game TAA)
+  std::string reflex = "on";     // [reflex] mode
+  float reflex_fps_limit = 0.0f;  // [reflex] fps_limit
+  bool reflex_markers = true;     // [reflex] markers
+  std::string reflex_marker_set = "minimal";  // [reflex] marker_set: minimal | full (experiments)
+  bool reflex_optimize = false;   // [reflex] optimize: bUseMarkersToOptimize
+  bool reflex_probe = false;      // [reflex] probe (input thread diagnostics)
 };
 
 const Config& config();
 // Re-reads the file; returns true if anything changed.
 bool config_reload();
 std::wstring module_dir();
+// Runtime toggle (hotkey) between DLSS and the game's TAA; reverts when the file changes.
+void config_toggle_upscaler();
+int config_toggle_vk();  // virtual-key code of [upscaler] toggle_key, 0 = none
 
 } // namespace aco

@@ -72,3 +72,20 @@ not bias texture LOD itself.
 CB contents are written with `Map(WRITE_DISCARD)` on deferred contexts; draws bind ranges with
 `*SetConstantBuffers1`. The tracer/upscaler shadow writes per (context, buffer) to read values at
 record time (`core/cbshadow`).
+
+## Threads and input (for latency work)
+
+- **Window/message thread**: busy-polls `PeekMessage` (~15,000 calls per frame). Mouse motion
+  arrives as `WM_INPUT` and is read there with `GetRawInputData`, then buffered for the simulation.
+- **Simulation thread**: consumes the buffered input at the start of its frame. It makes no user32
+  calls, so its frame boundary isn't visible at the API level.
+- **Render thread**: records on deferred contexts (9 worker threads) and calls `Present`.
+- The game does **not** call user32 through its import table (Denuvo/VMProtect resolve imports
+  privately). Wine's user32 calls win32u through *its* IAT, so hooking user32's imports
+  (`NtUserPeekMessage`, `NtUserGetRawInputData`, ...) does see every call.
+
+Measured input-to-frame latency (mouse-look injected through XTEST, camera change detected from
+`PassParams.viewToWorld`; `tools/latency`): the game needs ~3 frames (22-29 ms at 115-145 fps)
+from an input event to recording the frame that shows it (input buffering + simulation +
+render-thread handoff). When GPU-bound, DXVK's present queue adds ~2 more frames, which is what
+Reflex removes.

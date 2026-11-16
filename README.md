@@ -4,7 +4,7 @@ NVIDIA DLSS 4.5 Super Resolution for **Assassin's Creed Origins** (PC, v1.62), r
 TAA. Built from source with mingw; no game code is patched (the exe is Denuvo + VMProtect protected),
 everything happens at the D3D11 API level through a `d3d11.dll` proxy.
 
-Status: DLSS SR working (all quality modes + DLAA). Reflex and Frame Generation are next.
+Status: DLSS SR (all quality modes + DLAA) and NVIDIA Reflex working. Frame Generation is next.
 
 ## Results (RTX 5070 Laptop, 2560x1600, Discovery Tour / Siwa village, uncapped)
 
@@ -22,6 +22,18 @@ frames silently fall back to the game's TAA.)
 
 At the same render resolution DLSS is far cleaner than the game's TAA (which, below 100% scale,
 is simply bilinear-upscaled by the UI composite).
+
+### Latency (Ultra High, DLSS Performance, ~118 fps GPU-bound; `tools/latency-bench`)
+
+Median input → frame finished on the GPU (mouse-look injection, 40 samples per fresh launch;
+display scanout not included):
+
+| | Reflex off | Reflex on |
+|---|---|---|
+| DLSS Performance | 48.6 ms | **36.5 ms** (no fps cost) |
+| Game TAA (CPU-bound, 144 fps) | 27.0 ms | 26.5 ms (142 fps) |
+
+Press **F10** in game (`toggle_key`) to switch between DLSS and the game's own TAA live.
 
 ## How it works
 
@@ -45,6 +57,22 @@ See [docs/ENGINE_NOTES.md](docs/ENGINE_NOTES.md) for the reverse-engineered fram
 
 NGX is loaded dynamically from the driver (`_nvngx.dll`); NVIDIA's static loader library (MSVC
 only) isn't used. `NVSDK_NGX_Parameter` is called through its MSVC vtable layout explicitly.
+
+### Reflex
+
+The game has no Reflex support, so it is injected at the frame boundary we control: right after
+`Present` returns, the render thread calls `NvAPI_D3D_Sleep`, and the frame is delimited with
+latency markers (`SIMULATION_START` after the sleep … `PRESENT_START/END`, one app frame per
+Present). Under Proton this goes NVAPI (dxvk-nvapi) → DXVK's D3D11 low-latency device →
+`VK_NV_low_latency2` in the driver. The sleep holds the render thread back just enough that the
+frame reaches the GPU as it frees up, so the GPU render queue (~2 frames when GPU-bound) drains.
+
+Markers matter: without them DXVK must make each sleep wait for its own submission thread to
+finish the previous frame, which costs ~20% frame rate when the game is CPU-bound.
+
+What injection can't reach is the game's own simulation → render pipeline (~3 frames from input
+to the frame being recorded): the simulation thread's frame start isn't visible at the API level
+(see docs/ENGINE_NOTES.md, "Threads and input").
 
 ## Build
 

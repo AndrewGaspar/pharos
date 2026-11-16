@@ -18,6 +18,8 @@ add_library(aco_d3d11 SHARED
   src/core/cbshadow.cpp
   src/core/config.cpp
   src/core/latency.cpp
+  src/core/iat.cpp
+  src/reflex/reflex.cpp
   src/core/ctxhooks.cpp
   src/dlss/ngx.cpp
   src/dlss/kernels.cpp
