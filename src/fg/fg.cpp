@@ -72,6 +72,11 @@ struct Vk {
   PFN_vkCmdWriteTimestamp CmdWriteTimestamp = nullptr;
   PFN_vkGetQueryPoolResults GetQueryPoolResults = nullptr;
   PFN_vkGetPhysicalDeviceProperties GetPhysicalDeviceProperties = nullptr;
+  PFN_vkCreateImage CreateImage = nullptr;
+  PFN_vkGetImageMemoryRequirements GetImageMemoryRequirements = nullptr;
+  PFN_vkBindImageMemory BindImageMemory = nullptr;
+  PFN_vkCmdCopyImageToBuffer CmdCopyImageToBuffer = nullptr;
+  PFN_vkCmdClearColorImage CmdClearColorImage = nullptr;
 } vk;
 
 // ---- NGX Vulkan API (driver _nvngx.dll) ----
@@ -131,6 +136,7 @@ struct State {
   ID3D11Texture2D* real = nullptr;
   ID3D11Texture2D* interp = nullptr;
   ID3D11Texture2D* outreal = nullptr;  // debug: DLSS-G's OutputReal ([fg] show=outreal)
+  ID3D11Texture2D* scratch = nullptr;  // output for generated frames we don't present
   ID3D11UnorderedAccessView* interp_uav = nullptr;  // debug: pre-fill with magenta
   uint32_t tex_w = 0, tex_h = 0;
   DXGI_FORMAT tex_format = DXGI_FORMAT_UNKNOWN;
@@ -177,7 +183,10 @@ bool load_vulkan() {
          dev_fn(vk.AllocateMemory, "vkAllocateMemory") && dev_fn(vk.BindBufferMemory, "vkBindBufferMemory") &&
          dev_fn(vk.MapMemory, "vkMapMemory") && dev_fn(vk.CreateQueryPool, "vkCreateQueryPool") &&
          dev_fn(vk.CmdResetQueryPool, "vkCmdResetQueryPool") && dev_fn(vk.CmdWriteTimestamp, "vkCmdWriteTimestamp") &&
-         dev_fn(vk.GetQueryPoolResults, "vkGetQueryPoolResults") &&
+         dev_fn(vk.GetQueryPoolResults, "vkGetQueryPoolResults") && dev_fn(vk.CreateImage, "vkCreateImage") &&
+         dev_fn(vk.GetImageMemoryRequirements, "vkGetImageMemoryRequirements") &&
+         dev_fn(vk.BindImageMemory, "vkBindImageMemory") && dev_fn(vk.CmdCopyImageToBuffer, "vkCmdCopyImageToBuffer") &&
+         dev_fn(vk.CmdClearColorImage, "vkCmdClearColorImage") &&
          (vk.GetPhysicalDeviceProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
               vk.gipa(S.instance, "vkGetPhysicalDeviceProperties"))) != nullptr &&
          (vk.GetPhysicalDeviceMemoryProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(
@@ -404,9 +413,30 @@ bool ngx_res(ID3D11Resource* r, bool rw, NVSDK_NGX_Resource_VK* out, VkTex* tex_
     }
     r->AddRef();
     it = S.views.emplace(r, State::View{t.image, view, 0}).first;
-    ACO_LOG("fg: view for %p (VkImage %p) %ux%u format=%d layout=%d usage=0x%x (%zu cached)",
+    ACO_LOG("fg: view for %p (VkImage %p) %ux%u format=%d layout=%d usage=0x%x flags=0x%x (%zu cached)",
             static_cast<void*>(r), static_cast<void*>(t.image), t.info.extent.width, t.info.extent.height,
-            t.info.format, t.layout, t.info.usage, S.views.size());
+            t.info.format, t.layout, t.info.usage, t.info.flags, S.views.size());
+    // Diagnostics: the NVX handles NGX's kernels use to reach this view.
+    auto get_handle = reinterpret_cast<PFN_vkGetImageViewHandleNVX>(vk.gdpa(S.device, "vkGetImageViewHandleNVX"));
+    auto get_handle64 =
+        reinterpret_cast<PFN_vkGetImageViewHandle64NVX>(vk.gdpa(S.device, "vkGetImageViewHandle64NVX"));
+    auto get_addr = reinterpret_cast<PFN_vkGetImageViewAddressNVX>(vk.gdpa(S.device, "vkGetImageViewAddressNVX"));
+    for (VkDescriptorType dt : {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE}) {
+      VkImageViewHandleInfoNVX hi{VK_STRUCTURE_TYPE_IMAGE_VIEW_HANDLE_INFO_NVX};
+      hi.imageView = view;
+      hi.descriptorType = dt;
+      uint32_t h32 = get_handle ? get_handle(S.device, &hi) : 0xffffffffu;
+      uint64_t h64 = get_handle64 ? get_handle64(S.device, &hi) : ~0ull;
+      ACO_LOG("fg:   NVX handle (%s): 32-bit 0x%x, 64-bit 0x%llx (fn %p/%p)",
+              dt == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ? "storage" : "sampled", h32, (unsigned long long)h64,
+              reinterpret_cast<void*>(get_handle), reinterpret_cast<void*>(get_handle64));
+    }
+    if (get_addr) {
+      VkImageViewAddressPropertiesNVX ap{VK_STRUCTURE_TYPE_IMAGE_VIEW_ADDRESS_PROPERTIES_NVX};
+      VkResult ar = get_addr(S.device, view, &ap);
+      ACO_LOG("fg:   NVX address: %d addr 0x%llx size %llu", ar, (unsigned long long)ap.deviceAddress,
+              (unsigned long long)ap.size);
+    }
   }
   it->second.last_used = S.frames;
   r->AddRef();
@@ -443,6 +473,7 @@ bool ensure_textures(const D3D11_TEXTURE2D_DESC& bb) {
   safe_release(S.interp_uav);
   safe_release(S.interp);
   safe_release(S.outreal);
+  safe_release(S.scratch);
   D3D11_TEXTURE2D_DESC d{};
   d.Width = bb.Width;
   d.Height = bb.Height;
@@ -459,7 +490,8 @@ bool ensure_textures(const D3D11_TEXTURE2D_DESC& bb) {
   bool fill = config().fg_debug_fill && (bb.Format == DXGI_FORMAT_R8G8B8A8_UNORM || bb.Format == DXGI_FORMAT_B8G8R8A8_UNORM);
   if (FAILED(S.dev->CreateTexture2D(&d, nullptr, &S.real)) ||
       FAILED(S.dev->CreateTexture2D(&d, fill ? &init : nullptr, &S.interp)) ||
-      FAILED(S.dev->CreateTexture2D(&d, fill ? &init : nullptr, &S.outreal))) {
+      FAILED(S.dev->CreateTexture2D(&d, fill ? &init : nullptr, &S.outreal)) ||
+      FAILED(S.dev->CreateTexture2D(&d, nullptr, &S.scratch))) {
     ACO_LOG("fg: failed to create %ux%u format %d textures", d.Width, d.Height, d.Format);
     safe_release(S.real);
     return false;
@@ -487,7 +519,10 @@ bool ensure_feature(uint32_t w, uint32_t h, uint32_t rw, uint32_t rh, VkFormat f
   p.set(NVSDK_NGX_Parameter_Height, h);
   p.set(NVSDK_NGX_DLSSG_Parameter_Width, w);
   p.set(NVSDK_NGX_DLSSG_Parameter_Height, h);
-  p.set(NVSDK_NGX_DLSSG_Parameter_MultiFrameCount, 1u);  // read at create time
+  // In this DLSS-G build (310.9) the LAST index of a MultiFrameCount sequence is the real frame and
+  // indices before it are generated at t = index / (count + 1) (EndpointCoreInputs::
+  // ComputeAndValidateTimeFactor, reverse-engineered): count=1 never generates anything.
+  p.set(NVSDK_NGX_DLSSG_Parameter_MultiFrameCount, static_cast<unsigned int>(config().fg_count));
   for (const auto& kv : config().fg_create_extra) p.set(kv.first.c_str(), kv.second);
   // Which numbering NGX expects for the backbuffer format on Vulkan is undocumented; [fg]
   // bb_format_dxgi=1 passes the DXGI value of the backbuffer instead of the VkFormat.
@@ -519,6 +554,93 @@ bool ensure_feature(uint32_t w, uint32_t h, uint32_t rw, uint32_t rh, VkFormat f
 const float kIdentity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
 
 // Generates the frame between the previous real frame and S.real (current) into S.interp.
+// Debug ([fg] raw_output=1): an output image created directly with Vulkan (not by DXVK), cleared to a
+// marker colour before each evaluation and copied to a host-visible buffer afterwards, to tell
+// whether DLSS-G's kernels can write DXVK-created images at all.
+struct RawOut {
+  VkImage image = VK_NULL_HANDLE;
+  VkImageView view = VK_NULL_HANDLE;
+  VkBuffer readback = VK_NULL_HANDLE;
+  volatile uint32_t* map = nullptr;
+  uint32_t w = 0, h = 0;
+  int pending_slot = -1;
+} g_raw;
+
+uint32_t find_memory(uint32_t bits, VkMemoryPropertyFlags want) {
+  VkPhysicalDeviceMemoryProperties mp{};
+  vk.GetPhysicalDeviceMemoryProperties(S.pd, &mp);
+  for (uint32_t t = 0; t < mp.memoryTypeCount; ++t)
+    if ((bits & (1u << t)) && (mp.memoryTypes[t].propertyFlags & want) == want) return t;
+  return UINT32_MAX;
+}
+
+bool raw_out_init(uint32_t w, uint32_t h, VkFormat fmt) {
+  if (g_raw.image && g_raw.w == w && g_raw.h == h) return true;
+  VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+  ci.imageType = VK_IMAGE_TYPE_2D;
+  ci.format = fmt;
+  ci.extent = {w, h, 1};
+  ci.mipLevels = 1;
+  ci.arrayLayers = 1;
+  ci.samples = VK_SAMPLE_COUNT_1_BIT;
+  ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+  ci.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+             VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  if (vk.CreateImage(S.device, &ci, nullptr, &g_raw.image) != VK_SUCCESS) return false;
+  VkMemoryRequirements req{};
+  vk.GetImageMemoryRequirements(S.device, g_raw.image, &req);
+  VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+  mai.allocationSize = req.size;
+  mai.memoryTypeIndex = find_memory(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+  VkDeviceMemory mem = VK_NULL_HANDLE;
+  if (vk.AllocateMemory(S.device, &mai, nullptr, &mem) != VK_SUCCESS) return false;
+  vk.BindImageMemory(S.device, g_raw.image, mem, 0);
+  VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+  vi.image = g_raw.image;
+  vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  vi.format = fmt;
+  vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  vk.CreateImageView(S.device, &vi, nullptr, &g_raw.view);
+  VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+  bci.size = VkDeviceSize(w) * h * 4;
+  bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+  vk.CreateBuffer(S.device, &bci, nullptr, &g_raw.readback);
+  vk.GetBufferMemoryRequirements(S.device, g_raw.readback, &req);
+  mai.allocationSize = req.size;
+  mai.memoryTypeIndex =
+      find_memory(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+  VkDeviceMemory bmem = VK_NULL_HANDLE;
+  void* ptr = nullptr;
+  if (vk.AllocateMemory(S.device, &mai, nullptr, &bmem) != VK_SUCCESS) return false;
+  vk.BindBufferMemory(S.device, g_raw.readback, bmem, 0);
+  vk.MapMemory(S.device, bmem, 0, VK_WHOLE_SIZE, 0, &ptr);
+  g_raw.map = static_cast<volatile uint32_t*>(ptr);
+  g_raw.w = w;
+  g_raw.h = h;
+  ACO_LOG("fg: raw Vulkan output image %ux%u format %d created", w, h, fmt);
+  return true;
+}
+
+// Called with the previous evaluation's slot fence signalled: summarise what landed in the image.
+void raw_out_report() {
+  if (g_raw.pending_slot < 0 || !g_raw.map) return;
+  vk.WaitForFences(S.device, 1, &S.fence[g_raw.pending_slot], VK_TRUE, UINT64_MAX);
+  uint32_t n = g_raw.w * g_raw.h, marker = 0, zero = 0, other = 0;
+  uint64_t sum = 0;
+  for (uint32_t i = 0; i < n; i += 97) {
+    uint32_t px = g_raw.map[i];
+    if (px == 0xffff00ffu) ++marker;
+    else if (px == 0) ++zero;
+    else ++other, sum += (px & 0xff) + ((px >> 8) & 0xff) + ((px >> 16) & 0xff);
+  }
+  static int logged = 0;
+  if (logged++ < 20 || logged % 120 == 0)
+    ACO_LOG("fg: raw output after eval: marker %u, zero %u, other %u (mean rgb %.1f) of %u samples", marker, zero,
+            other, other ? double(sum) / other / 3 : 0.0, (n + 96) / 97);
+  g_raw.pending_slot = -1;
+}
+
 bool generate(const FgInputs& in, ID3D11Texture2D* swap_bb) {
   NVSDK_NGX_Resource_VK bb{}, depth{}, mv{}, out{}, outreal{}, hudless{};
   VkTex bb_t;
@@ -544,13 +666,15 @@ bool generate(const FgInputs& in, ID3D11Texture2D* swap_bb) {
     p.set(NVSDK_NGX_DLSSG_Parameter_HUDLessSubrectWidth, S.tex_w);
     p.set(NVSDK_NGX_DLSSG_Parameter_HUDLessSubrectHeight, S.tex_h);
   }
-  if ((config().fg_show == "outreal" || swap) && ngx_res(swap ? S.interp : S.outreal, true, &outreal)) {
+  if ((config().fg_show == "outreal" || config().fg_show == "compare" || swap) && ngx_res(swap ? S.interp : S.outreal, true, &outreal)) {
     p.set(NVSDK_NGX_DLSSG_Parameter_OutputReal, static_cast<void*>(&outreal));
     p.set(NVSDK_NGX_DLSSG_Parameter_OutputRealSubrectWidth, S.tex_w);
     p.set(NVSDK_NGX_DLSSG_Parameter_OutputRealSubrectHeight, S.tex_h);
   }
-  p.set(NVSDK_NGX_DLSSG_Parameter_MultiFrameCount, 1u);
-  p.set(NVSDK_NGX_DLSSG_Parameter_MultiFrameIndex, 1u);
+  const unsigned int count = static_cast<unsigned int>(config().fg_count);
+  const unsigned int show_index = static_cast<unsigned int>(config().fg_show_index);
+  NVSDK_NGX_Resource_VK scratch{};
+  if (!ngx_res(S.scratch, true, &scratch)) return false;
   for (const char* m : {NVSDK_NGX_DLSSG_Parameter_CameraViewToClip, NVSDK_NGX_DLSSG_Parameter_ClipToCameraView,
                         NVSDK_NGX_DLSSG_Parameter_ClipToLensClip, NVSDK_NGX_DLSSG_Parameter_ClipToPrevClip,
                         NVSDK_NGX_DLSSG_Parameter_PrevClipToClip})
@@ -582,6 +706,10 @@ bool generate(const FgInputs& in, ID3D11Texture2D* swap_bb) {
   p.set(NVSDK_NGX_DLSSG_Parameter_LinearizedDepth_Scale, 1.0f);
   p.set(NVSDK_NGX_DLSSG_Parameter_LinearizedDepth_NearFarPartition, 600.0f);
   p.set(NVSDK_NGX_DLSSG_Parameter_AutomodeOverrideReset, 0u);
+  // Increments by one per rendered (real) frame, as the SDK asks for.
+  static unsigned long long backbuffer_id = 0;
+  p.set(NVSDK_NGX_DLSSG_Parameter_BackbufferFrameID, ++backbuffer_id);
+  if (cfg.fg_refresh_hz > 0) p.set("DLSSG.RefreshRate", cfg.fg_refresh_hz);
   p.set(NVSDK_NGX_DLSSG_Parameter_CameraNear, 0.1f);
   p.set(NVSDK_NGX_DLSSG_Parameter_CameraFar, 100000.0f);
   p.set(NVSDK_NGX_DLSSG_Parameter_CameraFOV, 1.0f);
@@ -622,9 +750,52 @@ bool generate(const FgInputs& in, ID3D11Texture2D* swap_bb) {
   }
   NVSDK_NGX_Result r = NVSDK_NGX_Result_Fail;
   int64_t t0 = now_us();
+  bool use_raw = config().fg_raw_output && raw_out_init(S.tex_w, S.tex_h, bb_t.info.format);
+  NVSDK_NGX_Resource_VK raw{};
+  if (use_raw) {
+    raw_out_report();
+    raw = NVSDK_NGX_Create_ImageView_Resource_VK(g_raw.view, g_raw.image, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+                                                 bb_t.info.format, S.tex_w, S.tex_h, true);
+    g_raw.pending_slot = S.ring;
+  }
   bool ok = submit([&](VkCommandBuffer cmd) {
-    r = S.evaluate(cmd, S.feature, p.get(), nullptr);
-    return !NVSDK_NGX_FAILED(r);
+    if (use_raw) {
+      // To GENERAL, cleared to magenta (RGBA8 0xff00ff), before DLSS-G writes it.
+      VkImageMemoryBarrier ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+      ib.srcAccessMask = 0;
+      ib.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+      ib.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+      ib.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+      ib.srcQueueFamilyIndex = ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      ib.image = g_raw.image;
+      ib.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+      vk.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                            nullptr, 1, &ib);
+      VkClearColorValue magenta{};
+      magenta.float32[0] = 1.0f;
+      magenta.float32[2] = 1.0f;
+      magenta.float32[3] = 1.0f;
+      VkImageSubresourceRange rr{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+      vk.CmdClearColorImage(cmd, g_raw.image, VK_IMAGE_LAYOUT_GENERAL, &magenta, 1, &rr);
+      full_barrier(cmd);
+    }
+    // One evaluation per index: generated frames first, the real frame last (see create).
+    for (unsigned int i = 1; i <= count; ++i) {
+      p.set(NVSDK_NGX_DLSSG_Parameter_MultiFrameCount, count);
+      p.set(NVSDK_NGX_DLSSG_Parameter_MultiFrameIndex, i);
+      p.set(NVSDK_NGX_DLSSG_Parameter_OutputInterpolated,
+            static_cast<void*>(i == show_index ? (use_raw ? &raw : &out) : &scratch));
+      r = S.evaluate(cmd, S.feature, p.get(), nullptr);
+      if (NVSDK_NGX_FAILED(r)) return false;
+    }
+    if (use_raw) {
+      full_barrier(cmd);
+      VkBufferImageCopy bic{};
+      bic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+      bic.imageExtent = {g_raw.w, g_raw.h, 1};
+      vk.CmdCopyImageToBuffer(cmd, g_raw.image, VK_IMAGE_LAYOUT_GENERAL, g_raw.readback, 1, &bic);
+    }
+    return true;
   }, false);
   S.perf_eval_cpu_ms += (now_us() - t0) / 1000.0;
   static int logged = 0;
@@ -718,7 +889,14 @@ bool fg_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent real,
       S.imm->CopyResource(S.real, bb);
       if (generate(in, bb)) {
         // Generated frame first (it lies between the previous real frame and this one) ...
-        S.imm->CopyResource(bb, cfg.fg_show == "real" ? S.real : cfg.fg_show == "outreal" ? S.outreal : S.interp);
+        if (cfg.fg_show == "compare") {
+          // Debug: left half the input frame, right half OutputReal, both from this evaluation.
+          D3D11_BOX left{0, 0, 0, S.tex_w / 2, S.tex_h, 1};
+          S.imm->CopySubresourceRegion(bb, 0, 0, 0, 0, S.real, 0, &left);
+          S.imm->CopySubresourceRegion(bb, 0, S.tex_w / 2, 0, 0, S.outreal, 0, &left);
+        } else {
+          S.imm->CopyResource(bb, cfg.fg_show == "real" ? S.real : cfg.fg_show == "outreal" ? S.outreal : S.interp);
+        }
         *hr = real(sc, sync, flags);
         int64_t t_gen = now_us();
         ++S.perf_generated;
@@ -727,7 +905,13 @@ bool fg_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent real,
           wait_until(t_gen + static_cast<int64_t>(S.frame_interval_us / 2));
         ID3D11Texture2D* bb2 = nullptr;
         if (SUCCEEDED(sc->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&bb2)))) {
-          S.imm->CopyResource(bb2, cfg.fg_show == "generated" ? S.interp : cfg.fg_show == "outreal" ? S.outreal : S.real);
+          if (cfg.fg_show == "compare") {
+            D3D11_BOX left{0, 0, 0, S.tex_w / 2, S.tex_h, 1};
+            S.imm->CopySubresourceRegion(bb2, 0, 0, 0, 0, S.real, 0, &left);
+            S.imm->CopySubresourceRegion(bb2, 0, S.tex_w / 2, 0, 0, S.outreal, 0, &left);
+          } else {
+            S.imm->CopyResource(bb2, cfg.fg_show == "generated" ? S.interp : cfg.fg_show == "outreal" ? S.outreal : S.real);
+          }
           bb2->Release();
         }
         *hr = real(sc, sync, flags);

@@ -1,9 +1,53 @@
 # DLSS Frame Generation for a D3D11 game under Proton
 
-Status: **pipeline working end to end, image not yet correct.** DLSS-G is created and evaluated on
-DXVK's VkDevice every frame, its GPU work runs (it writes its "disable interpolation" flag = 0 and
-writes the output image), and the mod presents generated + real frames (e.g. 43.5 + 43.5 fps,
-pacing off). But the generated image DLSS-G writes is **all zeros**. See "Open issues".
+Status: **blocked on the Vulkan route; recommend the D3D12 (vkd3d-proton) route next.**
+Everything up to the generated image works: DLSS-G is created and evaluated on DXVK's VkDevice every
+frame (~2.1–2.7 ms GPU at 768x480), reports interpolation enabled, copies the real frame to
+`OutputReal`, and the mod presents generated + real frames. But DLSS-G's *generation kernels* never
+write their output — not into DXVK's images, and not into an image created directly with Vulkan
+either (see "Root-cause analysis"). On this stack (Windows `nvngx_dlssg.dll` → the driver's Wine NGX
+core → winevulkan) the kernel path doesn't produce frames.
+
+## Root-cause analysis (2026-11-16)
+
+Black-box tests (all on t3, `[fg]` debug knobs below):
+
+| Test | Result |
+|---|---|
+| `OutputReal` provided | written; **byte-identical to the input frame** (left/right same-frame compare, RMSE 0, also while the camera moves) |
+| `OutputInterpolated` (DXVK texture, magenta at creation) | never written |
+| swap which texture is passed as OutputReal / OutputInterpolated | the OutputReal one is written, the OutputInterpolated one never — parameter, not texture |
+| `OutputInterpolated` = image created with plain Vulkan (cleared magenta per frame, read back) | never written |
+| `OutputDisableInterpolation` | 0x01 on the reset frame, then 0x00 (interpolation enabled) |
+| NVX image-view handles of our views | valid (storage handles for UAV-capable images, sampled for all) |
+| GPU time of our DLSS-G submission | 2.1 ms (count=1) / 2.7 ms (count=2): DLSS-G does run work |
+| Reflex on/off, HUD-less colour, camera basis, `MvecInvalidValue`, DLSSG.Width/Height, BackbufferFrameID, RefreshRate, `StreamlineMode` (eval and create), `AsyncCreateEnabled=0`, swapchain vs copy as input, dev DLL + indicator | no change |
+
+Reverse engineering `nvngx_dlssg.dll` 310.9.16 (dev build; Ghidra headless scripts in the session
+scratchpad, RTTI names from the binary):
+
+- Feature creation builds two endpoints: `EndpointAlgorithm` (generation) and
+  `EndpointPassthrough`; a per-evaluation check picks one. Passthrough copies the backbuffer into
+  **both** outputs — since `OutputInterpolated` stays untouched we are on the `EndpointAlgorithm`
+  path.
+- `EndpointCoreInputs::ComputeAndValidateTimeFactor` defines the call sequence: the **last
+  `MultiFrameIndex` of a `MultiFrameCount` sequence is the real frame** (unless an internal flag
+  that nothing in this build sets), earlier indices are generated at `t = index / (count + 1)`.
+  So `count=1` (the SDK's documented "2x") only ever makes the real-frame call. The mod now uses
+  `count=2` (index 1 generated, index 2 real) — accepted by the DLL on this GPU (multi-frame
+  capable), GPU time rises accordingly, but the output is still not written.
+- In `EndpointAlgorithm::Evaluate` the fallback that copies the backbuffer into
+  `OutputInterpolated` is disabled right before the generation step, which then writes
+  `OutputInterpolated` from the network's compute kernels (cubins launched with
+  `vkCmdCuLaunchKernelNVX`, resources via `VK_NVX_image_view_handle`). Those writes are what never
+  land. Copies (vkCmdCopyImage) and buffer fills from the same evaluation do land.
+
+Conclusion: the Windows DLSS-G snippet's *Vulkan* kernel path does not work through the driver's
+Wine NGX core + winevulkan (whereas DLSS-SR's kernels work through DXVK's own NVX interop, and
+DLSS-G is known to work under Proton through **D3D12/vkd3d-proton**, and natively on Linux).
+Not checked: whether winevulkan's `vkCmdCuLaunchKernelNVX` thunk handles the launch form NGX uses
+(e.g. `pExtras` buffer-pointer parameters) — a winevulkan trace (`WINEDEBUG=+vulkan`) of one
+evaluation would settle it.
 
 ## Why it is not straightforward
 
@@ -83,9 +127,21 @@ DLSS-G's GPU work then executes.
 - `bb_format_dxgi=1`: pass the DXGI format number at create. Result: NGX then doesn't write the
   output at all, so on Vulkan the **VkFormat** numbering is the right one.
 
-## Open issues
+## Next steps (recommended)
 
-1. **Generated image is all zeros** (current blocker). DLSS-G writes the output (verified with a
+1. **Confirm the kernel-launch hypothesis cheaply**: trace one evaluation with `WINEDEBUG=+vulkan`
+   (or a vkCmdCuLaunchKernelNVX wrapper in our GetProcAddress hook) and compare the launch
+   parameters with DXVK's working DLSS-SR launches. If winevulkan mangles them, a fix in our
+   wrapper (re-marshalling the launch) could make the Vulkan route work as is.
+2. Otherwise switch to the **D3D12 route**: a vkd3d-proton D3D12 device in-process, DLSS-G via NGX
+   D3D12 (the path Proton officially supports), frames shared from DXVK with
+   `D3D11_RESOURCE_MISC_SHARED_NTHANDLE` textures + a shared fence, presenting through DXVK's
+   swapchain as now. Everything else built here (inputs, present takeover, pacing, Reflex
+   handling, debug knobs) carries over.
+
+## Open issues (from the first prototype)
+
+1. **Generated image never written** (current blocker, see root-cause analysis). DLSS-G writes the output (verified with a
    magenta-initialised output texture → black) and reports interpolation enabled. Next checks:
    pass `OutputReal` to see whether NGX reads the backbuffer at all (if OutputReal is also black,
    input reads are failing — e.g. image-view handle/descriptor type of DXVK images via

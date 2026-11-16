@@ -60,6 +60,10 @@ Config load() {
   c.fg_input = read_str(L"input", "swapchain", L"fg");
   c.fg_swap_outputs = read_float(L"swap_outputs", 0.0f, L"fg") != 0.0f;
   c.fg_hudless = read_float(L"hudless", 1.0f, L"fg") != 0.0f;
+  c.fg_refresh_hz = read_float(L"refresh_hz", 165.0f, L"fg");
+  c.fg_count = static_cast<int>(read_float(L"count", 2.0f, L"fg"));
+  c.fg_show_index = static_cast<int>(read_float(L"show_index", 1.0f, L"fg"));
+  c.fg_raw_output = read_float(L"raw_output", 0.0f, L"fg") != 0.0f;
   {
     auto parse = [](const std::string& extra, std::vector<std::pair<std::string, unsigned int>>& out) {
       size_t pos = 0;
@@ -92,7 +96,7 @@ bool same(const Config& a, const Config& b) {
   return a.enabled == b.enabled && a.backend == b.backend && a.preset == b.preset && a.debug == b.debug &&
          a.jitter_x == b.jitter_x && a.jitter_y == b.jitter_y && a.mv_x == b.mv_x && a.mv_y == b.mv_y &&
          a.render_scale == b.render_scale && a.mip_bias == b.mip_bias && a.mip_bias_offset == b.mip_bias_offset &&
-         a.latency_log == b.latency_log && a.fg_mode == b.fg_mode && a.fg_mv_scale == b.fg_mv_scale && a.fg_pacing == b.fg_pacing && a.fg_show == b.fg_show && a.fg_debug_fill == b.fg_debug_fill && a.fg_ngx_log == b.fg_ngx_log && a.fg_bb_format_dxgi == b.fg_bb_format_dxgi && a.fg_extra == b.fg_extra && a.fg_input == b.fg_input && a.fg_swap_outputs == b.fg_swap_outputs && a.fg_hudless == b.fg_hudless && a.fg_create_extra == b.fg_create_extra && a.reflex == b.reflex && a.reflex_fps_limit == b.reflex_fps_limit &&
+         a.latency_log == b.latency_log && a.fg_mode == b.fg_mode && a.fg_mv_scale == b.fg_mv_scale && a.fg_pacing == b.fg_pacing && a.fg_show == b.fg_show && a.fg_debug_fill == b.fg_debug_fill && a.fg_ngx_log == b.fg_ngx_log && a.fg_bb_format_dxgi == b.fg_bb_format_dxgi && a.fg_extra == b.fg_extra && a.fg_input == b.fg_input && a.fg_swap_outputs == b.fg_swap_outputs && a.fg_hudless == b.fg_hudless && a.fg_refresh_hz == b.fg_refresh_hz && a.fg_count == b.fg_count && a.fg_show_index == b.fg_show_index && a.fg_raw_output == b.fg_raw_output && a.fg_create_extra == b.fg_create_extra && a.reflex == b.reflex && a.reflex_fps_limit == b.reflex_fps_limit &&
          a.reflex_probe == b.reflex_probe && a.reflex_markers == b.reflex_markers &&
          a.reflex_marker_set == b.reflex_marker_set && a.reflex_optimize == b.reflex_optimize &&
          a.toggle_key == b.toggle_key && a.cloth_mode == b.cloth_mode && a.cloth_scale == b.cloth_scale;
