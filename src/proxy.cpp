@@ -16,6 +16,7 @@
 #include "core/latency.h"
 #include "reflex/reflex.h"
 #include "core/dump.h"
+#include "core/memtool.h"
 #include "dlss/upscaler.h"
 #include "trace/trace.h"
 
@@ -62,6 +63,7 @@ HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain* self, UINT sync, UINT flags
     latency_on_present_begin(self);
     reflex_on_present_begin(self);
     dump_poll();
+    memtool_poll();
   }
   LARGE_INTEGER a, b, f;
   QueryPerformanceCounter(&a);

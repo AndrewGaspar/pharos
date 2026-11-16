@@ -20,6 +20,7 @@ add_library(aco_d3d11 SHARED
   src/core/latency.cpp
   src/core/iat.cpp
   src/core/dump.cpp
+  src/core/memtool.cpp
   src/reflex/reflex.cpp
   src/core/ctxhooks.cpp
   src/dlss/ngx.cpp

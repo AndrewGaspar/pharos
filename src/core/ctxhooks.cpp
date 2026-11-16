@@ -10,6 +10,7 @@
 #include "core/cbshadow.h"
 #include "core/hook.h"
 #include "core/log.h"
+#include "core/memtool.h"
 #include "core/shaders.h"
 #include "core/vtidx.h"
 #include "dlss/upscaler.h"
@@ -81,28 +82,33 @@ inline void draw_common(ID3D11DeviceContext* self, const char* op, const char* a
 }
 
 void STDMETHODCALLTYPE hk_Draw(ID3D11DeviceContext* self, UINT a, UINT b) {
+  geo_count(a, false);
   char args[64] = "";
   if (trace_capturing()) snprintf(args, sizeof(args), "%u,%u", a, b);
   draw_common(self, "Draw", args, [&] { ORIG(decltype(hk_Draw), Context_Draw)(self, a, b); });
 }
 void STDMETHODCALLTYPE hk_DrawIndexed(ID3D11DeviceContext* self, UINT a, UINT b, INT c) {
+  geo_count(a, false);
   char args[64] = "";
   if (trace_capturing()) snprintf(args, sizeof(args), "%u,%u,%d", a, b, c);
   draw_common(self, "DrawIndexed", args, [&] { ORIG(decltype(hk_DrawIndexed), Context_DrawIndexed)(self, a, b, c); });
 }
 void STDMETHODCALLTYPE hk_DrawInstanced(ID3D11DeviceContext* self, UINT a, UINT b, UINT c, UINT d) {
+  geo_count(uint64_t(a) * b, false);
   char args[64] = "";
   if (trace_capturing()) snprintf(args, sizeof(args), "%u,%u,%u,%u", a, b, c, d);
   draw_common(self, "DrawInstanced", args,
               [&] { ORIG(decltype(hk_DrawInstanced), Context_DrawInstanced)(self, a, b, c, d); });
 }
 void STDMETHODCALLTYPE hk_DrawIndexedInstanced(ID3D11DeviceContext* self, UINT a, UINT b, UINT c, INT d, UINT e) {
+  geo_count(uint64_t(a) * b, false);
   char args[80] = "";
   if (trace_capturing()) snprintf(args, sizeof(args), "%u,%u,%u,%d,%u", a, b, c, d, e);
   draw_common(self, "DrawIndexedInstanced", args,
               [&] { ORIG(decltype(hk_DrawIndexedInstanced), Context_DrawIndexedInstanced)(self, a, b, c, d, e); });
 }
 void STDMETHODCALLTYPE hk_DrawIndexedInstancedIndirect(ID3D11DeviceContext* self, ID3D11Buffer* buf, UINT off) {
+  geo_count(0, true);
   char args[64] = "";
   if (trace_capturing()) snprintf(args, sizeof(args), "\"%p\",%u", static_cast<void*>(buf), off);
   draw_common(self, "DrawIndexedInstancedIndirect", args, [&] {
