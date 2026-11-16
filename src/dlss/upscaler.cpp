@@ -646,17 +646,17 @@ bool on_composite(ID3D11DeviceContext* ctx, const std::function<void()>& draw) {
   S.n_comp++;
   // Only swap if the TAA of this frame was actually replaced (else the TAA output is valid).
   if (!cfg.enabled || !S.out_srv || S.taa_replaced_frame.load() + 1 < S.frame.load()) return false;
+  // The composite is out = ui + (1 - ui.a) * scene with ui = t86 (texture0, premultiplied) and
+  // scene = t87 (texture1). Only the scene slot may be swapped: at 100% render scale the engine's
+  // texture pool hands former TAA outputs to the UI layer too, so identity alone isn't enough.
   ID3D11ShaderResourceView* srv[2] = {};
   ctx->PSGetShaderResources(86, 2, srv);
   int slot = -1;
-  {
+  if (srv[1]) {
     std::lock_guard lock(S.mutex);
-    for (int i = 0; i < 2 && slot < 0; ++i) {
-      if (!srv[i]) continue;
-      ID3D11Resource* r = resource_of(srv[i]);
-      if (S.taa_outputs.count(r)) slot = i;
-      r->Release();
-    }
+    ID3D11Resource* r = resource_of(srv[1]);
+    if (S.taa_outputs.count(r)) slot = 1;
+    r->Release();
   }
   if (diag < 10) {
     ID3D11Resource* r0 = srv[0] ? resource_of(srv[0]) : nullptr;

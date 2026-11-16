@@ -29,7 +29,8 @@
 #   aco create <name>        reflink-clone gold (free on btrfs)
 #   aco up <name> [--res WxH]           boot the container (bridge mode)
 #   aco up <name> --connect [--vnc]     legacy: boot + Connect, password login (CREDS_FILE below)
-#   aco game <name> [--mod <dir>] [--profile <p>]   (re)start the game inside a running container
+#   aco game <name> [--mod <dir>] [--profile <p>] [--fps N]   (re)start the game inside a running
+#                            container (--fps: frame cap via the mod's Reflex fps_limit)
 #                            (graphics settings pinned from tools/profiles/<p>.ini, default ultra-high)
 #   aco kill-game <name>
 #   aco shot <name> [file]   full-res screenshot of the instance display
@@ -51,7 +52,7 @@ CONNECT_APPDATA="drive_c/users/steamuser/AppData/Local/Ubisoft Game Launcher"
 CRED=ConnectSecureStorage.dat
 ACO_APPID=3539
 UBI_ROOT=${ACO_UBI_ROOT:-$HOME/code/ubisoft-linux}
-UBI=$UBI_ROOT/target/release/ubi
+UBI=$UBI_ROOT/target/release/quiver  # formerly ubi (alias still exists)
 BRIDGE_EXE=$UBI_ROOT/target/x86_64-pc-windows-gnu/release/ubi-bridge.exe
 CONNECT_EXES=(upc.exe UbisoftConnect.exe UbisoftGameLauncher.exe UbisoftGameLauncher64.exe UplayService.exe
   UplayWebCore.exe UbisoftExtension.exe)
@@ -122,6 +123,7 @@ start_container() {
     esac
   done
   [[ $mode == bridge && $xvfb == 1 ]] && die "--xvfb/--vnc need --connect (bridge mode uses host networking)"
+  echo "$res" > "$dst/res"
   local netopt=(); [[ $mode == bridge ]] && netopt=(--network host)
   podman rm -f "$(ctr "$name")" >/dev/null 2>&1 || true
   # CDI only injects 64-bit driver libs; 32-bit Connect helpers (upc.exe) need lib32 Vulkan.
@@ -326,11 +328,12 @@ bridge_launch() {
 
 cmd_game() {
   local name=$1; shift
-  local dst mod="" profile=ultra-high; dst=$(inst "$name")
+  local dst mod="" profile=ultra-high fps=""; dst=$(inst "$name")
   while (($#)); do
     case $1 in
       --mod) mod=$(realpath "$2"); shift 2;;
       --profile) profile=$2; shift 2;;
+      --fps) fps=$2; shift 2;;
       *) die "unknown option $1";;
     esac
   done
@@ -352,12 +355,19 @@ cmd_game() {
       mkdir -p "$(dirname "$game/$f")"; cp -a "$mod/$f" "$game/$f"; echo "$f" >> "$dst/mod-files"
     done
   fi
+  # Frame cap for background instances (Reflex fps_limit in the mod's ini; needs reflex mode on).
+  if [[ -n $fps && -f "$game/aco_dlss.ini" ]]; then
+    sed -i "/^\[reflex\]/,\$ { s/^fps_limit=.*/fps_limit=$fps/; s/^mode=off/mode=on/ }" "$game/aco_dlss.ini"
+  fi
   # Pin graphics settings so measurements are comparable across runs (PixelDensity is left to the
   # caller, e.g. tools/bench).
   local pf="$HERE/tools/profiles/$profile.ini" aco_ini="$dst/prefix/drive_c/users/steamuser/Documents/Assassin's Creed Origins/ACO.ini"
   [[ -f $pf ]] || die "no profile $pf"
   grep -E '^[A-Za-z]+=' "$pf" | while IFS='=' read -r k v; do sed -i "s/^$k=.*/$k=$v/" "$aco_ini"; done
-  log "$name: graphics profile $profile"
+  # The game renders at the container's display size (aco up --res; keep 16:10 for aco-dt).
+  local res; res=$(cat "$dst/res" 2>/dev/null || echo 2560x1600)
+  sed -i "s/^FullscreenWidth=.*/FullscreenWidth=${res%x*}/; s/^FullscreenHeight=.*/FullscreenHeight=${res#*x}/" "$aco_ini"
+  log "$name: graphics profile $profile at $res"
   if [[ $(cat "$dst/mode" 2>/dev/null) == connect ]]; then
     # NB: the game is spawned by the long-running Connect, so env vars set here do not reach it
     # (use dxvk.conf in the mod dir for DXVK options, e.g. "dxvk.hud = fps").

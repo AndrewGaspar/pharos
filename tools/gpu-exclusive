@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# gpu-exclusive <instance> <command...>
+# Runs a measurement with the GPU to itself: takes a lock (so measurements from parallel
+# workstreams queue up instead of overlapping), freezes every other running aco-* container
+# (podman pause), runs the command, and unfreezes them again, also on failure or interrupt.
+set -euo pipefail
+name=$1; shift
+lock=/home/ajg/Games/aco-dlss-instances/.gpu-exclusive.lock
+exec 9>"$lock"
+flock 9
+paused=()
+resume() { for c in "${paused[@]}"; do podman unpause "$c" >/dev/null 2>&1 || true; done; }
+trap resume EXIT INT TERM
+for c in $(podman ps --format '{{.Names}}' --filter status=running | grep '^aco-'); do
+  [[ $c == "aco-$name" ]] && continue
+  podman pause "$c" >/dev/null && paused+=("$c")
+done
+((${#paused[@]})) && echo "gpu-exclusive: paused ${paused[*]}" >&2
+"$@"

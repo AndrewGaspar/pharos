@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # aco-dt <instance> — drive a freshly launched game (aco game ...) into Discovery Tour free roam.
 #
-# Screen states are recognised by comparing fixed regions of the 2560x1600 display against
+# Screen states are recognised by comparing fixed regions of the (2560x1600-scaled) display against
 # reference crops in tools/ref/. Input is only sent when a state is positively recognised, so we
 # never press Return on an unknown screen (which could e.g. load a story save).
 set -euo pipefail
@@ -18,7 +18,13 @@ STATES=(
   "menu|600x110+205+537|menu.png"
 )
 
-grab() { "$aco" shot "$name" "$tmp/full.png" >/dev/null; }
+# Reference crops and click positions are for a 2560x1600 display; other 16:10 sizes are scaled.
+res=$(cat "/home/ajg/Games/aco-dlss-instances/$name/res" 2>/dev/null || echo 2560x1600)
+W=${res%x*}
+grab() {
+  "$aco" shot "$name" "$tmp/shot.png" >/dev/null
+  magick "$tmp/shot.png" -resize '2560x1600!' "$tmp/full.png"
+}
 
 # Prints the matching state name, or "unknown".
 classify() {
@@ -27,14 +33,21 @@ classify() {
     IFS='|' read -r st geo file <<< "$s"
     [[ -f $ref/$file ]] || continue
     magick "$tmp/full.png" -crop "$geo" +repage -colorspace gray "$tmp/c.png"
-    d=$(magick compare -metric RMSE "$ref/$file" "$tmp/c.png" null: 2>&1 | sed -n 's/.*(\(.*\)).*/\1/p')
+    local r=$ref/$file
+    if ((W < 2560)); then  # degrade the reference like the upscaled low-res capture
+      magick "$r" -resize "$((W * 100 / 2560))%" -resize "${geo%%+*}!" -colorspace gray "$tmp/r.png"; r=$tmp/r.png
+    fi
+    d=$(magick compare -metric RMSE "$r" "$tmp/c.png" null: 2>&1 | sed -n 's/.*(\(.*\)).*/\1/p')
     if awk "BEGIN{exit !(${d:-1} < 0.08)}"; then echo "$st"; return; fi
   done
   echo unknown
 }
 
 press() { "$aco" keys "$name" keydown "$1" sleep 0.15 keyup "$1"; }
-click() { "$aco" keys "$name" mousemove "$1" "$2" sleep 0.3 mousedown 1 sleep 0.12 mouseup 1; }
+click() {
+  local x=$(( $1 * W / 2560 )) y=$(( $2 * W / 2560 ))
+  "$aco" keys "$name" mousemove "$x" "$y" sleep 0.3 mousedown 1 sleep 0.12 mouseup 1
+}
 
 deadline=$((SECONDS + 300))
 while ((SECONDS < deadline)); do
