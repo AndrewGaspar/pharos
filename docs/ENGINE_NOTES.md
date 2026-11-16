@@ -310,6 +310,25 @@ Alexandria harbour (535-607 spawned) and Memphis (130-306), 84-89 fps, no hang (
   slots - stalls, seats - where extra units would stack; free wanderers
   `MetaAIBehaviourWanderOnAINetwork` are few).
 
+#### Cloning units: findings so far (not implemented)
+
+- Unit owners: class vtable RVA 0x377d218 (ctor ~0x1d5daa0, created from 8 call sites:
+  0x1d18401, 0x1d583a9, 0x1d587b0, 0x1d59419, 0x1d59499, 0x1d5c7d9, 0x1d5cbc9, 0x1d5d289) holds its
+  units in an Anvil array at +0xa0 (1-60 units; heavy tail: 252 of 600 sampled own none). These
+  owners do not reach `MetaAIObjectiveSpawnerCustomData` within two links, so the spawn-position
+  list of the custom data is not simply "one unit per position".
+- The MetaAI manager activates objectives from its list at +0x7b0 (count +0x7b8; RVA 0x1dbc400 ->
+  0x1d8e4e0 per entry). A clone would have to be allocated with the engine allocator (pattern
+  0x8cc350/0x872440), built with the unit's derived ctor, given a unique id, appended to the
+  owner's +0xa0 array and to the manager's +0x7b0 list (Anvil arrays, realloc 0x840180), and be
+  destroyed with its owner on unload.
+- **Save risk**: units carry id-like values at +0x8 (e.g. 0x1_000935d7), and the MetaAI save keeps
+  per-spawner dead units as 16-byte keys (`MetaAISpawnerSaveData` {handle, dead-unit array at +0x8,
+  tagged-unit array at +0x14}; `MetaAISpawnerDeadUnitSaveData` = two qwords + handle). Killing a
+  clone in story mode would most likely write a record for an id the vanilla game never created;
+  how a load treats that is unknown. This is the stop condition for runtime cloning until the
+  dead-unit write path (and whether clones can be excluded from it) is understood.
+
 ### The Havok deadlock is a vanilla engine bug
 
 Same stack (TaskThread0 spinning in 0x2ffd9e4 <- 0x2e78f07 <- 0x2e16a8d <- 0x2dbf560 (Havok object
