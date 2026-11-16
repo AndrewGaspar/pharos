@@ -16,9 +16,13 @@
 #include <nvsdk_ngx_defs_dlssg.h>
 #include <nvsdk_ngx_params.h>
 
+#include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "core/config.h"
@@ -77,7 +81,7 @@ struct Shared {
 };
 
 struct State {
-  bool tried = false, ok = false;
+
   ID3D11Device5* dev = nullptr;
   ID3D11DeviceContext4* imm = nullptr;
   ID3D11Fence* fence11 = nullptr;
@@ -242,13 +246,10 @@ bool submit(F&& record, bool cpu_wait) {
   return ok;
 }
 
-bool init(IDXGISwapChain* sc) {
-  ID3D11Device* dev = nullptr;
-  if (FAILED(sc->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void**>(&dev)))) return false;
+bool init(ID3D11Device* dev) {
   HRESULT hr = dev->QueryInterface(__uuidof(ID3D11Device5), reinterpret_cast<void**>(&S.dev));
   ID3D11DeviceContext* ctx = nullptr;
   dev->GetImmediateContext(&ctx);
-  dev->Release();
   if (FAILED(hr) || !ctx || FAILED(ctx->QueryInterface(__uuidof(ID3D11DeviceContext4), reinterpret_cast<void**>(&S.imm)))) {
     ACO_LOG("fg12: no ID3D11Device5/ID3D11DeviceContext4");
     safe_release(ctx);
@@ -669,8 +670,7 @@ void verify_read() {
 }
 
 // What goes into the backbuffer for the generated (first) or real (second) present.
-void fill(ID3D11Texture2D* dst, bool generated_slot) {
-  const std::string& show = config().fg_show;
+void fill(ID3D11Texture2D* dst, bool generated_slot, const std::string& show) {
   if (show == "compare" || show == "compare_gen") {
     // Debug: left half the real frame, right half OutputReal / the generated frame.
     D3D11_BOX left{0, 0, 0, S.tex_w / 2, S.tex_h, 1};
@@ -683,33 +683,273 @@ void fill(ID3D11Texture2D* dst, bool generated_slot) {
   S.imm->CopyResource(dst, src);
 }
 
+// ---- Present thread and proxy backbuffer ([fg] present_thread=1) ---------------------------------
+// The game renders into a backbuffer of ours (GetBuffer returns it); the swapchain's own backbuffer
+// is only written right before each real Present, here or on the present thread. That lets the
+// present thread show the real frame half a frame after the generated one while the game already
+// renders the next frame, without the game overwriting the swapchain image in between. The D3D11
+// immediate context is shared by both threads, so it runs with multithread protection.
+HANDLE g_exc_file = INVALID_HANDLE_VALUE;  // see exception_logger
+DWORD g_present_tid = 0;
+
+struct Presenter {
+  int proxy = -1;  // decided at the first GetBuffer: 0 off, 1 on
+  PFN_GetBuffer real_get_buffer = nullptr;
+  ID3D11Texture2D* proxy_bb = nullptr;
+  ID3D11DeviceContext* ctx = nullptr;  // immediate context, for plain presents before FG is ready
+  std::mutex m;
+  std::condition_variable cv;
+  bool job = false, busy = false;
+  IDXGISwapChain* sc = nullptr;
+  PFN_RealPresent present = nullptr;
+  UINT sync = 0, flags = 0;
+  int64_t half_interval_us = 0;
+  std::string show;
+  std::atomic<HRESULT> hr{S_OK};
+  std::atomic<int> init_state{0};  // 0 not started, 1 running, 2 ready, 3 failed
+  int64_t arrive_us = 0;  // when the game's Present reached us
+  double perf_join_ms = 0;
+  uint32_t perf_join_n = 0;
+  // Present-thread timing: when the generated / real present calls were made after the game's
+  // Present arrived (extra display latency of the real frame).
+  std::atomic<int64_t> delay_gen_us{0}, delay_real_us{0};
+  std::atomic<uint32_t> delay_n{0};
+} P;
+
+ID3D11Texture2D* real_backbuffer(IDXGISwapChain* sc) {
+  ID3D11Texture2D* bb = nullptr;
+  HRESULT hr = P.real_get_buffer ? P.real_get_buffer(sc, 0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&bb))
+                                 : sc->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&bb));
+  return SUCCEEDED(hr) ? bb : nullptr;
+}
+
+void present_loop() {
+  g_present_tid = GetCurrentThreadId();
+  for (;;) {
+    std::unique_lock<std::mutex> lk(P.m);
+    P.cv.wait(lk, [] { return P.job; });
+    P.job = false;
+    IDXGISwapChain* sc = P.sc;
+    PFN_RealPresent present = P.present;
+    UINT sync = P.sync, flags = P.flags;
+    int64_t half = P.half_interval_us;
+    int64_t arrive = P.arrive_us;
+    std::string show = P.show;
+    lk.unlock();
+
+    HRESULT hr = S_OK;
+    if (ID3D11Texture2D* bb = real_backbuffer(sc)) {
+      fill(bb, true, show);
+      bb->Release();
+      hr = present(sc, sync, flags);
+    }
+    int64_t t_gen = now_us();
+    if (half > 0) wait_until(t_gen + half);
+    int64_t t_real = now_us();
+    if (ID3D11Texture2D* bb = real_backbuffer(sc)) {
+      fill(bb, false, show);
+      bb->Release();
+      HRESULT h2 = present(sc, sync, flags);
+      if (SUCCEEDED(hr)) hr = h2;
+    }
+    P.delay_gen_us += t_gen - arrive;
+    P.delay_real_us += t_real - arrive;
+    ++P.delay_n;
+    P.hr = hr;
+    lk.lock();
+    P.busy = false;
+    P.cv.notify_all();
+  }
+}
+
+void join() {
+  std::unique_lock<std::mutex> lk(P.m);
+  if (!P.busy) return;
+  int64_t t0 = now_us();
+  P.cv.wait(lk, [] { return !P.busy; });
+  P.perf_join_ms += (now_us() - t0) / 1000.0;
+  ++P.perf_join_n;
+}
+
+void enqueue(IDXGISwapChain* sc, PFN_RealPresent present, UINT sync, UINT flags, int64_t half, const std::string& show,
+             int64_t arrive) {
+  static std::thread thread(present_loop);
+  std::lock_guard<std::mutex> lk(P.m);
+  P.arrive_us = arrive;
+  P.sc = sc;
+  P.present = present;
+  P.sync = sync;
+  P.flags = flags;
+  P.half_interval_us = half;
+  P.show = show;
+  P.job = true;
+  P.busy = true;
+  P.cv.notify_all();
+}
+
+// Debug: first-chance fatal-looking exceptions to out/fg12_exceptions.txt (lock-free writes), as
+// the game's own crash handler exits silently.
+// (declared above)
+
+LONG CALLBACK exception_logger(EXCEPTION_POINTERS* ep) {
+  DWORD code = ep->ExceptionRecord->ExceptionCode;
+  if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_STACK_OVERFLOW && code != 0xE06D7363u &&
+      code != 0xC0000409u && code != EXCEPTION_ILLEGAL_INSTRUCTION && code != EXCEPTION_INT_DIVIDE_BY_ZERO &&
+      code != 0x40000015u)
+    return EXCEPTION_CONTINUE_SEARCH;
+  static LONG n = 0;
+  if (InterlockedIncrement(&n) > 50 || g_exc_file == INVALID_HANDLE_VALUE) return EXCEPTION_CONTINUE_SEARCH;
+  void* addr = ep->ExceptionRecord->ExceptionAddress;
+  HMODULE mod = nullptr;
+  char name[MAX_PATH] = "?";
+  if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                         static_cast<LPCSTR>(addr), &mod))
+    GetModuleFileNameA(mod, name, MAX_PATH);
+  char line[768];
+  int len = snprintf(line, sizeof(line), "%lld tid %lu%s code 0x%08lx at %p (%s+0x%llx) info %llx %llx\n",
+                     static_cast<long long>(now_us()), GetCurrentThreadId(),
+                     GetCurrentThreadId() == g_present_tid ? " [present thread]" : "", code, addr, name,
+                     static_cast<unsigned long long>(static_cast<char*>(addr) - reinterpret_cast<char*>(mod)),
+                     static_cast<unsigned long long>(ep->ExceptionRecord->NumberParameters > 0 ? ep->ExceptionRecord->ExceptionInformation[0] : 0),
+                     static_cast<unsigned long long>(ep->ExceptionRecord->NumberParameters > 1 ? ep->ExceptionRecord->ExceptionInformation[1] : 0));
+  DWORD w;
+  if (len > 0) WriteFile(g_exc_file, line, static_cast<DWORD>(len), &w, nullptr);
+  return EXCEPTION_CONTINUE_SEARCH;
+}
+
+void enable_multithread(ID3D11Device* dev) {
+  g_exc_file = CreateFileW((out_dir() + L"\\fg12_exceptions.txt").c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  AddVectoredExceptionHandler(1, exception_logger);
+  ID3D11DeviceContext* ctx = nullptr;
+  dev->GetImmediateContext(&ctx);
+  bool ok = false;
+  ID3D11Multithread* mt = nullptr;
+  ID3D10Multithread* mt10 = nullptr;
+  if (ctx && SUCCEEDED(ctx->QueryInterface(__uuidof(ID3D11Multithread), reinterpret_cast<void**>(&mt)))) {
+    mt->SetMultithreadProtected(TRUE);
+    ok = mt->GetMultithreadProtected();
+    mt->Release();
+  } else if (SUCCEEDED(dev->QueryInterface(__uuidof(ID3D10Multithread), reinterpret_cast<void**>(&mt10)))) {
+    mt10->SetMultithreadProtected(TRUE);
+    ok = mt10->GetMultithreadProtected();
+    mt10->Release();
+  }
+  P.ctx = ctx;  // keeps the reference
+  ACO_LOG("fg12: D3D11 multithread protection %s", ok ? "on" : "UNAVAILABLE");
+}
+
+void perf_join_report() {
+  static int64_t last = 0;
+  int64_t now = now_us();
+  if (!last) last = now;
+  if (now - last < 2000000) return;
+  uint32_t n = P.delay_n.exchange(0);
+  int64_t dg = P.delay_gen_us.exchange(0), dr = P.delay_real_us.exchange(0);
+  ACO_LOG("perf: fg12 present thread: game waited for it %u times (%.2f ms avg); after the game's Present: generated "
+          "presented +%.2f ms, real +%.2f ms",
+          P.perf_join_n, P.perf_join_n ? P.perf_join_ms / P.perf_join_n : 0.0, n ? dg / 1000.0 / n : 0.0,
+          n ? dr / 1000.0 / n : 0.0);
+  P.perf_join_ms = 0;
+  P.perf_join_n = 0;
+  last = now;
+}
+
 } // namespace
 
-bool fg12_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent real, HRESULT* hr) {
-  const Config& cfg = config();
-  if (!S.tried) {
-    S.tried = true;
-    S.ok = init(sc);
-    ACO_LOG("fg12: %s", S.ok ? "ready" : "unavailable, presenting normally");
-  }
-  if (!S.ok) return false;
-
-  FgInputs in;
-  if (!upscaler_fg_inputs(&in)) {  // no DLSS this frame (menus, loading): present normally
-    S.reset = true;
-    static int64_t last = 0;
-    if (now_us() - last > 5000000) {
-      last = now_us();
-      ACO_LOG("fg12: no DLSS inputs this frame (menus/loading?) - presenting normally");
+HRESULT fg12_get_buffer(IDXGISwapChain* sc, UINT index, const _GUID& riid, void** out, PFN_GetBuffer real) {
+  P.real_get_buffer = real;
+  if (P.proxy < 0) {
+    P.proxy = config().fg_mode == "d3d12" && config().fg_present_thread ? 1 : 0;
+    if (P.proxy) {
+      ID3D11Device* dev = nullptr;
+      if (SUCCEEDED(sc->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void**>(&dev)))) {
+        enable_multithread(dev);
+        dev->Release();
+      }
+      ACO_LOG("fg12: proxy backbuffer + present thread enabled");
     }
-    return false;
   }
-  if (in.frame != S.last_input_frame + 1) S.reset = true;
-  S.last_input_frame = in.frame;
+  if (!P.proxy) return real(sc, index, riid, out);
+  ID3D11Texture2D* swap_bb = nullptr;
+  HRESULT hr = real(sc, 0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&swap_bb));
+  if (FAILED(hr)) return hr;
+  D3D11_TEXTURE2D_DESC d;
+  swap_bb->GetDesc(&d);
+  bool same = false;
+  if (P.proxy_bb) {
+    D3D11_TEXTURE2D_DESC pd;
+    P.proxy_bb->GetDesc(&pd);
+    same = pd.Width == d.Width && pd.Height == d.Height && pd.Format == d.Format;
+  }
+  if (!same) {
+    safe_release(P.proxy_bb);
+    ID3D11Device* dev = nullptr;
+    swap_bb->GetDevice(&dev);
+    d.MiscFlags = 0;
+    d.CPUAccessFlags = 0;
+    d.Usage = D3D11_USAGE_DEFAULT;
+    hr = dev->CreateTexture2D(&d, nullptr, &P.proxy_bb);
+    dev->Release();
+    ACO_LOG("fg12: proxy backbuffer %ux%u format %d bind 0x%x -> 0x%08lx", d.Width, d.Height, d.Format, d.BindFlags, hr);
+    if (FAILED(hr)) {
+      P.proxy_bb = nullptr;
+      swap_bb->Release();
+      return E_FAIL;
+    }
+  }
+  swap_bb->Release();
+  return P.proxy_bb->QueryInterface(riid, out);
+}
 
-  ID3D11Texture2D* bb = nullptr;
+void fg12_before_resize() {
+  if (P.proxy != 1) return;
+  join();
+  safe_release(P.proxy_bb);  // the game has released its references (DXGI requires it for the real ones)
+}
+
+bool fg12_proxy_active() { return P.proxy == 1; }
+
+bool fg12_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent real, HRESULT* hr, uint64_t frames) {
+  const Config& cfg = config();
+  const bool proxy = P.proxy == 1;
+  int64_t arrive = now_us();
+  if (proxy) join();
+
+  // NGX/D3D12 initialisation runs on its own thread; presents stay normal until it is ready.
+  const bool want = cfg.fg_mode == "d3d12" && frames >= 300;
+  if (want && P.init_state == 0) {
+    ID3D11Device* dev = nullptr;
+    if (SUCCEEDED(sc->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void**>(&dev)))) {
+      P.init_state = 1;
+      std::thread([dev] {
+        int64_t t0 = now_us();
+        bool ok = init(dev);
+        dev->Release();
+        ACO_LOG("fg12: %s (init thread, %.2f s)", ok ? "ready" : "unavailable, presenting normally", (now_us() - t0) / 1e6);
+        P.init_state = ok ? 2 : 3;
+      }).detach();
+    }
+  }
   bool done = false;
-  if (SUCCEEDED(sc->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&bb)))) {
+  FgInputs in{};
+  bool have_in = false;
+  if (want && P.init_state == 2) {
+    have_in = upscaler_fg_inputs(&in);
+    if (!have_in) {  // no DLSS this frame (menus, loading): present normally
+      S.reset = true;
+      static int64_t last = 0;
+      if (now_us() - last > 5000000) {
+        last = now_us();
+        ACO_LOG("fg12: no DLSS inputs this frame (menus/loading?) - presenting normally");
+      }
+    }
+  }
+  ID3D11Texture2D* bb = proxy ? P.proxy_bb : real_backbuffer(sc);
+  if (proxy && bb) bb->AddRef();
+  if (have_in && bb) {
+    if (in.frame != S.last_input_frame + 1) S.reset = true;
+    S.last_input_frame = in.frame;
     D3D11_TEXTURE2D_DESC bd;
     bb->GetDesc(&bd);
     if (ensure_textures(bd)) {
@@ -727,39 +967,57 @@ bool fg12_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent rea
           S.imm->CopyResource(S.stage[2], S.real);
           S.verify_pending = 4;
         }
-        // The generated frame first (it lies between the previous real frame and this one) ...
-        fill(bb, true);
-        *hr = real(sc, sync, flags);
-        int64_t t_gen = now_us();
-        ++S.perf_generated;
-        // ... then the real frame, half a frame interval later.
-        if (cfg.fg_pacing && S.frame_interval_us > 0) wait_until(t_gen + static_cast<int64_t>(S.frame_interval_us / 2));
-        ID3D11Texture2D* bb2 = nullptr;
-        if (SUCCEEDED(sc->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&bb2)))) {
-          fill(bb2, false);
-          bb2->Release();
+        int64_t half = cfg.fg_pacing && S.frame_interval_us > 0 ? static_cast<int64_t>(S.frame_interval_us / 2) : 0;
+        if (proxy && config().fg_present_thread == 1) {
+          // Both presents (generated now, real half a frame later) on the present thread.
+          enqueue(sc, real, sync, flags, half, cfg.fg_show, arrive);
+          *hr = P.hr;
+        } else {
+          ID3D11Texture2D* dst = proxy ? real_backbuffer(sc) : bb;
+          if (dst) {
+            fill(dst, true, cfg.fg_show);
+            *hr = real(sc, sync, flags);
+            if (half > 0) wait_until(now_us() + half);
+            fill(dst, false, cfg.fg_show);
+            *hr = real(sc, sync, flags);
+            if (proxy) dst->Release();
+          }
         }
-        *hr = real(sc, sync, flags);
+        ++S.perf_generated;
         done = true;
       } else {
         ++S.perf_fail;
       }
     }
-    bb->Release();
   }
-  safe_release(in.mv);
-  safe_release(in.depth);
-  safe_release(in.hudless);
+  if (have_in) {
+    safe_release(in.mv);
+    safe_release(in.depth);
+    safe_release(in.hudless);
+  }
+  if (!done && proxy && bb) {
+    // A normal present of the game's frame.
+    if (ID3D11Texture2D* swap_bb = real_backbuffer(sc)) {
+      P.ctx->CopyResource(swap_bb, bb);
+      swap_bb->Release();
+    }
+    *hr = real(sc, sync, flags);
+    done = true;
+  }
+  safe_release(bb);
   if (!done) return false;
+  if (!have_in) return true;
 
-  int64_t now = now_us();
+  // Real-frame interval from the game's arrivals here (with the present thread, not inflated by our
+  // own pacing wait).
   if (S.last_real_present) {
-    double dt = double(now - S.last_real_present);
+    double dt = double(arrive - S.last_real_present);
     S.frame_interval_us = S.frame_interval_us > 0 ? S.frame_interval_us * 0.9 + dt * 0.1 : dt;
   }
-  S.last_real_present = now;
+  S.last_real_present = arrive;
   ++S.perf_real;
   perf_report();
+  if (proxy) perf_join_report();
   return true;
 }
 

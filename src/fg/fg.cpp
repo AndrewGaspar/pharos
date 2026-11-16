@@ -970,8 +970,8 @@ void fg_on_present(IDXGISwapChain*) { ++S.frames; }
 
 bool fg_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent real, HRESULT* hr) {
   const Config& cfg = config();
+  if (cfg.fg_mode == "d3d12" || fg12_proxy_active()) return fg12_present(sc, sync, flags, real, hr, S.frames);
   if (S.frames < 300) return false;
-  if (cfg.fg_mode == "d3d12") return fg12_present(sc, sync, flags, real, hr);
   if (cfg.fg_mode != "on") return false;
   if (S.ok) prune_views();
   if (!S.tried) {

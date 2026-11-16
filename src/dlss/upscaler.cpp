@@ -2,6 +2,7 @@
 
 #include <windows.h>
 #include <d3d11_1.h>
+#include <d3d10.h>
 #include <dxgi.h>
 #include <shlobj.h>
 
@@ -442,6 +443,12 @@ void run_job(const Job& job) {
             job.render_w, job.render_h, dw, dh, job.jitter_x, job.jitter_y, static_cast<void*>(job.depth));
   if (!dw || !dh) return;
   if (!ensure_output(dw, dh)) return;
+  // DXVK's SwapDeviceContextState doesn't take the context's multithread lock (other methods do), and
+  // with Frame Generation's present thread ([fg] present_thread=1) another thread uses the immediate
+  // context: hold the lock for the whole job. A no-op unless multithread protection is on.
+  ID3D10Multithread* mt = nullptr;
+  if (FAILED(S.imm->QueryInterface(__uuidof(ID3D10Multithread), reinterpret_cast<void**>(&mt)))) mt = nullptr;
+  if (mt) mt->Enter();
   // Run on a private context state so the game's bindings are untouched.
   ID3DDeviceContextState* prev = nullptr;
   S.imm1->SwapDeviceContextState(S.own_state, &prev);
@@ -473,6 +480,10 @@ void run_job(const Job& job) {
 
   S.imm1->SwapDeviceContextState(prev, nullptr);
   if (prev) prev->Release();
+  if (mt) {
+    mt->Leave();
+    mt->Release();
+  }
 }
 
 void split_here(ID3D11DeviceContext* ctx, std::shared_ptr<Job> job) {

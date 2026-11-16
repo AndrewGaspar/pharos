@@ -50,6 +50,7 @@ struct Config {
   int fg_show_index = 1;
   bool fg_raw_output = false;  // [fg] raw_output (debug)
   bool fg_trace_cu = false;
+  int fg_present_thread = 1;  // [fg] present_thread (mode=d3d12, at swapchain creation): 0 inline, 1 proxy+thread, 2 proxy+inline
   bool fg_verify = false;  // [fg] verify: log/dump (previous real, generated, current real) every 2 s
   bool fg12_descriptor_heap = true;  // [fg] descriptor_heap (mode=d3d12): VKD3D_CONFIG=descriptor_heap for our device
   bool fg_hide_handle64 = false;  // [fg] hide_handle64 (experiment): evaluation then fails, DLSS-G needs them    // [fg] trace_cu (debug): log NGX CUDA-kernel creation/launches  // [fg] show_index: which generated index to present          // [fg] refresh_hz (DLSSG.RefreshRate)               // [fg] hudless: pass the DLSS output as HUD-less colour

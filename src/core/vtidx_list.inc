@@ -38,5 +38,6 @@ ACO_VT(Factory, CreateSwapChain)
 ACO_VT(Factory2, CreateSwapChainForHwnd)
 
 ACO_VT(SwapChain, Present)
+ACO_VT(SwapChain, GetBuffer)
 ACO_VT(SwapChain, ResizeBuffers)
 ACO_VT(SwapChain1, Present1)

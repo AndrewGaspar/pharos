@@ -17,6 +17,7 @@
 #include "reflex/reflex.h"
 #include "core/dump.h"
 #include "fg/fg.h"
+#include "fg/fg_d3d12.h"
 #include "fg/vk_device_ext.h"
 #include "core/memtool.h"
 #include "world/world.h"
@@ -113,9 +114,13 @@ HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1* self, UINT sync, UINT fla
   }
   return hr;
 }
+HRESULT STDMETHODCALLTYPE hk_GetBuffer(IDXGISwapChain* self, UINT index, REFIID riid, void** out) {
+  return fg12_get_buffer(self, index, riid, out, orig<decltype(hk_GetBuffer)>(self, SwapChain_GetBuffer));
+}
 HRESULT STDMETHODCALLTYPE hk_ResizeBuffers(IDXGISwapChain* self, UINT n, UINT w, UINT h, DXGI_FORMAT f, UINT fl) {
   ACO_LOG("ResizeBuffers %ux%u fmt=%d n=%u", w, h, f, n);
   reflex_on_resize();
+  fg12_before_resize();
   return orig<decltype(hk_ResizeBuffers)>(self, SwapChain_ResizeBuffers)(self, n, w, h, f, fl);
 }
 
@@ -126,6 +131,7 @@ void install_swapchain(IDXGISwapChain* sc) {
           d.BufferDesc.Height, d.BufferDesc.Format, d.BufferCount, d.SwapEffect, d.Windowed);
   hook_vtable(sc, SwapChain_Present, reinterpret_cast<void*>(hk_Present));
   hook_vtable(sc, SwapChain_ResizeBuffers, reinterpret_cast<void*>(hk_ResizeBuffers));
+  hook_vtable(sc, SwapChain_GetBuffer, reinterpret_cast<void*>(hk_GetBuffer));
   IDXGISwapChain1* sc1 = nullptr;
   if (SUCCEEDED(sc->QueryInterface(__uuidof(IDXGISwapChain1), reinterpret_cast<void**>(&sc1)))) {
     hook_vtable(sc1, SwapChain1_Present1, reinterpret_cast<void*>(hk_Present1));
