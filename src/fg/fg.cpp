@@ -275,17 +275,20 @@ std::atomic<uint32_t> g_cu_launches{0};
 VkResult VKAPI_CALL tr_create_module(VkDevice d, const VkCuModuleCreateInfoNVX* ci, const VkAllocationCallbacks* a,
                                      VkCuModuleNVX* m) {
   VkResult r = g_real_create_module(d, ci, a, m);
-  if (g_cu_logged++ < 60) ACO_LOG("fg: cu: vkCreateCuModuleNVX(size %zu) -> %d", ci ? ci->dataSize : 0, r);
+  if (config().fg_trace_cu && g_cu_logged++ < 60)
+    ACO_LOG("fg: cu: vkCreateCuModuleNVX(size %zu) -> %d", ci ? ci->dataSize : 0, r);
   return r;
 }
 VkResult VKAPI_CALL tr_create_function(VkDevice d, const VkCuFunctionCreateInfoNVX* ci, const VkAllocationCallbacks* a,
                                        VkCuFunctionNVX* f) {
   VkResult r = g_real_create_function(d, ci, a, f);
-  if (g_cu_logged++ < 60) ACO_LOG("fg: cu: vkCreateCuFunctionNVX(%s) -> %d", ci && ci->pName ? ci->pName : "?", r);
+  if (config().fg_trace_cu && g_cu_logged++ < 60)
+    ACO_LOG("fg: cu: vkCreateCuFunctionNVX(%s) -> %d", ci && ci->pName ? ci->pName : "?", r);
   return r;
 }
 void VKAPI_CALL tr_launch(VkCommandBuffer cb, const VkCuLaunchInfoNVX* li) {
   ++g_cu_launches;
+  if (!config().fg_trace_cu) return g_real_launch(cb, li);
   static std::atomic<int> launch_logged{0};
   if (li && launch_logged++ < 12) {
     ACO_LOG("fg: cu: launch fn=%p grid %ux%ux%u block %ux%ux%u shmem %u params %zu (p=%p) extras %zu (e=%p)",
@@ -386,8 +389,11 @@ bool init(IDXGISwapChain* sc) {
     common.LoggingInfo.MinimumLoggingLevel = config().fg_ngx_log >= 2 ? NVSDK_NGX_LOGGING_LEVEL_VERBOSE
                                                                        : NVSDK_NGX_LOGGING_LEVEL_ON;
   }
-  if (config().fg_trace_cu) {
-    // Load the DLSS-G snippet ourselves before NGX does, and hook its GetProcAddress import.
+  {
+    // Load the DLSS-G snippet ourselves before NGX does and hook its GetProcAddress import: it
+    // resolves Vulkan itself, and under Wine its 64-bit image-view-handle path (texmode_raw) loses
+    // every kernel read/write, so vkGetImageViewHandle64NVX/AddressNVX must be hidden from it
+    // ([fg] hide_handle64, default on). The same hook carries the kernel tracing ([fg] trace_cu).
     HMODULE dlssg = LoadLibraryW((dir + L"\\nvngx_dlssg.dll").c_str());
     if (dlssg && iat_hook(dlssg, "KERNEL32.dll", "GetProcAddress", reinterpret_cast<void*>(tr_dlssg_gpa),
                           reinterpret_cast<void**>(&g_dlssg_gpa)))
@@ -395,8 +401,7 @@ bool init(IDXGISwapChain* sc) {
   }
   int64_t t0 = now_us();
   NVSDK_NGX_Result r =
-      init_fn(kAppId, dir.c_str(), S.instance, S.pd, S.device, config().fg_trace_cu ? tr_gipa : vk.gipa,
-              config().fg_trace_cu ? tr_gdpa : vk.gdpa, &common, NVSDK_NGX_Version_API);
+      init_fn(kAppId, dir.c_str(), S.instance, S.pd, S.device, tr_gipa, tr_gdpa, &common, NVSDK_NGX_Version_API);
   ACO_LOG("fg: NVSDK_NGX_VULKAN_Init -> %s (%.1f s)", ngx::result_str(r), (now_us() - t0) / 1e6);
   if (NVSDK_NGX_FAILED(r)) return false;
   NVSDK_NGX_Parameter* caps_raw = nullptr;
@@ -614,9 +619,8 @@ bool ensure_feature(uint32_t w, uint32_t h, uint32_t rw, uint32_t rh, VkFormat f
   p.set(NVSDK_NGX_Parameter_Height, h);
   p.set(NVSDK_NGX_DLSSG_Parameter_Width, w);
   p.set(NVSDK_NGX_DLSSG_Parameter_Height, h);
-  // In this DLSS-G build (310.9) the LAST index of a MultiFrameCount sequence is the real frame and
-  // indices before it are generated at t = index / (count + 1) (EndpointCoreInputs::
-  // ComputeAndValidateTimeFactor, reverse-engineered): count=1 never generates anything.
+  // Generated frames per real frame, read at create time; evaluations then run index 1..count
+  // (frame i at t = i / (count + 1), EndpointCoreInputs::ComputeAndValidateTimeFactor).
   p.set(NVSDK_NGX_DLSSG_Parameter_MultiFrameCount, static_cast<unsigned int>(config().fg_count));
   for (const auto& kv : config().fg_create_extra) p.set(kv.first.c_str(), kv.second);
   // Which numbering NGX expects for the backbuffer format on Vulkan is undocumented; [fg]
@@ -874,7 +878,7 @@ bool generate(const FgInputs& in, ID3D11Texture2D* swap_bb) {
       vk.CmdClearColorImage(cmd, g_raw.image, VK_IMAGE_LAYOUT_GENERAL, &magenta, 1, &rr);
       full_barrier(cmd);
     }
-    // One evaluation per index: generated frames first, the real frame last (see create).
+    // One evaluation per generated frame.
     for (unsigned int i = 1; i <= count; ++i) {
       p.set(NVSDK_NGX_DLSSG_Parameter_MultiFrameCount, count);
       p.set(NVSDK_NGX_DLSSG_Parameter_MultiFrameIndex, i);
