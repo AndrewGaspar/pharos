@@ -301,8 +301,8 @@ Alexandria harbour (535-607 spawned) and Memphis (130-306), 84-89 fps, no hang (
   spawns nearest first and its cap (240) is reached at roughly 70-80 m, so the ring the player can
   see up close is already fully populated in vanilla; raising the cap/distance fills the rim.
 - Measured in view (skinning compute thread groups per frame, fixed camera, only drawn characters
-  are skinned): 1726 at 1/1 vs 1870 at npc_density=5 npc_distance=2 (+8%), although the spawned
-  total goes 208 -> 579.
+  are skinned; 120 s per step): 1726 at 1/1, 1870 at npc_density=5 npc_distance=2, 1943 back at
+  1/1 - no change beyond the +-10% noise, although the spawned total goes 208 -> 579.
 - So "3x people within 40 m" needs ~3x the *units*: more units per spawner / spawn position at
   world load (patching the data before the virtual spawners are built, or hooking their unit
   creation), or cloning units at runtime through the engine's creation path. Not done: it means
