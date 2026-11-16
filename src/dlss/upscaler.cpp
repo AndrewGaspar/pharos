@@ -10,6 +10,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -198,6 +199,10 @@ struct State {
   std::atomic<uint32_t> display_w{0}, display_h{0};
   std::atomic<uint64_t> frame{0};
   std::atomic<uint64_t> taa_replaced_frame{0};
+  // per perf-window counters
+  std::atomic<uint32_t> n_taa_calls{0}, n_bail{0}, n_taa{0}, n_jobs{0}, n_dlss{0}, n_comp{0}, n_swap{0};
+  std::mutex jit_mutex;
+  std::set<std::pair<float, float>> jitters;
   float render_scale_hint = 1.0f;  // for sampler LOD bias (known before the first frame)
 } S;
 
@@ -437,6 +442,7 @@ void run_job(const Job& job) {
 
   const Config& cfg = config();
   bool done = false;
+  S.n_jobs++;
   int timer = S.gpu_timer.start(S.imm);
   if (cfg.debug == "motion") {
     blit(S.mv_srv, job.render_w, job.render_h, kernels::kBlitMotion, 0.05f);
@@ -446,6 +452,7 @@ void run_job(const Job& job) {
     done = true;
   } else if (cfg.backend == "dlss") {
     done = evaluate_dlss(job);
+    if (done) S.n_dlss++;
   }
   if (!done) blit(srv_for(job.color), job.render_w, job.render_h, kernels::kBlitColor, 1.0f);
   S.gpu_timer.stop(S.imm, timer);
@@ -494,6 +501,7 @@ bool on_linear_z(ID3D11DeviceContext* ctx) {
 
 bool on_taa(ID3D11DeviceContext* ctx) {
   const Config& cfg = config();
+  S.n_taa_calls++;
   if (!cfg.enabled || !ensure_kernels()) return false;
 
   ID3D11ShaderResourceView* srv[4] = {};
@@ -514,7 +522,13 @@ bool on_taa(ID3D11DeviceContext* ctx) {
   };
 
   TaaConstants tc;
-  if (cb[5]) cbshadow_watch(cb[5]);  // shadowed from now on; the first frame falls back to TAA
+  if (cb[5]) {
+    // The engine rotates this cbuffer through a pool of identical buffers: shadow them all by size.
+    // Until the first write after this is seen, the frame falls back to the game's TAA.
+    D3D11_BUFFER_DESC bd{};
+    cb[5]->GetDesc(&bd);
+    cbshadow_watch_size(bd.ByteWidth);
+  }
   bool have_tc = cb[5] && cbshadow_read(ctx, cb[5], first[5] * 16, sizeof(tc), &tc);
   static std::atomic<int> diag{0};
   if (diag++ < 6)
@@ -522,6 +536,13 @@ bool on_taa(ID3D11DeviceContext* ctx) {
             ctx == S.imm, have_tc, static_cast<void*>(srv[0]), static_cast<void*>(srv[1]), static_cast<void*>(srv[2]),
             static_cast<void*>(rtv[0]), static_cast<void*>(cb[1]), static_cast<void*>(cb[3]));
   if (!have_tc || !srv[0] || !srv[1] || !srv[2] || !rtv[0] || !cb[1] || !cb[3]) {
+    if (S.n_bail++ < 40) {
+      D3D11_BUFFER_DESC bd{};
+      if (cb[5]) cb[5]->GetDesc(&bd);
+      ACO_LOG("upscaler: TAA bail have_tc=%d srv=%d%d%d rtv=%d cb1=%d cb3=%d cb5=%p bw=%u usage=%u cpu=%x first=%u num=%u",
+              have_tc, !!srv[0], !!srv[1], !!srv[2], !!rtv[0], !!cb[1], !!cb[3], static_cast<void*>(cb[5]), bd.ByteWidth,
+              bd.Usage, bd.CPUAccessFlags, first[5], num[5]);
+    }
     cleanup();
     return false;
   }
@@ -597,6 +618,11 @@ bool on_taa(ID3D11DeviceContext* ctx) {
   job->jitter_y = tc.sub_pixel_jitter[1];
   job->frame = S.frame.load();
   S.taa_replaced_frame.store(job->frame);
+  S.n_taa++;
+  {
+    std::lock_guard jl(S.jit_mutex);
+    S.jitters.emplace(job->jitter_x, job->jitter_y);
+  }
   lin->Release();
   taa_out->Release();
   cleanup();
@@ -616,6 +642,7 @@ bool on_composite(ID3D11DeviceContext* ctx, const std::function<void()>& draw) {
     ACO_LOG("upscaler: composite ctx=%p imm=%d out_srv=%p replaced_frame=%llu frame=%llu", static_cast<void*>(ctx),
             ctx == S.imm, static_cast<void*>(S.out_srv), (unsigned long long)S.taa_replaced_frame.load(),
             (unsigned long long)S.frame.load());
+  S.n_comp++;
   // Only swap if the TAA of this frame was actually replaced (else the TAA output is valid).
   if (!cfg.enabled || !S.out_srv || S.taa_replaced_frame.load() + 1 < S.frame.load()) return false;
   ID3D11ShaderResourceView* srv[2] = {};
@@ -639,6 +666,7 @@ bool on_composite(ID3D11DeviceContext* ctx, const std::function<void()>& draw) {
     if (r1) r1->Release();
   }
   if (slot >= 0) {
+    S.n_swap++;
     ctx->PSSetShaderResources(86 + slot, 1, &S.out_srv);
     draw();
     ctx->PSSetShaderResources(86 + slot, 1, &srv[slot]);
@@ -720,6 +748,13 @@ void upscaler_on_present(IDXGISwapChain* sc) {
             S.perf_frames / elapsed, 1000.0 * elapsed / S.perf_frames, S.perf_max_ms, gpu,
             cfg.enabled ? cfg.backend.c_str() : "game-taa", cfg.debug == "none" ? "" : (" debug=" + cfg.debug).c_str(),
             S.mv_w, S.mv_h, S.out_w, S.out_h);
+    {
+      std::lock_guard jl(S.jit_mutex);
+      ACO_LOG("perf: taa_calls=%u bails=%u taa=%u jobs=%u dlss=%u composite=%u swapped=%u distinct_jitters=%zu", S.n_taa_calls.exchange(0), S.n_bail.load(), S.n_taa.exchange(0),
+              S.n_jobs.exchange(0), S.n_dlss.exchange(0), S.n_comp.exchange(0), S.n_swap.exchange(0),
+              S.jitters.size());
+      S.jitters.clear();
+    }
     S.perf_last = now;
     S.perf_frames = 0;
     S.perf_max_ms = 0;
