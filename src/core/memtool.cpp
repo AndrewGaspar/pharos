@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <cmath>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -170,6 +171,48 @@ bool run_scan(const char* line) {
     g_cands.swap(keep);
     ACO_LOG("memtool: %s: %zu left", cmd, g_cands.size());
     log_cands(32);
+    return true;
+  }
+  if ((!strcmp(cmd, "f1") || !strcmp(cmd, "f1a")) && n == 3) {
+    // f1 v tol: every 4-aligned float within tol of v (f1a: add to the current candidates).
+    ACO_LOG("memtool: %s", line);
+    if (!strcmp(cmd, "f1")) g_cands.clear();
+    static std::vector<uint8_t> buf(1 << 20);
+    size_t total = 0;
+    for_each_rw_region([&](uintptr_t start, uintptr_t end) {
+      for (uintptr_t c = start; c < end; c += buf.size()) {
+        size_t len = std::min<size_t>(buf.size(), end - c);
+        SIZE_T got = 0;
+        if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(c), buf.data(), len, &got) || got < 4) continue;
+        if (c <= reinterpret_cast<uintptr_t>(buf.data()) + buf.size() && reinterpret_cast<uintptr_t>(buf.data()) < c + got) continue;
+        for (size_t o = 0; o + 4 <= got; o += 4) {
+          float v;
+          memcpy(&v, buf.data() + o, 4);
+          if (!(std::fabs(v - a[0]) <= a[1])) continue;
+          if (++total, g_cands.size() < 2000000) g_cands.push_back({c + o, {v, 0, 0}});
+        }
+      }
+    });
+    ACO_LOG("memtool: %s: %zu matches, %zu candidates", cmd, total, g_cands.size());
+    return true;
+  }
+  if ((!strcmp(cmd, "f1r") || !strcmp(cmd, "f1d")) && n == 3) {
+    // f1r v tol: keep floats now within tol of v; f1d d tol: keep those whose |change| is d +- tol.
+    ACO_LOG("memtool: %s", line);
+    std::vector<Cand> keep;
+    for (Cand c : g_cands) {
+      float v;
+      SIZE_T got = 0;
+      if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(c.a), &v, 4, &got) || got != 4) continue;
+      bool ok = cmd[2] == 'r' ? std::fabs(v - a[0]) <= a[1] : std::fabs(std::fabs(v - c.v[0]) - a[0]) <= a[1];
+      if (!ok) continue;
+      c.v[0] = v;
+      keep.push_back(c);
+    }
+    g_cands.swap(keep);
+    ACO_LOG("memtool: %s: %zu left", cmd, g_cands.size());
+    for (size_t i = 0; i < g_cands.size() && i < 64; ++i)
+      ACO_LOG("memtool:   %p  %g", reinterpret_cast<void*>(g_cands[i].a), g_cands[i].v[0]);
     return true;
   }
   if (!strcmp(cmd, "fl")) {

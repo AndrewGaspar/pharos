@@ -136,3 +136,44 @@ the read-only data table after checking its values and the referencing instructi
   bias 0, FOV factor ~1.0055, MinTriangleArea 0. `[world] lod_distance` patches the scale.
 - Characters (NPCs) are not part of that GPU path (they stay visible when world LOD is cut).
 - Shadow cascades are set up on the CPU (shaders only see cascade matrices / fade params).
+
+## Player entity, camera and teleport (`src/world/teleport.cpp`, `tools/teleport`)
+
+World coordinates are metres, **Z up**; Alexandria is around (-700, 3570), Giza (900, 160), Memphis
+(1470, -1130), Siwa (-6400, -260), Cyrene (-5780, 3720). Heading convention used by the tools:
+yaw 0 = +X, 90 = +Y.
+
+- **Entity** (AnvilNext `Entity`, Anvil TypeInfo size 0x250, vtable RVA **0x365e460**, shared by
+  ~37k world entities): world matrix at **+0x20** as 4 float4 rows: right (+0x20), forward (+0x30),
+  up (+0x40), **position (+0x50**, w = 1). Found by scanning for float3 copies of a point next to
+  the camera (`memtool fs/fc/fr`) and bisecting writes over the ~200 copies that follow the player:
+  only the entity's +0x50 moves the player; every other copy (components with their own matrices,
+  e.g. a visual component whose +0x20 points back to the entity, nav/AI proxies) is derived from it
+  each frame.
+- **Static path to the player**: `[[base + 0x4c23c40] + 0] = player entity` (also
+  `[[base + 0x4c5d788] + 0x78]`). Both survive restarts and the entity being recreated (respawn);
+  found with the reverse pointer scan (`memtool pp/pn`), validated over several launches. Other
+  level-2 roots pointed at the player in one run only (e.g. `[base + 0x48bdd10] + 0x278`).
+- **Writing the position** from the render thread (Present) works, with caveats: the simulation
+  thread updates the entity concurrently, so a write is lost now and then (re-check after a few
+  frames and write again). Rewriting it every frame instead fights the character controller: it
+  derives motion from the displacement and the player was flung hundreds of metres or the game
+  respawned it through the Animus loading void at (-100, 33.5, 0.2). Single writes over any
+  distance (tested 4-5 km, region to region) are stable; streaming follows on its own. Placed exactly
+  on the ground, the player's model stays invisible (only its shadow is drawn) until the character
+  moves, so the player is placed 1 m above the ground and lands. The rotation rows are overwritten
+  by the character controller (writing a heading has no effect).
+- **Arrival**: the player hangs at the target while collision streams in (about 1 s across the
+  map), then falls the 1 m. Textures/LODs are complete within ~5 s at 768x480. NPCs keep spawning
+  for longer (compare with the same place after the game's own fast travel).
+- **Render camera**: global pointers at RVA **0x49e86b8** and 0x49f39d8 (object vtable RVA
+  0x36afd88): position at +0x130, unit forward vector at +0x140, then the view rotation; this is what
+  `PassParams.viewToWorld` is built from. The camera controller's yaw/pitch were not found as plain
+  floats (no stored heading vector either), so `tools/camera` turns the camera with injected
+  relative mouse motion in a closed loop on this readout (~0.1 deg/px yaw, ~0.07 deg/px pitch,
+  with smoothing; converges to 0.5 deg in 2-4 iterations).
+- Game-side alternatives seen in the strings (not used): `FastTravelManager`, `FastTravelCommand`,
+  `TeleportEvent`, `ActionPlayerTeleportAndRespawn`, `DiscoveryModeTeleportToTourEvent`.
+  Discovery Tour fast travel itself: map (M), hover a tour/viewpoint icon, **hold right mouse**.
+- Time of day keeps cycling in Discovery Tour (`TimeOfDayManager2`, TypeInfo RVA 0x42eff68, size
+  0x3c0, has no constructor/vtable link in its TypeInfo); not controlled yet.

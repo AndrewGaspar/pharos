@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# aco-dt <instance> — drive a freshly launched game (aco game ...) into Discovery Tour free roam.
+# aco-dt <instance> [location] — drive a freshly launched game (aco game ...) into Discovery Tour
+# free roam; with a location (tools/teleport <inst> list), teleport there afterwards.
 #
 # Screen states are recognised by comparing fixed regions of the (2560x1600-scaled) display against
 # reference crops in tools/ref/. Input is only sent when a state is positively recognised, so we
 # never press Return on an unknown screen (which could e.g. load a story save).
 set -euo pipefail
 name=${1:?instance}
+location=${2:-}
 here=$(cd "$(dirname "$0")/.." && pwd)
 ref=$here/tools/ref
 tmp=$(mktemp -d)
@@ -56,8 +58,19 @@ while ((SECONDS < deadline)); do
   case $st in
     title) echo "aco-dt: title -> pressing Return"; press Return; sleep 8;;
     menu)  echo "aco-dt: main menu -> Discovery Tour"; click 380 592; sleep 3
-           # Wait for the world to load, then let streaming settle.
-           sleep 45; echo "aco-dt: in Discovery Tour"; exit 0;;
+           # Wait for the player to be in the world (the mod answers tools/where; while loading the
+           # player stands in the Animus void near (-100, 33.5, 0.2)), then let streaming settle.
+           # Without the mod's teleport support this falls back to a fixed wait.
+           t_load=$SECONDS; in_world=0
+           while ((SECONDS < t_load + 120)); do
+             if pos=$("$here/tools/where" "$name" 2>/dev/null) &&
+                awk '{exit !($1 != "none" && ($3 > 5 || $3 < -5))}' <<< "$pos"; then in_world=1; break; fi
+             sleep 2
+           done
+           if ((in_world)); then sleep 12; else sleep $((45 - (SECONDS - t_load) > 0 ? 45 - (SECONDS - t_load) : 0)); fi
+           echo "aco-dt: in Discovery Tour ($((SECONDS - t_load)) s after selecting it)"
+           if [[ -n $location ]]; then "$here/tools/teleport" "$name" "$location" --settle 5 || exit 1; fi
+           exit 0;;
     *)     sleep 3;;
   esac
 done

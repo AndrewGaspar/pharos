@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# camera <instance> <yaw_deg> [pitch_deg]: turn the game camera to a heading (yaw 0 = +X, 90 = +Y;
+# pitch < 0 looks down) by injecting relative mouse-look motion until tools/where reports it within
+# 0.5 deg. Closed loop, so mouse sensitivity/smoothing don't matter. Prints the final camera.
+set -euo pipefail
+here=$(cd "$(dirname "$0")/.." && pwd)
+name=${1:?instance}; want_yaw=${2:?yaw}; want_pitch=${3:-}
+cam() { "$here/tools/where" "$name" | awk '$5 == "camera" {print $9, $10}'; }
+# Rough gains (deg per pixel); the loop corrects whatever is left.
+gx=0.11; gy=0.07
+end=$((SECONDS + 40))
+for i in $(seq 10); do
+  ((SECONDS < end)) || break
+  read -r yaw pitch <<< "$(cam)"
+  [[ -n ${yaw:-} ]] || { echo "camera: no camera readout (game not in world?)" >&2; exit 1; }
+  read -r dx dy done <<< "$(awk -v y="$yaw" -v p="$pitch" -v wy="$want_yaw" -v wp="${want_pitch:-x}" -v gx=$gx -v gy=$gy 'BEGIN {
+    e = wy - y; while (e > 180) e -= 360; while (e < -180) e += 360
+    ep = (wp == "x") ? 0 : wp - p
+    dx = int(-e / gx + (e > 0 ? -0.5 : 0.5)); dy = int(-ep / gy + (ep > 0 ? -0.5 : 0.5))
+    ok = (e < 0.5 && e > -0.5 && ep < 0.5 && ep > -0.5)
+    print dx, dy, ok }')"
+  ((done)) && break
+  # Large turns in steps: the game clamps very large single mouse deltas.
+  while ((dx > 400 || dx < -400 || dy > 300 || dy < -300)); do
+    sx=$((dx > 400 ? 400 : (dx < -400 ? -400 : dx))); sy=$((dy > 300 ? 300 : (dy < -300 ? -300 : dy)))
+    "$here/scripts/aco" keys "$name" mousemove_relative -- "$sx" "$sy"
+    dx=$((dx - sx)); dy=$((dy - sy)); sleep 0.1
+  done
+  "$here/scripts/aco" keys "$name" mousemove_relative -- "$dx" "$dy"
+  sleep 0.8   # camera smoothing
+done
+read -r yaw pitch <<< "$(cam)"
+echo "camera: yaw $yaw pitch $pitch"
