@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# fg-toggle-test <instance> [toggles=6] [section.key=value ...]
+# Frame Generation hotkey soak: fresh launch with [fg] mode=d3d12 verify=1, the character running,
+# presses the toggle key (F9) every ~6 s through the instance's X display and reports, per phase,
+# the FG perf line, the toggle log lines and the generated-frame verification. Fails if the game
+# stops logging (hang/crash) or generated frames don't come back. Every wait has a deadline.
+set -uo pipefail
+name=$1; n=${2:-6}; shift; shift || true
+here=$(cd "$(dirname "$0")/.." && pwd)
+L=/home/ajg/Games/aco-dlss-instances/$name/out/aco_dlss.log
+timeout 420 "$here/tools/fg-launch" "$name" fg.mode=d3d12 fg.enabled=1 fg.verify=1 "$@" >/dev/null 2>&1 \
+  || { echo "launch failed"; exit 1; }
+end=$((SECONDS + 120))
+until grep -q "perf: fg real" "$L" 2>/dev/null || ((SECONDS >= end)); do sleep 2; done
+grep -q "perf: fg real" "$L" || { echo "FG never started"; exit 1; }
+timeout 20 "$here/scripts/aco" keys "$name" keydown w
+fail=0
+for ((i = 1; i <= n; i++)); do
+  before=$(wc -l < "$L")
+  timeout 20 "$here/scripts/aco" keys "$name" keydown F9 sleep 0.3 keyup F9
+  sleep 6
+  seg=$(tail -n +"$before" "$L")
+  echo "--- toggle $i: $(grep -o 'Frame Generation o[nf]*' <<<"$seg" | tail -1)"
+  grep -E "perf: fg real|fg12 verify" <<<"$seg" | tail -2 | cut -c14-200
+  if [[ $(wc -l < "$L") -le $before ]]; then echo "game stopped logging"; fail=1; break; fi
+done
+timeout 20 "$here/scripts/aco" keys "$name" keyup w
+# Generated frames must be produced again after the last 'on'.
+last_on=$(grep -n "Frame Generation on" "$L" | tail -1 | cut -d: -f1)
+if [[ -n $last_on ]] && tail -n +"$last_on" "$L" | grep -q "generated [1-9][0-9.]* fps"; then
+  echo "generated frames after the last re-enable: yes"
+else
+  echo "generated frames after the last re-enable: NO"; fail=1
+fi
+echo "exceptions: $(wc -l < /home/ajg/Games/aco-dlss-instances/$name/out/fg12_exceptions.txt 2>/dev/null || echo n/a)"
+exit $fail

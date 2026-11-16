@@ -51,6 +51,8 @@ struct Config {
   bool fg_raw_output = false;  // [fg] raw_output (debug)
   bool fg_trace_cu = false;
   int fg_present_thread = 1;  // [fg] present_thread (mode=d3d12, at swapchain creation): 0 inline, 1 proxy+thread, 2 proxy+inline
+  bool fg_enabled = true;          // [fg] enabled: initial state of the F9 toggle (mode=d3d12)
+  std::string fg_toggle_key = "F9";  // [fg] toggle_key: F1..F24 or none (Frame Generation on/off live)
   std::string fg_skip;  // [fg] skip (bisecting): eval | d3d12 | present2
   int fg_frame_latency = 0;  // [fg] frame_latency: DXGI maximum frame latency while FG runs (0 = the game's)
   int fg_buffers = 0;        // [fg] buffers: minimum swapchain buffer count (mode=d3d12, at creation/resize)
@@ -80,5 +82,6 @@ std::wstring module_dir();
 // Runtime toggle (hotkey) between DLSS and the game's TAA; reverts when the file changes.
 void config_toggle_upscaler();
 int config_toggle_vk();  // virtual-key code of [upscaler] toggle_key, 0 = none
+int config_key_vk(const std::string& key);  // "F1".."F24" -> virtual-key code, else 0
 
 } // namespace aco

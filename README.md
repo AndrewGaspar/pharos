@@ -35,6 +35,10 @@ display scanout not included):
 
 Press **F10** in game (`toggle_key`) to switch between DLSS and the game's own TAA live.
 
+Press **F9** in game (`[fg] toggle_key`) to turn DLSS Frame Generation on and off live (with
+`[fg] mode=d3d12`, the default; `[fg] enabled` sets the state at start). Off presents each frame
+straight away like `mode=off`, so the latency difference can be felt directly.
+
 ## How it works
 
 See [docs/ENGINE_NOTES.md](docs/ENGINE_NOTES.md) for the reverse-engineered frame structure.
