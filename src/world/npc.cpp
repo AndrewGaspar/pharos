@@ -2,7 +2,11 @@
 
 #include <windows.h>
 
+#include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <unordered_map>
+#include <vector>
 #include <cstdint>
 #include <cstring>
 
@@ -96,6 +100,116 @@ float g_applied = 1.0f;
 
 uint32_t& max_spawned(uintptr_t s) { return *reinterpret_cast<uint32_t*>(s + kMaxSpawnedOff); }
 
+// ---- npc_distance ----------------------------------------------------------------------------
+// SpawnSettings+0x70: spawn-distance multiplier (1.0). The MetaAI scales every objective's
+// activation range by it; the spawning source scales a candidate's spawn distance by it only when
+// the candidate is inside the camera frustum. Most ambient spawn templates are SphereStrategyParams
+// data objects (spawn / despawn distance at +0x2c / +0x30, 80 / 82 m), streamed with the world, so
+// a background thread finds them by vtable every few seconds and scales those two fields.
+constexpr uintptr_t kDistanceMulOff = 0x70;
+constexpr uintptr_t kSphereVtRva = 0x37a48f8;
+constexpr uintptr_t kSphereSpawnOff = 0x2c, kSphereDespawnOff = 0x30, kSphereKindOff = 0x28;
+
+uintptr_t g_dist_settings = 0;
+float g_dist_original = 0;      // SpawnSettings+0x70 before we touched it
+std::atomic<float> g_dist_k{1.0f};
+HANDLE g_scan_thread = nullptr;
+
+struct Sphere { float spawn, despawn, k; };       // originals + factor applied
+std::unordered_map<uintptr_t, Sphere> g_spheres;  // scanner thread only
+
+bool rpm(uintptr_t a, void* out, size_t n) {
+  SIZE_T got = 0;
+  return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(a), out, n, &got) && got == n;
+}
+bool wpm(uintptr_t a, const void* in, size_t n) {
+  SIZE_T put = 0;
+  return WriteProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(a), in, n, &put) && put == n;
+}
+
+// One pass over committed private read-write memory: (re)scale every SphereStrategyParams found.
+// All accesses go through Read/WriteProcessMemory, so memory the game frees or decommits meanwhile
+// just fails the call instead of faulting.
+void scan_spheres(float k) {
+  const uint64_t vt = g_base + kSphereVtRva;
+  std::vector<uint8_t> buf(4 << 20);
+  uintptr_t addr = 0x10000;
+  MEMORY_BASIC_INFORMATION mbi{};
+  unsigned found = 0, written = 0;
+  while (VirtualQuery(reinterpret_cast<void*>(addr), &mbi, sizeof(mbi))) {
+    uintptr_t start = reinterpret_cast<uintptr_t>(mbi.BaseAddress), end = start + mbi.RegionSize;
+    if (mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE && mbi.Protect == PAGE_READWRITE) {
+      for (uintptr_t c = start; c < end; c += buf.size()) {
+        size_t n = std::min<uintptr_t>(buf.size(), end - c);
+        if (!rpm(c, buf.data(), n)) continue;
+        for (size_t o = 0; o + 0x38 <= n; o += 8) {
+          uint64_t q;
+          memcpy(&q, buf.data() + o, 8);
+          if (q != vt) continue;
+          uint32_t kind;
+          float sp, de;
+          memcpy(&kind, buf.data() + o + kSphereKindOff, 4);
+          memcpy(&sp, buf.data() + o + kSphereSpawnOff, 4);
+          memcpy(&de, buf.data() + o + kSphereDespawnOff, 4);
+          if (kind != 4 || !(sp > 0 && sp < 20000) || !(de > 0 && de < 20000)) continue;
+          ++found;
+          uintptr_t obj = c + o;
+          auto it = g_spheres.find(obj);
+          // A tracked object still holding what we wrote keeps its originals; anything else is a
+          // new (or reloaded) object whose current values are the originals.
+          if (it == g_spheres.end() || sp != it->second.spawn * it->second.k || de != it->second.despawn * it->second.k)
+            it = g_spheres.insert_or_assign(obj, Sphere{sp, de, 1.0f}).first;
+          Sphere& s = it->second;
+          if (s.k == k) continue;
+          float v[2] = {s.spawn * k, s.despawn * k};
+          uint64_t check = 0;
+          if (rpm(obj, &check, 8) && check == vt && wpm(obj + kSphereSpawnOff, v, 8)) {
+            s.k = k;
+            ++written;
+          }
+        }
+      }
+    }
+    if (end <= addr) break;
+    addr = end;
+    if (addr >= 0x7fffffff0000ull) break;
+  }
+  if (g_spheres.size() > 200000) g_spheres.clear();  // stale entries from streamed-out data
+  static unsigned last_found = 0;
+  if (written || found != last_found) ACO_LOG("npc: spawn templates: %u found, %u rescaled (x%g)", found, written, k);
+  last_found = found;
+}
+
+DWORD WINAPI scan_thread(void*) {
+  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE);
+  float applied = 1.0f;
+  for (;;) {
+    float k = g_dist_k.load();
+    if (k != 1.0f || applied != 1.0f) {  // keep scanning while active, plus one pass to restore
+      scan_spheres(k);
+      applied = k;
+    }
+    Sleep(k != 1.0f ? 10000 : 2000);
+  }
+}
+
+void apply_distance(uintptr_t s, float k) {
+  float* mul = reinterpret_cast<float*>(s + kDistanceMulOff);
+  if (s != g_dist_settings) {
+    g_dist_settings = s;
+    g_dist_original = *mul;
+  } else if (*mul != g_dist_original * g_dist_k.load()) {
+    g_dist_original = *mul;  // rewritten by the game (data reload)
+  }
+  float want = g_dist_original * k;
+  if (*mul != want) *mul = want;
+  if (k != g_dist_k.load()) {
+    ACO_LOG("npc: npc_distance=%g -> spawn distance multiplier %g (game %g)", k, want, g_dist_original);
+    g_dist_k = k;
+  }
+  if (k != 1.0f && !g_scan_thread) g_scan_thread = CreateThread(nullptr, 0, scan_thread, nullptr, 0, nullptr);
+}
+
 } // namespace
 
 void npc_on_present() {
@@ -106,10 +220,11 @@ void npc_on_present() {
 
   const Config& cfg = config();
   float k = cfg.world_npc_density;
+  float kd = cfg.world_npc_distance;
   if (g_state == State::Unchecked) {
-    if (k == 1.0f && !g_written) return;  // don't even look unless asked to
+    if (k == 1.0f && kd == 1.0f) return;  // don't even look unless asked to
     g_state = verify_code() ? State::Ok : State::Unsupported;
-    ACO_LOG("npc: spawn budget code %s", g_state == State::Ok ? "found (v1.62 layout)" : "not found; npc_density disabled");
+    ACO_LOG("npc: spawn budget code %s", g_state == State::Ok ? "found (v1.62 layout)" : "not found; npc settings disabled");
   }
   if (g_state != State::Ok) return;
 
@@ -126,8 +241,7 @@ void npc_on_present() {
     g_original = cur;
     g_written = 0;
   }
-  if (k < 0.1f) k = 0.1f;
-  if (k > 20.0f) k = 20.0f;
+  k = std::clamp(k, 0.1f, 20.0f);
   uint32_t want = static_cast<uint32_t>(std::lround(g_original * static_cast<double>(k)));
   if (k == 1.0f) want = g_original;
   if (cur != want) {
@@ -138,6 +252,7 @@ void npc_on_present() {
     ACO_LOG("npc: npc_density=%g -> maxSpawned %u (game %u)", k, want, g_original);
     g_applied = k;
   }
+  apply_distance(s, std::clamp(kd, 0.25f, 8.0f));
   static ULONGLONG last_stat = 0;
   if (now - last_stat >= 10000) {
     last_stat = now;

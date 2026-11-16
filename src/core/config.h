@@ -71,6 +71,7 @@ struct Config {
   bool reflex_optimize = false;   // [reflex] optimize: bUseMarkersToOptimize
   bool reflex_probe = false;
   float world_npc_density = 1.0f;         // [world] npc_density
+  float world_npc_distance = 1.0f;        // [world] npc_distance
   float world_lod_distance = 1.0f;        // [world] lod_distance      // [reflex] probe (input thread diagnostics)
   std::string cloth_mode = "game";  // [cloth] mode: game | render | scale (see cloth/cloth.h)
   float cloth_scale = 1.0f;         // [cloth] scale (mode=scale, diagnostics)

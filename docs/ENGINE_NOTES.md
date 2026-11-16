@@ -136,3 +136,92 @@ the read-only data table after checking its values and the referencing instructi
   bias 0, FOV factor ~1.0055, MinTriangleArea 0. `[world] lod_distance` patches the scale.
 - Characters (NPCs) are not part of that GPU path (they stay visible when world LOD is cut).
 - Shadow cascades are set up on the CPU (shaders only see cascade matrices / fade params).
+
+## NPC population
+
+Found with host-side tools in `tools/npc-re/` (live memory through `/proc/<pid>/mem`, gdb hardware
+watchpoints/breakpoints with the game running, headless Ghidra on the image dump; see "Tools" below).
+
+### What spawns ambient NPCs
+
+- Civilians, workers, guards and animals are units of the **MetaAI** virtual population
+  (`MetaAIVirtualObjective*`, ~25k static objective nodes loaded around the player). The MetaAI
+  manager (World+0x1688, vtable RVA 0x377e7e8; update RVA 0x1daf5f0) activates an objective when the
+  player is within `m * r[0] + r[2]` (deactivates beyond `m * r[1] + r[2]`; per-objective ranges,
+  e.g. {80, 82, 40} m; RVA 0x1d8e4e0) and registers its units as **spawn candidates** with the
+  SpawningManager's sources (call chain 0x1daf9b4 -> ... -> 0x123b650 -> source vtable +0x78).
+- The **SpawningManager** (World+0x13c0 -> +0x38, vtable RVA 0x363beb0; job
+  `Ai::SpawningManagerSpawningUpdate`, RVA 0x12685c0) owns 6 spawning sources ("strategies": sphere,
+  blob, bulk, ingredient, rideable...) at +0x18. Each frame it asks the sources to spawn up to
+  `SpawnSettings+0x68` (1) entities (RVA 0x12683f0 -> source vtable +0xd8). The main source (vtable
+  RVA 0x37a5280, spawn RVA 0x1ec42d0) spawns candidates within their template's spawn distance
+  (`SphereStrategyParams` +0x2c / +0x30: spawn / despawn distance, 80 / 82 m for most of the ~1500
+  templates). Budget pressure: from 0.8 * cap the spawn distance is scaled by 0.9, from 0.9 * cap by
+  0.8, at the cap nothing spawns (constants at RVAs 0x356d60c / 0x356d668).
+- **The cap** (RVA 0x1268e30 evicts above it, 0x1259050 / 0x12683f0 stop spawning at it):
+  `count >= SpawnSettings.maxSpawned (+0x38) * multiplier(quality)`. The multiplier (RVA 0x12559c0)
+  is picked on PC by the **Environment** quality level (settings index 10) from +0x4c..+0x60
+  (0.75, 0.875, 1, 1, 1.1, 1.2 in the shipped data), so Ultra = 200 * 1.2 = 240. The count is the
+  sum of the manager's pool list (+0x58: {entries, n << 17}, 0x28-byte entries, count at +0x10).
+- `SpawnSettings` (vtable RVA 0x363cc80, size 0xa8; live object = World+0x1648 = SpawningManager
+  +0x10; reached in-process via `[RVA 0x4c27f18] + 0xc0` = World) is a data object, not saved.
+  Other fields: +0x6c despawns per frame (1), +0x70 spawn-distance multiplier (1.0; scales every
+  MetaAI objective's activation range, and a candidate's spawn distance only when the candidate is
+  inside the camera frustum: RVA 0x12f9150 tests against the camera's planes at +0x310 with a 1.2
+  margin), +0x7c 40, +0xa0 flag.
+- Measured: the cap binds in every populated place tried. Siwa (Discovery Tour start) sits at 231
+  spawned with 200 * 1.0 (t3, Environment=5 profile in 768x480 shows multiplier 1.0 at that
+  moment); Alexandria's market at night held ~220 and climbed to ~400 within 2 minutes once the cap
+  was lifted (the source then stops at its demand). Lowering the cap again evicts down to it within
+  seconds.
+
+### Demand: what limits the population once the cap is lifted
+
+With the cap out of the way the count stops where the sources run out of candidates within spawn
+distance (Alexandria by day, 2560x1600, t1):
+
+| change (live) | spawned |
+|---|---|
+| game (cap 240) | 191-218 |
+| cap x5 (`npc_density=5`) | 337-359 |
+| + SpawnSettings+0x70 = 2 | ~410 |
+| + SpawnSettings+0x70 = 4 | ~425 |
+| cap x5, +0x70 = 2, SphereStrategyParams spawn/despawn x2 (`npc_distance=2`) | 495-570 |
+
+The template distances are what matter (the +0x70 multiplier only extends spawning inside the
+view frustum). Beyond that, more NPCs would need more MetaAI units per objective (spawner data:
+`MetaAIObjectiveSpawnerCustomData`, 3962 instances, unit lists at +0x7c) or more stations, i.e.
+changing what the virtual population is built from at load; not attempted.
+
+### Stability
+
+One hang in ~4 test runs: ~40 s after jumping from ~415 to ~566 spawned within seconds
+(distance x2 applied live with the cap at x5), every task thread blocked and TaskThread0 spinning
+on a lock in a Havok object destructor (RVA 0x2dbf530 -> 0x2e169d0 -> 0x2e78ef0, unregistering
+from the registry at [RVA 0x52521f0]). The same configuration then ran 5+ minutes without
+problems on a fresh launch. A lock-order deadlock in Havok object teardown that heavy spawn/despawn
+churn makes more likely is the best guess; not proven to be caused by the higher count itself.
+
+### Dead ends
+
+- `CrowdDensity` (settings index 7) has one level on PC and nothing reads it except the settings
+  copy code (refs at RVAs 0xa47127, 0xa47134, 0xa5e677; the getter 0xa58ec0 is never called with 7).
+- `MetaAIBudgetSettings` (vtable 0x377e518: 250 / 30.0 / 100 / 1000 + 10 `MetaAIBudgetPriority`
+  entries), `BulkWorldComponent` (+0xd0..: 8192 / 160 / 70 / 40), `BulkGlobalSettings` and
+  `BlobSettings` (vtable 0x37a35f0) are never read while playing (hardware read watchpoints for
+  20-120 s, also across a fast travel): consumed at world load, or unused. `BlobSettings` values are
+  copied into the blob source's helper (spawn radius^2 5625 = 75 m at +0xf0); the blob source had no
+  candidates in Alexandria / Siwa. Changing them live had no effect on the count.
+- `FakeCrowd*` (the distant fake crowd: `FakeCrowdHerder` holds `FakeCrowdDensityModifiers` at
+  +0x60, four 1.0 multipliers) has no live instances in Discovery Tour (Siwa, Alexandria).
+
+### Tools
+
+- `tools/npc-re/live.py` (host-side reads of the game's memory, `ACO_INST=t1|t3`), `hist.py`
+  (heap objects per class, from `vtnames.json` built by `vtnames.py` from the TypeInfo records),
+  `fields.py` (per-offset value distribution across a class's instances), `spawncount.py`.
+- `gw.sh` / `gb.sh`: hardware data watchpoints / execution breakpoints via gdb from the host
+  (no code bytes modified; the script always deletes the debug registers and detaches; killing gdb
+  with the watchpoint armed leaves DR7 set and crashes the game on the next hit). In-process
+  guard-page watching (PAGE_GUARD + single step) hangs the game under Wine and was removed.
+- `decomp.sh <rva> | @<rva inside a function>`: headless Ghidra decompile of the raw image dump.
