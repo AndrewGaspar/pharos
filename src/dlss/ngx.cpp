@@ -98,6 +98,9 @@ void Params::set(const char* n, void* v) { slot<void(NVSDK_NGX_Parameter*, const
 void Params::set(const char* n, ID3D11Resource* v) {
   slot<void(NVSDK_NGX_Parameter*, const char*, ID3D11Resource*)>(p_, kSetD3D11Res)(p_, n, v);
 }
+void Params::set(const char* n, ID3D12Resource* v) {
+  slot<void(NVSDK_NGX_Parameter*, const char*, ID3D12Resource*)>(p_, kSetD3D12Res)(p_, n, v);
+}
 void Params::set(const char* n, int v) { slot<void(NVSDK_NGX_Parameter*, const char*, int)>(p_, kSetI)(p_, n, v); }
 void Params::set(const char* n, unsigned int v) {
   slot<void(NVSDK_NGX_Parameter*, const char*, unsigned int)>(p_, kSetUI)(p_, n, v);

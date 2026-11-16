@@ -28,6 +28,7 @@ add_library(aco_d3d11 SHARED
   src/cloth/cloth.cpp
   src/reflex/reflex.cpp
   src/fg/fg.cpp
+  src/fg/fg_d3d12.cpp
   src/fg/vk_device_ext.cpp
   src/core/ctxhooks.cpp
   src/dlss/ngx.cpp

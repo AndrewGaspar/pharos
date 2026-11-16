@@ -48,7 +48,7 @@ HMODULE real_d3d11() {
     g_real = nullptr;
   }
   ACO_LOG("real d3d11: %ls -> %p", p.c_str(), static_cast<void*>(g_real));
-  if (g_real && config().fg_mode != "off") fg_hook_dxvk_device_creation(nullptr, g_real);
+  if (g_real && config().fg_mode == "on") fg_hook_dxvk_device_creation(nullptr, g_real);
   return g_real;
 }
 

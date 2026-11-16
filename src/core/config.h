@@ -35,7 +35,7 @@ struct Config {
   std::string mip_bias = "auto";
   float mip_bias_offset = 0.0f;
   bool latency_log = false;
-  std::string fg_mode = "off";  // [fg] mode: off | on (DLSS Frame Generation)
+  std::string fg_mode = "off";  // [fg] mode: off | on (Vulkan route, broken) | d3d12 (DLSS Frame Generation)
   float fg_mv_scale = 1.0f;     // [fg] mv_scale: motion vector normalisation (UV units -> 1)
   std::string fg_show = "both";  // [fg] show: both | generated | real (debug: present only one kind)
   bool fg_pacing = true;
@@ -50,6 +50,8 @@ struct Config {
   int fg_show_index = 1;
   bool fg_raw_output = false;  // [fg] raw_output (debug)
   bool fg_trace_cu = false;
+  bool fg_verify = false;  // [fg] verify: log/dump (previous real, generated, current real) every 2 s
+  bool fg12_descriptor_heap = true;  // [fg] descriptor_heap (mode=d3d12): VKD3D_CONFIG=descriptor_heap for our device
   bool fg_hide_handle64 = false;  // [fg] hide_handle64 (experiment): evaluation then fails, DLSS-G needs them    // [fg] trace_cu (debug): log NGX CUDA-kernel creation/launches  // [fg] show_index: which generated index to present          // [fg] refresh_hz (DLSSG.RefreshRate)               // [fg] hudless: pass the DLSS output as HUD-less colour
   std::vector<std::pair<std::string, unsigned int>> fg_create_extra;  // [fg] create_extra=DLSSG.Name:value,...
   std::vector<std::pair<std::string, unsigned int>> fg_extra;  // [fg] extra=DLSSG.Name:value,...           // [fg] ngx_log: 1 = NGX log lines into aco_dlss.log, 2 = verbose   // [fg] debug_fill: pre-fill the output with magenta        // [fg] pacing: present the real frame half a frame after the generated one

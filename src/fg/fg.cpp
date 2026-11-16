@@ -24,6 +24,7 @@
 #include "dlss/ngx.h"
 #include "dlss/upscaler.h"
 #include "fg/vk_device_ext.h"
+#include "fg/fg_d3d12.h"
 #include "core/iat.h"
 
 namespace aco {
@@ -962,14 +963,16 @@ void fg_preinit() {
   }
   // DXVK's device must be created with VK_KHR_push_descriptor (see vk_device_ext.cpp). dxgi.dll is
   // a static import of the game, so it is already mapped; DXVK's d3d11.dll is hooked when we load it.
-  if (config().fg_mode != "off") fg_hook_dxvk_device_creation(GetModuleHandleW(L"dxgi.dll"), nullptr);
+  if (config().fg_mode == "on") fg_hook_dxvk_device_creation(GetModuleHandleW(L"dxgi.dll"), nullptr);
 }
 
 void fg_on_present(IDXGISwapChain*) { ++S.frames; }
 
 bool fg_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent real, HRESULT* hr) {
   const Config& cfg = config();
-  if (cfg.fg_mode != "on" || S.frames < 300) return false;
+  if (S.frames < 300) return false;
+  if (cfg.fg_mode == "d3d12") return fg12_present(sc, sync, flags, real, hr);
+  if (cfg.fg_mode != "on") return false;
   if (S.ok) prune_views();
   if (!S.tried) {
     S.tried = true;
