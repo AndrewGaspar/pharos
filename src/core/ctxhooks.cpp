@@ -11,6 +11,7 @@
 #include "core/hook.h"
 #include "core/log.h"
 #include "core/memtool.h"
+#include "world/world.h"
 #include "core/shaders.h"
 #include "core/vtidx.h"
 #include "dlss/upscaler.h"
@@ -29,6 +30,7 @@ ID3D11DeviceContext* g_immediate = nullptr;
 struct CtxState {
   std::atomic<ID3D11DeviceContext*> ctx{nullptr};
   std::atomic<ShaderClass> ps{ShaderClass::None};
+  std::atomic<ShaderClass> cs{ShaderClass::None};
 };
 constexpr size_t kMaxContexts = 64;
 CtxState g_ctx[kMaxContexts];
@@ -46,6 +48,7 @@ CtxState* state_for(ID3D11DeviceContext* ctx) {
     if (c == ctx) return &s;
     if (!c) {
       s.ps.store(ShaderClass::None);
+      s.cs.store(ShaderClass::None);
       s.ctx.store(ctx, std::memory_order_release);
       return &s;
     }
@@ -67,8 +70,22 @@ void STDMETHODCALLTYPE hk_PSSetShader(ID3D11DeviceContext* self, ID3D11PixelShad
   ORIG(decltype(hk_PSSetShader), Context_PSSetShader)(self, ps, ci, n);
 }
 
+void STDMETHODCALLTYPE hk_CSSetShader(ID3D11DeviceContext* self, ID3D11ComputeShader* cs, ID3D11ClassInstance* const* ci,
+                                      UINT n) {
+  if (CtxState* s = state_for(self)) s->cs.store(shader_class_fast(cs), std::memory_order_relaxed);
+  ORIG(decltype(hk_CSSetShader), Context_CSSetShader)(self, cs, ci, n);
+}
+
+inline bool culling_cs(ID3D11DeviceContext* ctx) {
+  CtxState* s = state_for(ctx);
+  return s && s->cs.load(std::memory_order_relaxed) == ShaderClass::Culling;
+}
+
 void STDMETHODCALLTYPE hk_ClearState(ID3D11DeviceContext* self) {
-  if (CtxState* s = state_for(self)) s->ps.store(ShaderClass::None, std::memory_order_relaxed);
+  if (CtxState* s = state_for(self)) {
+    s->ps.store(ShaderClass::None, std::memory_order_relaxed);
+    s->cs.store(ShaderClass::None, std::memory_order_relaxed);
+  }
   ORIG(decltype(hk_ClearState), Context_ClearState)(self);
 }
 
@@ -129,12 +146,20 @@ void STDMETHODCALLTYPE hk_Dispatch(ID3D11DeviceContext* self, UINT x, UINT y, UI
   } else {
     trace_dispatch(self, "Dispatch", "");
   }
+  if (culling_cs(self)) {
+    world_on_culling_dispatch(self, [&] { ORIG(decltype(hk_Dispatch), Context_Dispatch)(self, x, y, z); });
+    return;
+  }
   ORIG(decltype(hk_Dispatch), Context_Dispatch)(self, x, y, z);
 }
 void STDMETHODCALLTYPE hk_DispatchIndirect(ID3D11DeviceContext* self, ID3D11Buffer* buf, UINT off) {
   char args[64] = "";
   if (trace_capturing()) snprintf(args, sizeof(args), "\"%p\",%u", static_cast<void*>(buf), off);
   trace_dispatch(self, "DispatchIndirect", args);
+  if (culling_cs(self)) {
+    world_on_culling_dispatch(self, [&] { ORIG(decltype(hk_DispatchIndirect), Context_DispatchIndirect)(self, buf, off); });
+    return;
+  }
   ORIG(decltype(hk_DispatchIndirect), Context_DispatchIndirect)(self, buf, off);
 }
 void STDMETHODCALLTYPE hk_CopyResource(ID3D11DeviceContext* self, ID3D11Resource* dst, ID3D11Resource* src) {
@@ -166,7 +191,10 @@ void STDMETHODCALLTYPE hk_ClearUAVUint(ID3D11DeviceContext* self, ID3D11Unordere
 HRESULT STDMETHODCALLTYPE hk_FinishCommandList(ID3D11DeviceContext* self, BOOL restore, ID3D11CommandList** out) {
   HRESULT hr = ORIG(decltype(hk_FinishCommandList), Context_FinishCommandList)(self, restore, out);
   if (!restore)
-    if (CtxState* s = state_for(self)) s->ps.store(ShaderClass::None, std::memory_order_relaxed);
+    if (CtxState* s = state_for(self)) {
+      s->ps.store(ShaderClass::None, std::memory_order_relaxed);
+      s->cs.store(ShaderClass::None, std::memory_order_relaxed);
+    }
   if (SUCCEEDED(hr) && out && *out) {
     trace_finish_command_list(self, *out);
     upscaler_on_finish_command_list(self, *out);
@@ -178,7 +206,10 @@ void STDMETHODCALLTYPE hk_ExecuteCommandList(ID3D11DeviceContext* self, ID3D11Co
   if (!upscaler_on_execute_command_list(self, cl, restore))
     ORIG(decltype(hk_ExecuteCommandList), Context_ExecuteCommandList)(self, cl, restore);
   if (!restore)
-    if (CtxState* s = state_for(self)) s->ps.store(ShaderClass::None, std::memory_order_relaxed);
+    if (CtxState* s = state_for(self)) {
+      s->ps.store(ShaderClass::None, std::memory_order_relaxed);
+      s->cs.store(ShaderClass::None, std::memory_order_relaxed);
+    }
 }
 
 // ---- device hooks ----------------------------------------------------------------------------
@@ -225,6 +256,7 @@ HRESULT STDMETHODCALLTYPE hk_CreateSamplerState(ID3D11Device* self, const D3D11_
 void ctxhooks_install_context(ID3D11DeviceContext* ctx) {
   cbshadow_install(ctx);
   hook_vtable(ctx, Context_PSSetShader, reinterpret_cast<void*>(hk_PSSetShader));
+  hook_vtable(ctx, Context_CSSetShader, reinterpret_cast<void*>(hk_CSSetShader));
   hook_vtable(ctx, Context_ClearState, reinterpret_cast<void*>(hk_ClearState));
   hook_vtable(ctx, Context_Draw, reinterpret_cast<void*>(hk_Draw));
   hook_vtable(ctx, Context_DrawIndexed, reinterpret_cast<void*>(hk_DrawIndexed));
