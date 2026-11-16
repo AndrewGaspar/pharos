@@ -108,6 +108,10 @@ scripts/aco create t1            # reflink clone (free on btrfs)
 scripts/aco up t1                # boot Connect; logs in itself (see CREDS_FILE in the script)
 scripts/package && scripts/aco game t1 --mod build/mod
 scripts/aco-dt t1                # drive menus into Discovery Tour
+scripts/aco-dt t1 giza-sphinx    # ... and teleport to a named place (tools/teleport t1 list)
+tools/teleport t1 memphis-temple --settle 5 --shot m.png   # move the player (DT or story)
+tools/where t1                   # player x y z yaw + camera position/yaw/pitch
+tools/camera t1 90 -8            # turn the camera to a fixed heading (closed loop, mouse-look)
 scripts/aco shot t1 out.png      # screenshot; scripts/aco keys t1 <xdotool args> for input
 touch ~/Games/aco-dlss-instances/t1/out/capture   # frame capture -> out/cap-NNN/
 tools/passes.py <cap-dir>        # pass-level view of a capture; tools/capsum.py for per-draw
