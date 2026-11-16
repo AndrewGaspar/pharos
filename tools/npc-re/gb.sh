@@ -10,6 +10,6 @@ abs=$(python3 -c "import sys;b=int('$base',16);print(','.join('%x'%(b+int(x,16))
 secs=${4:-20}
 ( sleep $((secs + 8)); pkill -INT -f "^gdb -p $pid -batch -x $here/hwbreak.py" ) &
 killer=$!
-BADDR=$abs BN=${2:-5} BEXPR=${3:-\$rcx} WSECS=$secs WBASE=$base \
-  timeout -s INT -k 30 $((secs + 40)) gdb -p "$pid" -batch -x "$here/hwbreak.py" 2>&1 | grep -E '^(hit|stopped|error)'
+BSTACK=${BSTACK:-0} BADDR=$abs BN=${2:-5} BEXPR=${3:-\$rcx} WSECS=$secs WBASE=$base \
+  timeout -s INT -k 30 $((secs + 40)) gdb -p "$pid" -batch -x "$here/hwbreak.py" 2>&1 | grep -E '^(hit|stopped|error|   stack)'
 kill $killer 2>/dev/null

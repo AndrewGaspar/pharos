@@ -20,6 +20,7 @@
 #include "fg/fg_d3d12.h"
 #include "fg/vk_device_ext.h"
 #include "core/memtool.h"
+#include "world/npc.h"
 #include "world/world.h"
 #include "core/framedump.h"
 #include "core/mapstats.h"
@@ -75,6 +76,7 @@ HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain* self, UINT sync, UINT flags
     fg_on_present(self);
     memtool_poll();
     world_on_present();
+    npc_on_present();
     framedump_on_present(self);
     mapstats_on_present();
     peek_on_present();

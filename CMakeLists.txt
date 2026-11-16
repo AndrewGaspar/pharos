@@ -22,6 +22,7 @@ add_library(aco_d3d11 SHARED
   src/core/dump.cpp
   src/core/memtool.cpp
   src/world/world.cpp
+  src/world/npc.cpp
   src/core/framedump.cpp
   src/core/mapstats.cpp
   src/core/peek.cpp

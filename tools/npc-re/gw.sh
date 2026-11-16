@@ -9,7 +9,7 @@ base=$(grep -m1 'ACOrigins.exe' /proc/$pid/maps | cut -d- -f1)
 secs=${5:-20}
 ( sleep $((secs + 8)); pkill -INT -f "^gdb -p $pid -batch -x $here/hwwatch.py" ) &
 killer=$!
-WADDR=$1 WLEN=${2:-4} WKIND=${3:-rwatch} WN=${4:-30} WSECS=${5:-20} WBASE=$base \
+BSTACK=${BSTACK:-0} WPER=${WPER:-1} WADDR=$1 WLEN=${2:-4} WKIND=${3:-rwatch} WN=${4:-30} WSECS=${5:-20} WBASE=$base \
   timeout -s INT -k 30 $(( ${5:-20} + 40 )) gdb -p "$pid" -batch -x "$here/hwwatch.py" 2>&1 |
   grep -vE '^\[New Thread|New LWP|^Old value|^New value|^Value = |hit Hardware|hit Read|hit Acc|^\[Thread|^warning|^$|Reading symbols|Missing separate|^0x0000|Download|debuginfod'
 kill $killer 2>/dev/null

@@ -49,8 +49,14 @@ for i in range(n):
     val = ','.join(str(int(gdb.parse_and_eval('*(%s*)0x%x' % (ctype, a_)))) for a_ in addrs)
     hits[pc] += 1
     rets.setdefault(pc, set()).add(ret)
-    if hits[pc] == 1:
+    if hits[pc] <= int(os.environ.get('WPER', '1')):
         print('hit %s val=%s tid=%d [rsp]=%s' % (rel(pc), val, gdb.selected_thread().ptid[1], rel(ret)))
+        nst = int(os.environ.get('BSTACK', '0'))
+        if nst:
+            import struct
+            mem = gdb.selected_inferior().read_memory(rsp, 8 * 400).tobytes()
+            ra = [v - base for v in struct.unpack('<400Q', mem) if base + 0x1000 <= v < base + 0x3500000]
+            print('   stack:', ' '.join('%x' % r for r in ra[:nst]))
 gdb.execute('delete', to_string=True)
 for pc, c in hits.most_common():
     print('%-14s n=%d callers %s' % (rel(pc), c, ' '.join(rel(r) for r in list(rets[pc])[:4])))

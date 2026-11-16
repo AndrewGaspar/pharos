@@ -44,5 +44,13 @@ for i in range(n):
         except gdb.error as err:
             vals.append('%s=?' % e)
     print('hit %s tid=%d %s' % (rel(pc), gdb.selected_thread().ptid[1], ' '.join(vals)))
+    nst = int(os.environ.get('BSTACK', '0'))
+    if nst:
+        # Return-address candidates: stack qwords pointing into the exe's code (.text below rva 0x3500000).
+        rsp = int(gdb.parse_and_eval('$rsp'))
+        mem = gdb.selected_inferior().read_memory(rsp, 8 * 400).tobytes()
+        import struct
+        ra = [v - base for v in struct.unpack('<400Q', mem) if base + 0x1000 <= v < base + 0x3500000]
+        print('   stack:', ' '.join('%x' % r for r in ra[:nst]))
 gdb.execute('delete', to_string=True)
 gdb.execute('detach')
