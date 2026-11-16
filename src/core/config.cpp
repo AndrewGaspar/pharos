@@ -57,6 +57,8 @@ Config load() {
   c.reflex_marker_set = read_str(L"marker_set", "minimal", L"reflex");
   c.toggle_key = read_str(L"toggle_key", "F10");
   c.reflex_optimize = read_float(L"optimize", 0.0f, L"reflex") != 0.0f;
+  c.cloth_mode = read_str(L"mode", "game", L"cloth");
+  c.cloth_scale = read_float(L"scale", 1.0f, L"cloth");
   return c;
 }
 
@@ -67,7 +69,7 @@ bool same(const Config& a, const Config& b) {
          a.latency_log == b.latency_log && a.reflex == b.reflex && a.reflex_fps_limit == b.reflex_fps_limit &&
          a.reflex_probe == b.reflex_probe && a.reflex_markers == b.reflex_markers &&
          a.reflex_marker_set == b.reflex_marker_set && a.reflex_optimize == b.reflex_optimize &&
-         a.toggle_key == b.toggle_key;
+         a.toggle_key == b.toggle_key && a.cloth_mode == b.cloth_mode && a.cloth_scale == b.cloth_scale;
 }
 } // namespace
 

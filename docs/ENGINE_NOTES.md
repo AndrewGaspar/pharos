@@ -89,3 +89,27 @@ Measured input-to-frame latency (mouse-look injected through XTEST, camera chang
 from an input event to recording the frame that shows it (input buffering + simulation +
 render-thread handoff). When GPU-bound, DXVK's present queue adds ~2 more frames, which is what
 Reflex removes.
+
+## Cloth simulation rate
+
+MotionCloth (Ubisoft's cloth; `MotionClothComponent`, reflection size 0x610, vtable RVA 0x3686e48)
+is simulated from the `UpdateMotionComponentsSim` job (job graph set up at RVA ~0xa690f0; per
+component callback RVA 0x1536700 -> 0x1536a80) with a **fixed timestep chosen by cloth LOD**:
+
+```
+lod  = word [owner + 0x184] & 7, clamped to 3
+step = interval[lod] * timescale(+0x378) * 0.5,  interval = {1/30, 1/20, 1/15, 1/10}  (RVA 0x368c4d0)
+       -> 60 / 40 / 30 / 20 Hz
+now = world clock (+0x36c); last = cloth's last sim time (+0x94)
+while now >= last + step (at most 3 substeps; more than 3 steps behind -> larger step): solve(step)
+```
+
+The rendered cloth is not interpolated between steps, so above 60 fps even the nearest cloth moves
+at a lower rate than everything else (every other frame at 120 fps), and NPC cloth at 30-20 Hz.
+The per-frame clock the job uses (`[RVA 0x48b4a10] + 0x18`, with 1/dt at +0x1c and the previous
+dt at +0x20) is the real frame delta; the throttle is only this table.
+
+`[cloth] mode=render` rewrites the table each frame (min(original, 2 * 0.8 * frame time)) so every
+cloth steps at least once per rendered frame. Verified with `mode=scale scale=20` (cloth visibly
+freezes for ~0.3 s between steps). The code is ordinary (not virtualized); the patch only touches
+the read-only data table after checking its values and the referencing instruction.

@@ -20,6 +20,10 @@ add_library(aco_d3d11 SHARED
   src/core/latency.cpp
   src/core/iat.cpp
   src/core/dump.cpp
+  src/core/framedump.cpp
+  src/core/mapstats.cpp
+  src/core/peek.cpp
+  src/cloth/cloth.cpp
   src/reflex/reflex.cpp
   src/core/ctxhooks.cpp
   src/dlss/ngx.cpp
