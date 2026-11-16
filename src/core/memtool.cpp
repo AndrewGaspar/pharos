@@ -106,10 +106,13 @@ void run(const char* line) {
 }
 
 std::atomic<uint64_t> g_draws{0}, g_indices{0}, g_indirect{0};
+// Draw statistics are a debugging aid (shared atomics on every draw): on only while <out>\geo exists.
+std::atomic<bool> g_geo_on{false};
 
 } // namespace
 
 void geo_count(unsigned long long indices, bool indirect) {
+  if (!g_geo_on.load(std::memory_order_relaxed)) return;
   g_draws.fetch_add(1, std::memory_order_relaxed);
   if (indirect) g_indirect.fetch_add(1, std::memory_order_relaxed);
   else g_indices.fetch_add(indices, std::memory_order_relaxed);
@@ -121,7 +124,9 @@ void memtool_poll() {
   ++frames;
   uint64_t now = GetTickCount64();
   if (now - last_ms >= 2000) {
-    if (last_ms)
+    g_geo_on.store(GetFileAttributesW((out_dir() + L"\\geo").c_str()) != INVALID_FILE_ATTRIBUTES,
+                   std::memory_order_relaxed);
+    if (last_ms && g_geo_on.load())
       ACO_LOG("geo: %.0f draws/frame, %.2fM indices/frame, %.0f indirect/frame", double(g_draws.exchange(0)) / frames,
               double(g_indices.exchange(0)) / frames / 1e6, double(g_indirect.exchange(0)) / frames);
     else
