@@ -2,3 +2,4 @@ third_party/DLSS-*/
 build/
 third_party/
 .claude/
+__pycache__/

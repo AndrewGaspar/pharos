@@ -48,7 +48,9 @@ bool contains(const std::vector<uint8_t>& bc, const char* needle) {
 
 ShaderClass classify(ShaderKind kind, const std::vector<uint8_t>& bc) {
   if (kind == ShaderKind::CS)
-    return contains(bc, "MiscCullingConsts_cbuffer") ? ShaderClass::Culling : ShaderClass::None;
+    return contains(bc, "MiscCullingConsts_cbuffer")     ? ShaderClass::Culling
+           : contains(bc, "SkinningPassCompute_cbuffer") ? ShaderClass::Skinning
+                                                         : ShaderClass::None;
   if (kind != ShaderKind::PS) return ShaderClass::None;
   if (contains(bc, "TemporalAA_ColorAccumulation")) return ShaderClass::TemporalAA;
   if (contains(bc, "ConvertLinearZParams_DepthBufferSampler")) return ShaderClass::LinearZ;
@@ -117,6 +119,7 @@ const char* shader_class_name(ShaderClass c) {
     case ShaderClass::LinearZ: return "LinearZ";
     case ShaderClass::UIComposite: return "UIComposite";
     case ShaderClass::Culling: return "Culling";
+    case ShaderClass::Skinning: return "Skinning";
   }
   return "?";
 }

@@ -17,6 +17,7 @@ enum class ShaderClass : uint8_t {
   LinearZ,      // depth linearisation; RT0 = linear Z, RT1 = raw device depth copy
   UIComposite,  // final scene + UI composite ("UICompositingParameters_cbuffer")
   Culling,      // GPU instance culling / LOD selection CS ("MiscCullingConsts_cbuffer" at b8)
+  Skinning,     // character skinning CS ("SkinningPassCompute_cbuffer"); counted for NPC load stats
 };
 
 struct ShaderInfo {

@@ -6,6 +6,9 @@ everything happens at the D3D11 API level through a `d3d11.dll` proxy.
 
 Status: DLSS SR (all quality modes + DLAA), NVIDIA Reflex and DLSS Frame Generation (D3D12 route via
 vkd3d-proton, F9 toggle) working; see [docs/FRAME_GENERATION.md](docs/FRAME_GENERATION.md).
+Game-data tweaks: `[world] npc_density` / `npc_distance` (bigger crowds: the engine's spawn cap
+and spawn distance), `[world] lod_distance`, `[cloth] mode=render`; see `dist/aco_dlss.ini` and
+docs/ENGINE_NOTES.md.
 
 ## Results (RTX 5070 Laptop, 2560x1600, Discovery Tour / Siwa village, uncapped)
 

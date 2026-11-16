@@ -95,6 +95,11 @@ void STDMETHODCALLTYPE hk_CSSetShader(ID3D11DeviceContext* self, ID3D11ComputeSh
   ORIG(decltype(hk_CSSetShader), Context_CSSetShader)(self, cs, ci, n);
 }
 
+inline bool skinning_cs(ID3D11DeviceContext* ctx) {
+  CtxState* s = state_for(ctx);
+  return s && s->cs.load(std::memory_order_relaxed) == ShaderClass::Skinning;
+}
+
 inline bool culling_cs(ID3D11DeviceContext* ctx) {
   CtxState* s = state_for(ctx);
   return s && s->cs.load(std::memory_order_relaxed) == ShaderClass::Culling;
@@ -168,6 +173,7 @@ void STDMETHODCALLTYPE hk_Dispatch(ID3D11DeviceContext* self, UINT x, UINT y, UI
   } else {
     trace_dispatch(self, "Dispatch", "");
   }
+  if (skinning_cs(self)) skin_count(uint64_t(x) * y * z);
   if (culling_cs(self)) {
     world_on_culling_dispatch(self, [&] { ORIG(decltype(hk_Dispatch), Context_Dispatch)(self, x, y, z); });
     return;
@@ -179,6 +185,7 @@ void STDMETHODCALLTYPE hk_DispatchIndirect(ID3D11DeviceContext* self, ID3D11Buff
   char args[64] = "";
   if (trace_capturing()) snprintf(args, sizeof(args), "\"%p\",%u", static_cast<void*>(buf), off);
   trace_dispatch(self, "DispatchIndirect", args);
+  if (skinning_cs(self)) skin_count(0);
   if (culling_cs(self)) {
     world_on_culling_dispatch(self, [&] { ORIG(decltype(hk_DispatchIndirect), Context_DispatchIndirect)(self, buf, off); });
     return;

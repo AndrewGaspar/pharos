@@ -20,10 +20,17 @@ namespace aco {
 //   fr x y z r | fc | fu    refine: within r of a new point / changed / unchanged since last scan
 //   fd dx dy dz tol         refine: moved by (dx,dy,dz) +- tol since last scan
 //   fl [n]                  list candidates
+//   wq <addr> <hex> / wb <addr> <hex>   write a qword / byte
+//   find <value> [max]      every aligned qword == value in writable/readonly data
+// (To see which code touches an address, use hardware watchpoints from the host: tools/npc-re/gw.sh.)
+// An address written "r<hex>" is relative to the image base.
 void memtool_poll();
 
 // Geometry statistics (draws / indices per frame), logged every ~2 s as "geo:" lines; used to
 // see the effect of LOD/draw-distance changes quantitatively.
 void geo_count(unsigned long long indices, bool indirect);
+// Character skinning compute dispatches (thread groups), reported with the geo stats: a proxy for
+// the number of animated characters being rendered.
+void skin_count(unsigned long long groups);
 
 } // namespace aco
