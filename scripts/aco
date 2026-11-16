@@ -52,8 +52,11 @@ CONNECT_APPDATA="drive_c/users/steamuser/AppData/Local/Ubisoft Game Launcher"
 CRED=ConnectSecureStorage.dat
 ACO_APPID=3539
 UBI_ROOT=${ACO_UBI_ROOT:-$HOME/code/ubisoft-linux}
-UBI=$UBI_ROOT/target/release/quiver  # formerly ubi (alias still exists)
-BRIDGE_EXE=$UBI_ROOT/target/x86_64-pc-windows-gnu/release/ubi-bridge.exe
+# Prefer the installed Quiver (stable) over the dev build (may be mid-rebuild).
+UBI=$HOME/.local/bin/quiver
+[[ -x $UBI ]] || UBI=$UBI_ROOT/target/release/quiver
+BRIDGE_EXE=$HOME/.local/lib/quiver/ubi-bridge.exe
+[[ -f $BRIDGE_EXE ]] || BRIDGE_EXE=$UBI_ROOT/target/x86_64-pc-windows-gnu/release/ubi-bridge.exe
 CONNECT_EXES=(upc.exe UbisoftConnect.exe UbisoftGameLauncher.exe UbisoftGameLauncher64.exe UplayService.exe
   UplayWebCore.exe UbisoftExtension.exe)
 GAME_WIN="C:\\Program Files (x86)\\Ubisoft\\Ubisoft Game Launcher\\games\\Assassin's Creed Origins\\ACOrigins.exe"
