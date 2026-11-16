@@ -14,6 +14,7 @@
 
 #include <atomic>
 #include <cmath>
+#include <cstring>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -23,6 +24,7 @@
 #include "dlss/ngx.h"
 #include "dlss/upscaler.h"
 #include "fg/vk_device_ext.h"
+#include "core/iat.h"
 
 namespace aco {
 
@@ -263,6 +265,91 @@ void NVSDK_CONV ngx_log(const char* msg, NVSDK_NGX_Logging_Level, NVSDK_NGX_Feat
   ACO_LOG("ngx[%d]: %s", static_cast<int>(feature), s.c_str());
 }
 
+// ---- Diagnostics: how NGX creates and launches its CUDA kernels through Vulkan ([fg] trace_cu=1) --
+PFN_vkCreateCuModuleNVX g_real_create_module = nullptr;
+PFN_vkCreateCuFunctionNVX g_real_create_function = nullptr;
+PFN_vkCmdCuLaunchKernelNVX g_real_launch = nullptr;
+std::atomic<int> g_cu_logged{0};
+std::atomic<uint32_t> g_cu_launches{0};
+
+VkResult VKAPI_CALL tr_create_module(VkDevice d, const VkCuModuleCreateInfoNVX* ci, const VkAllocationCallbacks* a,
+                                     VkCuModuleNVX* m) {
+  VkResult r = g_real_create_module(d, ci, a, m);
+  if (g_cu_logged++ < 60) ACO_LOG("fg: cu: vkCreateCuModuleNVX(size %zu) -> %d", ci ? ci->dataSize : 0, r);
+  return r;
+}
+VkResult VKAPI_CALL tr_create_function(VkDevice d, const VkCuFunctionCreateInfoNVX* ci, const VkAllocationCallbacks* a,
+                                       VkCuFunctionNVX* f) {
+  VkResult r = g_real_create_function(d, ci, a, f);
+  if (g_cu_logged++ < 60) ACO_LOG("fg: cu: vkCreateCuFunctionNVX(%s) -> %d", ci && ci->pName ? ci->pName : "?", r);
+  return r;
+}
+void VKAPI_CALL tr_launch(VkCommandBuffer cb, const VkCuLaunchInfoNVX* li) {
+  ++g_cu_launches;
+  static std::atomic<int> launch_logged{0};
+  if (li && launch_logged++ < 12) {
+    ACO_LOG("fg: cu: launch fn=%p grid %ux%ux%u block %ux%ux%u shmem %u params %zu (p=%p) extras %zu (e=%p)",
+            static_cast<void*>(li->function), li->gridDimX, li->gridDimY, li->gridDimZ, li->blockDimX, li->blockDimY,
+            li->blockDimZ, li->sharedMemBytes, li->paramCount, li->pParams, li->extraCount, li->pExtras);
+    for (size_t i = 0; i < li->extraCount && i < 6; ++i)
+      ACO_LOG("fg: cu:   extra[%zu] = %p", i, li->pExtras ? li->pExtras[i] : nullptr);
+  }
+  g_real_launch(cb, li);
+}
+// [fg] hide_handle64=1: don't let DLSS-G use 64-bit image view handles ("texmode_raw").
+bool hidden(const char* name) {
+  return name && config().fg_hide_handle64 &&
+         (!strcmp(name, "vkGetImageViewHandle64NVX") || !strcmp(name, "vkGetImageViewAddressNVX"));
+}
+
+PFN_vkVoidFunction VKAPI_CALL tr_gdpa(VkDevice d, const char* name) {
+  if (hidden(name)) {
+    ACO_LOG("fg: hiding %s from NGX", name);
+    return nullptr;
+  }
+  if (name && !strcmp(name, "vkCmdCuLaunchKernelNVX")) {
+    g_real_launch = reinterpret_cast<PFN_vkCmdCuLaunchKernelNVX>(vk.gdpa(d, name));
+    return g_real_launch ? reinterpret_cast<PFN_vkVoidFunction>(tr_launch) : nullptr;
+  }
+  if (name && !strcmp(name, "vkCreateCuModuleNVX")) {
+    g_real_create_module = reinterpret_cast<PFN_vkCreateCuModuleNVX>(vk.gdpa(d, name));
+    return g_real_create_module ? reinterpret_cast<PFN_vkVoidFunction>(tr_create_module) : nullptr;
+  }
+  if (name && !strcmp(name, "vkCreateCuFunctionNVX")) {
+    g_real_create_function = reinterpret_cast<PFN_vkCreateCuFunctionNVX>(vk.gdpa(d, name));
+    return g_real_create_function ? reinterpret_cast<PFN_vkVoidFunction>(tr_create_function) : nullptr;
+  }
+  if (name && !strcmp(name, "vkGetDeviceProcAddr")) return reinterpret_cast<PFN_vkVoidFunction>(tr_gdpa);
+  return vk.gdpa(d, name);
+}
+PFN_vkVoidFunction VKAPI_CALL tr_gipa(VkInstance i, const char* name);
+using PFN_GetProcAddressW = FARPROC(WINAPI*)(HMODULE, LPCSTR);
+PFN_GetProcAddressW g_dlssg_gpa = nullptr;
+// nvngx_dlssg.dll resolves Vulkan itself (GetProcAddress on vulkan-1.dll): route its lookups through
+// the tracers above.
+FARPROC WINAPI tr_dlssg_gpa(HMODULE m, LPCSTR name) {
+  FARPROC f = g_dlssg_gpa(m, name);
+  if (!IS_INTRESOURCE(name) && hidden(name)) {
+    ACO_LOG("fg: hiding %s from nvngx_dlssg (GetProcAddress)", name);
+    return nullptr;
+  }
+  if (f && !IS_INTRESOURCE(name)) {
+    if (!strcmp(name, "vkGetDeviceProcAddr")) return reinterpret_cast<FARPROC>(tr_gdpa);
+    if (!strcmp(name, "vkGetInstanceProcAddr")) return reinterpret_cast<FARPROC>(tr_gipa);
+    if (!strcmp(name, "vkCmdCuLaunchKernelNVX")) {
+      g_real_launch = reinterpret_cast<PFN_vkCmdCuLaunchKernelNVX>(f);
+      return reinterpret_cast<FARPROC>(tr_launch);
+    }
+  }
+  return f;
+}
+
+PFN_vkVoidFunction VKAPI_CALL tr_gipa(VkInstance i, const char* name) {
+  if (name && !strcmp(name, "vkGetDeviceProcAddr")) return reinterpret_cast<PFN_vkVoidFunction>(tr_gdpa);
+  if (name && !strcmp(name, "vkGetInstanceProcAddr")) return reinterpret_cast<PFN_vkVoidFunction>(tr_gipa);
+  return vk.gipa(i, name);
+}
+
 bool init(IDXGISwapChain* sc) {
   if (FAILED(sc->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void**>(&S.dev)))) return false;
   S.dev->GetImmediateContext(&S.imm);
@@ -299,9 +386,17 @@ bool init(IDXGISwapChain* sc) {
     common.LoggingInfo.MinimumLoggingLevel = config().fg_ngx_log >= 2 ? NVSDK_NGX_LOGGING_LEVEL_VERBOSE
                                                                        : NVSDK_NGX_LOGGING_LEVEL_ON;
   }
+  if (config().fg_trace_cu) {
+    // Load the DLSS-G snippet ourselves before NGX does, and hook its GetProcAddress import.
+    HMODULE dlssg = LoadLibraryW((dir + L"\\nvngx_dlssg.dll").c_str());
+    if (dlssg && iat_hook(dlssg, "KERNEL32.dll", "GetProcAddress", reinterpret_cast<void*>(tr_dlssg_gpa),
+                          reinterpret_cast<void**>(&g_dlssg_gpa)))
+      ACO_LOG("fg: tracing nvngx_dlssg.dll Vulkan lookups");
+  }
   int64_t t0 = now_us();
   NVSDK_NGX_Result r =
-      init_fn(kAppId, dir.c_str(), S.instance, S.pd, S.device, vk.gipa, vk.gdpa, &common, NVSDK_NGX_Version_API);
+      init_fn(kAppId, dir.c_str(), S.instance, S.pd, S.device, config().fg_trace_cu ? tr_gipa : vk.gipa,
+              config().fg_trace_cu ? tr_gdpa : vk.gdpa, &common, NVSDK_NGX_Version_API);
   ACO_LOG("fg: NVSDK_NGX_VULKAN_Init -> %s (%.1f s)", ngx::result_str(r), (now_us() - t0) / 1e6);
   if (NVSDK_NGX_FAILED(r)) return false;
   NVSDK_NGX_Parameter* caps_raw = nullptr;
@@ -824,8 +919,8 @@ void perf_report() {
   if (!S.perf_last) S.perf_last = now;
   double secs = (now - S.perf_last) / 1e6;
   if (secs < 2.0) return;
-  ACO_LOG("perf: fg real %.1f fps + generated %.1f fps = %.1f presents/s (fail %u, dlssg-disabled %u, resets %u), eval CPU %.2f ms GPU %.3f ms/frame",
-          S.perf_real / secs, S.perf_generated / secs, (S.perf_real + S.perf_generated) / secs, S.perf_fail, S.perf_disabled, S.perf_resets,
+  ACO_LOG("perf: fg real %.1f fps + generated %.1f fps = %.1f presents/s (fail %u, dlssg-disabled %u, resets %u, cu launches %u), eval CPU %.2f ms GPU %.3f ms/frame",
+          S.perf_real / secs, S.perf_generated / secs, (S.perf_real + S.perf_generated) / secs, S.perf_fail, S.perf_disabled, S.perf_resets, g_cu_launches.exchange(0),
           S.perf_real ? S.perf_eval_cpu_ms / S.perf_real : 0.0, S.perf_gpu_n ? S.perf_gpu_ms / S.perf_gpu_n : 0.0);
   S.perf_gpu_ms = 0;
   S.perf_gpu_n = 0;
