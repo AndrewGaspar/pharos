@@ -22,6 +22,7 @@ class Live:
             self.regions.append((s, e, perms, path))
 
     def read(self, addr, n):
+        if not (0 < addr < 0x7fffffffffff): return None
         try:
             self.mem.seek(addr)
             return self.mem.read(n)

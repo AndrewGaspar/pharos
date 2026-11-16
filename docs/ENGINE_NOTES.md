@@ -289,6 +289,39 @@ churn makes more likely is the best guess; not proven to be caused by the higher
 After that: story mode, `npc_density=5 npc_distance=2`, 12-minute soak with 8 teleports between the
 Alexandria harbour (535-607 spawned) and Memphis (130-306), 84-89 fps, no hang (`tools/npc-re/soak.sh`).
 
+### Visible density near the player (why the settings mostly add people far away)
+
+- Every ambient NPC is a placed **MetaAI virtual unit** (base vtable RVA 0x377eab8, built by
+  ctor 0x1d5d360 and its derived ctors 0x1d58fd0 / 0x1d596a0 / 0x1d5d520 / 0x1d5ddc0 / 0x1d17b10):
+  ~9300 loaded around Alexandria, position at +0x10. Units belong to virtual spawners (vtable RVA
+  0x377d218, ~3950 loaded; unit array at +0xa0, 0-8 units each, mostly 1-4; the spawner data
+  `MetaAIObjectiveSpawnerCustomData` holds spawn positions at +0x7c {x, y, z, heading}).
+- Around the Alexandria harbour market (story fixture position): 22 units within 20 m, 68-78 within
+  40 m, ~240 within 80 m, ~395 within 120 m (the activation range), ~1200 within 250 m. The game
+  spawns nearest first and its cap (240) is reached at roughly 70-80 m, so the ring the player can
+  see up close is already fully populated in vanilla; raising the cap/distance fills the rim.
+- Measured in view (skinning compute thread groups per frame, fixed camera, only drawn characters
+  are skinned): 1726 at 1/1 vs 1870 at npc_density=5 npc_distance=2 (+8%), although the spawned
+  total goes 208 -> 579.
+- So "3x people within 40 m" needs ~3x the *units*: more units per spawner / spawn position at
+  world load (patching the data before the virtual spawners are built, or hooking their unit
+  creation), or cloning units at runtime through the engine's creation path. Not done: it means
+  hooking/calling game code and finding the slot semantics (many units stand at CrowdLife station
+  slots - stalls, seats - where extra units would stack; free wanderers
+  `MetaAIBehaviourWanderOnAINetwork` are few).
+
+### The Havok deadlock is a vanilla engine bug
+
+Same stack (TaskThread0 spinning in 0x2ffd9e4 <- 0x2e78f07 <- 0x2e16a8d <- 0x2dbf560 (Havok object
+destructor unregistering from [RVA 0x52521f0]) <- 0xf8c5ce <- 0xf0f4e9 <- 0xf1f482 <- 0x1327601 <-
+0x131aa31 <- 0x131ade4; other task threads waiting in 0x1316a4b -> 0x2ffd9e4 under 0x2e16a8d), seen:
+1. DT, cap x5 + distance x2 applied live (spawn burst 415 -> 566);
+2. story, `npc_density=3`, right after `tools/teleport` Alexandria -> Memphis;
+3. story, **vanilla** (npc settings at 1, the npc code never engaged), right after the same teleport;
+4. story, vanilla, while gdb hardware breakpoints were pausing threads repeatedly.
+Abrupt mass spawn/despawn (instant teleports, debugger stalls) triggers it; it is not caused by the
+density settings. Long soaks must move the player normally (`tools/npc-re/walker.sh`), not teleport.
+
 ### Dead ends
 
 - `CrowdDensity` (settings index 7) has one level on PC and nothing reads it except the settings
