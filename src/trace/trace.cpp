@@ -24,7 +24,8 @@ namespace aco {
 
 namespace {
 
-constexpr int kCaptureFrames = 3;
+constexpr int kCaptureFrames = 3;  // default; the trigger file may contain another count
+int g_capture_frames = kCaptureFrames;
 
 std::atomic<int> g_capture_left{0};  // frames left to capture (0 = idle)
 std::atomic<uint64_t> g_frame{0};
@@ -406,7 +407,7 @@ void trace_on_present(IDXGISwapChain* sc) {
   uint64_t frame = g_frame.fetch_add(1) + 1;
   if (g_preroll) {
     g_preroll = false;
-    g_capture_left.store(kCaptureFrames);
+    g_capture_left.store(g_capture_frames);
     ACO_LOG("capture %d started at frame %llu", g_cap_index, (unsigned long long)frame);
     return;
   }
@@ -429,6 +430,12 @@ void trace_on_present(IDXGISwapChain* sc) {
   if (frame % 30 == 0) {
     std::wstring trig = out_dir() + L"\\capture";
     if (GetFileAttributesW(trig.c_str()) != INVALID_FILE_ATTRIBUTES) {
+      g_capture_frames = kCaptureFrames;
+      if (FILE* f = _wfopen(trig.c_str(), L"r")) {
+        int n = 0;
+        if (fscanf(f, "%d", &n) == 1 && n > 0 && n <= 64) g_capture_frames = n;
+        fclose(f);
+      }
       DeleteFileW(trig.c_str());
       wchar_t name[64];
       swprintf(name, 64, L"\\cap-%03d", ++g_cap_index);

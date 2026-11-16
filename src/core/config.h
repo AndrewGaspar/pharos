@@ -40,6 +40,8 @@ struct Config {
   std::string reflex_marker_set = "minimal";  // [reflex] marker_set: minimal | full (experiments)
   bool reflex_optimize = false;   // [reflex] optimize: bUseMarkersToOptimize
   bool reflex_probe = false;      // [reflex] probe (input thread diagnostics)
+  std::string cloth_mode = "game";  // [cloth] mode: game | render | scale (see cloth/cloth.h)
+  float cloth_scale = 1.0f;         // [cloth] scale (mode=scale, diagnostics)
 };
 
 const Config& config();

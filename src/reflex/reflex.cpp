@@ -5,6 +5,7 @@
 #include <dxgi.h>
 
 #include <algorithm>
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <string>
@@ -40,6 +41,15 @@ struct State {
   float applied_limit = -1.0f;
   bool applied_optimize = false;
   bool sleeping = false;
+  // Robustness: Reflex is only armed after kArmFrames stable presents (not during startup /
+  // device probing / swapchain changes), and the sleep runs on a watchdog thread: DXVK waits on
+  // the driver's semaphore with no timeout, so a confused frame mapping would otherwise hang the
+  // game (seen once at startup). On a stall Reflex is switched off for the rest of the session.
+  IDXGISwapChain* swapchain = nullptr;
+  uint32_t stable_frames = 0;
+  bool stalled = false;
+  HANDLE sleep_req = nullptr, sleep_done = nullptr;
+  std::atomic<bool> sleeper_busy{false};
   // perf
   double sleep_ms_sum = 0;
   uint32_t sleeps = 0;
@@ -78,9 +88,35 @@ bool load() {
   return S.available;
 }
 
+constexpr uint32_t kArmFrames = 240;
+
+DWORD WINAPI sleeper_main(void*) {
+  for (;;) {
+    WaitForSingleObject(S.sleep_req, INFINITE);
+    S.sleep(S.dev);
+    S.sleeper_busy.store(false);
+    SetEvent(S.sleep_done);
+  }
+}
+
+// Runs NvAPI_D3D_Sleep on the sleeper thread; false if it didn't return within the timeout.
+bool sleep_with_watchdog(DWORD timeout_ms) {
+  if (!S.sleep_req) {
+    S.sleep_req = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    S.sleep_done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    HANDLE t = CreateThread(nullptr, 0, sleeper_main, nullptr, 0, nullptr);
+    if (t) CloseHandle(t);
+  }
+  if (S.sleeper_busy.load()) return false;  // a previous sleep never returned
+  S.sleeper_busy.store(true);
+  SetEvent(S.sleep_req);
+  return WaitForSingleObject(S.sleep_done, timeout_ms) == WAIT_OBJECT_0;
+}
+
 // (Re)applies the sleep mode when the config or the device changed.
 void apply_mode() {
   const Config& cfg = config();
+  if (S.stalled) return;
   if (S.applied_dev == S.dev && S.applied_mode == cfg.reflex && S.applied_limit == cfg.reflex_fps_limit &&
       S.applied_optimize == cfg.reflex_optimize)
     return;
@@ -96,6 +132,7 @@ void apply_mode() {
   p.bUseMarkersToOptimize = cfg.reflex_optimize;
   nv::Status st = S.set_sleep_mode(S.dev, &p);
   S.sleeping = st == 0 && p.bLowLatencyMode;
+  S.frame_begun = false;
   ACO_LOG("reflex: SetSleepMode(low_latency=%d boost=%d min_interval=%uus optimize=%d) -> %d", p.bLowLatencyMode,
           p.bLowLatencyBoost, p.minimumIntervalUs, p.bUseMarkersToOptimize, st);
   if (S.get_sleep_status) {
@@ -233,8 +270,21 @@ void reflex_on_device(ID3D11Device* dev) {
   S.dev = dev;
 }
 
-void reflex_on_present_begin(IDXGISwapChain*) {
+void reflex_on_resize() {
   std::lock_guard lock(S.mutex);
+  S.stable_frames = 0;  // re-arm once the resized swapchain is stable
+}
+
+void reflex_on_present_begin(IDXGISwapChain* sc) {
+  std::lock_guard lock(S.mutex);
+  if (sc != S.swapchain) {  // new swapchain: re-arm after it has been stable for a while
+    S.swapchain = sc;
+    S.stable_frames = 0;
+  }
+  if (S.stable_frames < kArmFrames) {
+    ++S.stable_frames;
+    return;
+  }
   if (config().reflex_probe) {
     probe_install();
     probe_on_present();
@@ -261,11 +311,23 @@ void reflex_on_present_begin(IDXGISwapChain*) {
 // sleep wait for its CS thread to finish the previous frame, which costs throughput when CPU-bound.
 void reflex_on_present_end() {
   std::lock_guard lock(S.mutex);
-  if (!S.available || !S.sleeping) return;
+  if (!S.available || !S.sleeping || S.stalled || S.stable_frames < kArmFrames) return;
   if (S.frame_begun) marker(nv::PRESENT_END);
   ++S.frame_id;
   int64_t t0 = now_us();
-  S.sleep(S.dev);
+  // Generous: a legitimate sleep is at most about one frame (or one fps_limit interval).
+  float limit = config().reflex_fps_limit;
+  DWORD timeout = 500 + (limit > 0 ? static_cast<DWORD>(2000.0f / limit) : 0);
+  if (!sleep_with_watchdog(timeout)) {
+    S.stalled = true;
+    S.sleeping = false;
+    nv::SetSleepModeParams off{};
+    off.version = nv::kSetSleepModeVer;
+    nv::Status st = S.set_sleep_mode(S.dev, &off);
+    ACO_LOG("reflex: sleep did not return within %lu ms; Reflex disabled for this session (SetSleepMode off -> %d)",
+            timeout, st);
+    return;
+  }
   int64_t t1 = now_us();
   marker(nv::SIMULATION_START);
   S.frame_begun = true;
