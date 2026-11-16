@@ -390,10 +390,8 @@ bool init(IDXGISwapChain* sc) {
                                                                        : NVSDK_NGX_LOGGING_LEVEL_ON;
   }
   {
-    // Load the DLSS-G snippet ourselves before NGX does and hook its GetProcAddress import: it
-    // resolves Vulkan itself, and under Wine its 64-bit image-view-handle path (texmode_raw) loses
-    // every kernel read/write, so vkGetImageViewHandle64NVX/AddressNVX must be hidden from it
-    // ([fg] hide_handle64, default on). The same hook carries the kernel tracing ([fg] trace_cu).
+    // Load the DLSS-G snippet ourselves before NGX does and hook its GetProcAddress import (it
+    // resolves Vulkan itself), for kernel tracing ([fg] trace_cu) and the hide_handle64 experiment.
     HMODULE dlssg = LoadLibraryW((dir + L"\\nvngx_dlssg.dll").c_str());
     if (dlssg && iat_hook(dlssg, "KERNEL32.dll", "GetProcAddress", reinterpret_cast<void*>(tr_dlssg_gpa),
                           reinterpret_cast<void**>(&g_dlssg_gpa)))
@@ -740,6 +738,14 @@ void raw_out_report() {
   g_raw.pending_slot = -1;
 }
 
+void gen_fail(const char* why) {
+  static int64_t last = 0;
+  if (now_us() - last > 5000000) {
+    last = now_us();
+    ACO_LOG("fg: generate: failed at: %s", why);
+  }
+}
+
 bool generate(const FgInputs& in, ID3D11Texture2D* swap_bb) {
   NVSDK_NGX_Resource_VK bb{}, depth{}, mv{}, out{}, outreal{}, hudless{};
   VkTex bb_t;
@@ -750,8 +756,8 @@ bool generate(const FgInputs& in, ID3D11Texture2D* swap_bb) {
   bool swap = config().fg_swap_outputs;
   if (!ngx_res(input, false, &bb, &bb_t) || !ngx_res(in.depth, false, &depth) || !ngx_res(in.mv, false, &mv) ||
       !ngx_res(swap ? S.outreal : S.interp, true, &out))
-    return false;
-  if (!ensure_feature(S.tex_w, S.tex_h, in.render_w, in.render_h, bb_t.info.format)) return false;
+    { gen_fail("ngx_res inputs"); return false; }
+  if (!ensure_feature(S.tex_w, S.tex_h, in.render_w, in.render_h, bb_t.info.format)) { gen_fail("!ensure_feature(S.tex_w, S.tex_h, in.render_w, in.render_h, "); return false; }
 
   ngx::Params& p = S.eval_params;
   p.reset();
@@ -773,7 +779,7 @@ bool generate(const FgInputs& in, ID3D11Texture2D* swap_bb) {
   const unsigned int count = static_cast<unsigned int>(config().fg_count);
   const unsigned int show_index = static_cast<unsigned int>(config().fg_show_index);
   NVSDK_NGX_Resource_VK scratch{};
-  if (!ngx_res(S.scratch, true, &scratch)) return false;
+  if (!ngx_res(S.scratch, true, &scratch)) { gen_fail("!ngx_res(S.scratch, true, &scratch)"); return false; }
   for (const char* m : {NVSDK_NGX_DLSSG_Parameter_CameraViewToClip, NVSDK_NGX_DLSSG_Parameter_ClipToCameraView,
                         NVSDK_NGX_DLSSG_Parameter_ClipToLensClip, NVSDK_NGX_DLSSG_Parameter_ClipToPrevClip,
                         NVSDK_NGX_DLSSG_Parameter_PrevClipToClip})
@@ -885,7 +891,7 @@ bool generate(const FgInputs& in, ID3D11Texture2D* swap_bb) {
       p.set(NVSDK_NGX_DLSSG_Parameter_OutputInterpolated,
             static_cast<void*>(i == show_index ? (use_raw ? &raw : &out) : &scratch));
       r = S.evaluate(cmd, S.feature, p.get(), nullptr);
-      if (NVSDK_NGX_FAILED(r)) return false;
+      if (NVSDK_NGX_FAILED(r)) { static int n = 0; if (n++ < 5) ACO_LOG("fg: Evaluate(index %u of %u) -> %s (0x%08x)", i, count, ngx::result_str(r), static_cast<unsigned>(r)); return false; }
     }
     if (use_raw) {
       full_barrier(cmd);
@@ -974,6 +980,11 @@ bool fg_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent real,
   FgInputs in;
   if (!upscaler_fg_inputs(&in)) {  // no DLSS this frame (menus, loading): present normally
     S.reset = true;
+    static int64_t last = 0;
+    if (now_us() - last > 5000000) {
+      last = now_us();
+      ACO_LOG("fg: no DLSS inputs this frame (menus/loading?) - presenting normally");
+    }
     return false;
   }
   if (in.frame != S.last_input_frame + 1) S.reset = true;
@@ -988,11 +999,11 @@ bool fg_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent real,
       S.imm->CopyResource(S.real, bb);
       if (generate(in, bb)) {
         // Generated frame first (it lies between the previous real frame and this one) ...
-        if (cfg.fg_show == "compare") {
+        if (cfg.fg_show == "compare" || cfg.fg_show == "compare_gen") {
           // Debug: left half the input frame, right half OutputReal, both from this evaluation.
           D3D11_BOX left{0, 0, 0, S.tex_w / 2, S.tex_h, 1};
           S.imm->CopySubresourceRegion(bb, 0, 0, 0, 0, S.real, 0, &left);
-          S.imm->CopySubresourceRegion(bb, 0, S.tex_w / 2, 0, 0, S.outreal, 0, &left);
+          S.imm->CopySubresourceRegion(bb, 0, S.tex_w / 2, 0, 0, cfg.fg_show == "compare_gen" ? S.interp : S.outreal, 0, &left);
         } else {
           S.imm->CopyResource(bb, cfg.fg_show == "real" ? S.real : cfg.fg_show == "outreal" ? S.outreal : S.interp);
         }
@@ -1004,10 +1015,10 @@ bool fg_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent real,
           wait_until(t_gen + static_cast<int64_t>(S.frame_interval_us / 2));
         ID3D11Texture2D* bb2 = nullptr;
         if (SUCCEEDED(sc->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&bb2)))) {
-          if (cfg.fg_show == "compare") {
+          if (cfg.fg_show == "compare" || cfg.fg_show == "compare_gen") {
             D3D11_BOX left{0, 0, 0, S.tex_w / 2, S.tex_h, 1};
             S.imm->CopySubresourceRegion(bb2, 0, 0, 0, 0, S.real, 0, &left);
-            S.imm->CopySubresourceRegion(bb2, 0, S.tex_w / 2, 0, 0, S.outreal, 0, &left);
+            S.imm->CopySubresourceRegion(bb2, 0, S.tex_w / 2, 0, 0, cfg.fg_show == "compare_gen" ? S.interp : S.outreal, 0, &left);
           } else {
             S.imm->CopyResource(bb2, cfg.fg_show == "generated" ? S.interp : cfg.fg_show == "outreal" ? S.outreal : S.real);
           }
@@ -1017,6 +1028,11 @@ bool fg_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent real,
         done = true;
       } else {
         ++S.perf_fail;
+        static int64_t last_fail = 0;
+        if (now_us() - last_fail > 5000000) {
+          last_fail = now_us();
+          ACO_LOG("fg: generate() failed (%u failures so far this window)", S.perf_fail);
+        }
       }
     }
     bb->Release();

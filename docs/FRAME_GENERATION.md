@@ -42,6 +42,24 @@ scratchpad, RTTI names from the binary):
   `vkCmdCuLaunchKernelNVX`, resources via `VK_NVX_image_view_handle`). Those writes are what never
   land. Copies (vkCmdCopyImage) and buffer fills from the same evaluation do land.
 
+Kernel trace ([fg] trace_cu=1, hooks nvngx_dlssg.dll's own GetProcAddress, which it uses to
+resolve Vulkan from vulkan-1.dll): all CUDA modules/functions are created successfully
+(`Kernel_BlendCandidatesFused`, `Kernel_DL1Net_*`, `Kernel_EstimateIntermMvecsScatter`, …) and ~110
+kernels are launched per evaluation (`vkCmdCuLaunchKernelNVX`, parameters passed as a
+CU_LAUNCH_PARAM_BUFFER_POINTER "extras" block, the same form DXVK uses for DLSS-SR). So the kernels
+run; their image accesses go nowhere.
+
+The snippet uses **64-bit image view handles** ("Enabling texmode_raw" →
+`vkGetImageViewHandle64NVX`/`vkGetImageViewAddressNVX`). Through winevulkan these return the same
+small values as the 32-bit `vkGetImageViewHandleNVX` (e.g. 0x3a for both), which looks wrong for a
+64-bit handle. Hiding the 64-bit entry points from the snippet ([fg] hide_handle64=1) doesn't make
+it fall back: evaluation then fails with `PlatformError` ("vkGetImageViewHandle64NVX() function not
+available") — raw texture mode is mandatory. **Prime suspect: 64-bit image view handles obtained
+through winevulkan are not valid for kernels launched through it** (DXVK's working DLSS-SR path uses
+32-bit handles). (Correction: an earlier commit message claimed hide_handle64 produced generated
+frames — those screenshots were real frames presented after the failed evaluation; `tools/fg-shots`
+now refuses to run when Frame Generation isn't presenting.)
+
 Conclusion: the Windows DLSS-G snippet's *Vulkan* kernel path does not work through the driver's
 Wine NGX core + winevulkan (whereas DLSS-SR's kernels work through DXVK's own NVX interop, and
 DLSS-G is known to work under Proton through **D3D12/vkd3d-proton**, and natively on Linux).
@@ -129,10 +147,11 @@ DLSS-G's GPU work then executes.
 
 ## Next steps (recommended)
 
-1. **Confirm the kernel-launch hypothesis cheaply**: trace one evaluation with `WINEDEBUG=+vulkan`
-   (or a vkCmdCuLaunchKernelNVX wrapper in our GetProcAddress hook) and compare the launch
-   parameters with DXVK's working DLSS-SR launches. If winevulkan mangles them, a fix in our
-   wrapper (re-marshalling the launch) could make the Vulkan route work as is.
+1. **Pin down the 64-bit handle problem** (launch marshalling looks fine, see above): compare
+   `vkGetImageViewHandle64NVX` through winevulkan with a native Linux Vulkan call on the same kind
+   of image (a tiny native test program), and read winevulkan's thunk for it in the Proton source.
+   If the thunk is at fault, the fix belongs in Wine/Proton (or our hook could call the native
+   driver directly).
 2. Otherwise switch to the **D3D12 route**: a vkd3d-proton D3D12 device in-process, DLSS-G via NGX
    D3D12 (the path Proton officially supports), frames shared from DXVK with
    `D3D11_RESOURCE_MISC_SHARED_NTHANDLE` textures + a shared fence, presenting through DXVK's

@@ -65,7 +65,7 @@ Config load() {
   c.fg_show_index = static_cast<int>(read_float(L"show_index", 1.0f, L"fg"));
   c.fg_raw_output = read_float(L"raw_output", 0.0f, L"fg") != 0.0f;
   c.fg_trace_cu = read_float(L"trace_cu", 0.0f, L"fg") != 0.0f;
-  c.fg_hide_handle64 = read_float(L"hide_handle64", 1.0f, L"fg") != 0.0f;
+  c.fg_hide_handle64 = read_float(L"hide_handle64", 0.0f, L"fg") != 0.0f;
   {
     auto parse = [](const std::string& extra, std::vector<std::pair<std::string, unsigned int>>& out) {
       size_t pos = 0;

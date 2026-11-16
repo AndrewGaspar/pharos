@@ -9,6 +9,15 @@ kinds=("$@")
 here=$(cd "$(dirname "$0")/.." && pwd)
 ini="/home/ajg/Games/aco-dlss-instances/$name/prefix/drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher/games/Assassin's Creed Origins/aco_dlss.ini"
 mkdir -p "$out"
+# Only meaningful while Frame Generation is actually presenting (if evaluation fails the mod falls
+# back to normal presents and "generated" screenshots would just be real frames).
+log=/home/ajg/Games/aco-dlss-instances/$name/out/aco_dlss.log
+last=$(grep "perf: fg real" "$log" | tail -1)
+if [[ -z $last ]] || ! grep -q "perf: fg real" <(tail -40 "$log"); then
+  echo "fg-shots: Frame Generation is not presenting (no recent 'perf: fg' line in $log)" >&2
+  grep -E "fg: generate: failed|fg: Evaluate" "$log" | tail -2 >&2
+  exit 1
+fi
 for k in "${kinds[@]}"; do
   sed -i "/^\[fg\]/,\$ s/^show=.*/show=$k/" "$ini"
   sleep 3
