@@ -416,7 +416,7 @@ cmd_fixture() {  # fixture <name> <fixture>: install a fixture (game must be sto
   if [[ ! -d $(inst "$name")/savegame-orig ]]; then mkdir -p "$(inst "$name")/savegame-orig" && cp -a "$d"/. "$(inst "$name")/savegame-orig/"; fi
   for i in 1 2 3 4 5 6; do cp "$FIXTURES/$fx/$i.save" "$d/$i.save"; chmod 644 "$d/$i.save"; done
   log "$name: installed save fixture $fx"
-  echo "fixture $fx installed in $name; launch with: scripts/aco game $name ... && scripts/aco-dt $name --story"
+  echo "fixture $fx installed in $name; launch with: scripts/aco game $name ... && scripts/aco-dt $name --story [location]"
 }
 
 cmd_fixture_save() {  # fixture-save <name> <fixture> [note]: archive the instance's current slots
@@ -435,7 +435,9 @@ cmd_fixture_save() {  # fixture-save <name> <fixture> [note]: archive the instan
     [[ -n $where ]] && { echo; echo "Player when archived (tools/where: x y z yaw camera x y z yaw pitch): $where"; }
     [[ -f $FIXTURES/$fx/fixture.png ]] && { echo; echo "fixture.png: the game when archived (768x480)."; }
     echo; echo "Install: scripts/aco fixture <instance> $fx   (game stopped), then"
-    echo "scripts/aco game <instance> --mod build/mod && scripts/aco-dt <instance> --story"; } > "$FIXTURES/$fx/README.md"
+    echo "scripts/aco game <instance> --mod build/mod && scripts/aco-dt <instance> --story [location]"
+    echo; echo "Loading puts the player at the region's spawn point (e.g. Alexandria: -749.7 3574.2), not"
+    echo "the exact saved spot; pass a tools/teleport location to aco-dt to go there."; } > "$FIXTURES/$fx/README.md"
   chmod 444 "$FIXTURES/$fx"/*; chmod 555 "$FIXTURES/$fx"
   game_running "$name" && echo "note: the game was running; slot files are as of its last save" >&2
   echo "archived $FIXTURES/$fx"

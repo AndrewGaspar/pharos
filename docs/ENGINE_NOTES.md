@@ -175,8 +175,10 @@ yaw 0 = +X, 90 = +Y.
 - **Saves**: the game keeps everything in `savegames/<account>/3539/{1..6}.save` (pairs of file +
   backup): 1/2 profile/settings (2.5 KB), **3/4 the story** (~108 KB, autosaved e.g. on entering a
   named location, which a teleport does), 5/6 Discovery Tour state (~40 KB, written on exit).
-  There is no manual save on PC. `scripts/aco fixture-save` / `scripts/aco fixture` archive and
-  install all six; `scripts/aco-dt <inst> --story` continues the first profile.
+  There is no manual save on PC. Loading puts the player at the region's spawn anchor (Alexandria:
+  -749.7 3574.2, the same point Discovery Tour starts at), not the exact saved position.
+  `scripts/aco fixture-save` / `scripts/aco fixture` archive and install all six;
+  `scripts/aco-dt <inst> --story [location]` continues the first profile (and teleports).
 - **Arrival**: the player hangs at the target while collision streams in (about 1 s across the
   map), then falls the 1 m. Textures/LODs are complete within ~5 s at 768x480. NPCs keep spawning
   for longer (compare with the same place after the game's own fast travel).
