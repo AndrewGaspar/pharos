@@ -16,6 +16,8 @@
 #include "core/latency.h"
 #include "reflex/reflex.h"
 #include "core/dump.h"
+#include "core/memtool.h"
+#include "world/world.h"
 #include "core/framedump.h"
 #include "core/mapstats.h"
 #include "core/peek.h"
@@ -66,6 +68,8 @@ HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain* self, UINT sync, UINT flags
     latency_on_present_begin(self);
     reflex_on_present_begin(self);
     dump_poll();
+    memtool_poll();
+    world_on_present();
     framedump_on_present(self);
     mapstats_on_present();
     peek_on_present();
