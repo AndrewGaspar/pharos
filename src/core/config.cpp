@@ -57,6 +57,20 @@ Config load() {
   c.fg_debug_fill = read_float(L"debug_fill", 0.0f, L"fg") != 0.0f;
   c.fg_ngx_log = static_cast<int>(read_float(L"ngx_log", 0.0f, L"fg"));
   c.fg_bb_format_dxgi = read_float(L"bb_format_dxgi", 0.0f, L"fg") != 0.0f;
+  c.fg_input = read_str(L"input", "swapchain", L"fg");
+  {
+    std::string extra = read_str(L"extra", "", L"fg");
+    size_t pos = 0;
+    while (pos < extra.size()) {
+      size_t end = extra.find(',', pos);
+      if (end == std::string::npos) end = extra.size();
+      std::string item = extra.substr(pos, end - pos);
+      size_t colon = item.find(':');
+      if (colon != std::string::npos)
+        c.fg_extra.emplace_back(item.substr(0, colon), static_cast<unsigned int>(strtoul(item.c_str() + colon + 1, nullptr, 0)));
+      pos = end + 1;
+    }
+  }
   c.reflex = read_str(L"mode", "on", L"reflex");
   c.reflex_fps_limit = read_float(L"fps_limit", 0.0f, L"reflex");
   c.reflex_probe = read_float(L"probe", 0.0f, L"reflex") != 0.0f;
@@ -73,7 +87,7 @@ bool same(const Config& a, const Config& b) {
   return a.enabled == b.enabled && a.backend == b.backend && a.preset == b.preset && a.debug == b.debug &&
          a.jitter_x == b.jitter_x && a.jitter_y == b.jitter_y && a.mv_x == b.mv_x && a.mv_y == b.mv_y &&
          a.render_scale == b.render_scale && a.mip_bias == b.mip_bias && a.mip_bias_offset == b.mip_bias_offset &&
-         a.latency_log == b.latency_log && a.fg_mode == b.fg_mode && a.fg_mv_scale == b.fg_mv_scale && a.fg_pacing == b.fg_pacing && a.fg_show == b.fg_show && a.fg_debug_fill == b.fg_debug_fill && a.fg_ngx_log == b.fg_ngx_log && a.fg_bb_format_dxgi == b.fg_bb_format_dxgi && a.reflex == b.reflex && a.reflex_fps_limit == b.reflex_fps_limit &&
+         a.latency_log == b.latency_log && a.fg_mode == b.fg_mode && a.fg_mv_scale == b.fg_mv_scale && a.fg_pacing == b.fg_pacing && a.fg_show == b.fg_show && a.fg_debug_fill == b.fg_debug_fill && a.fg_ngx_log == b.fg_ngx_log && a.fg_bb_format_dxgi == b.fg_bb_format_dxgi && a.fg_extra == b.fg_extra && a.fg_input == b.fg_input && a.reflex == b.reflex && a.reflex_fps_limit == b.reflex_fps_limit &&
          a.reflex_probe == b.reflex_probe && a.reflex_markers == b.reflex_markers &&
          a.reflex_marker_set == b.reflex_marker_set && a.reflex_optimize == b.reflex_optimize &&
          a.toggle_key == b.toggle_key && a.cloth_mode == b.cloth_mode && a.cloth_scale == b.cloth_scale;

@@ -1,5 +1,7 @@
 #pragma once
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace aco {
 
@@ -39,7 +41,9 @@ struct Config {
   bool fg_pacing = true;
   bool fg_debug_fill = false;
   int fg_ngx_log = 0;
-  bool fg_bb_format_dxgi = false;  // [fg] bb_format_dxgi           // [fg] ngx_log: 1 = NGX log lines into aco_dlss.log, 2 = verbose   // [fg] debug_fill: pre-fill the output with magenta        // [fg] pacing: present the real frame half a frame after the generated one
+  bool fg_bb_format_dxgi = false;  // [fg] bb_format_dxgi
+  std::string fg_input = "swapchain";  // [fg] input: swapchain | copy
+  std::vector<std::pair<std::string, unsigned int>> fg_extra;  // [fg] extra=DLSSG.Name:value,...           // [fg] ngx_log: 1 = NGX log lines into aco_dlss.log, 2 = verbose   // [fg] debug_fill: pre-fill the output with magenta        // [fg] pacing: present the real frame half a frame after the generated one
   std::string toggle_key = "F10";  // [upscaler] toggle_key: F1..F24 or none (DLSS <-> game TAA)
   std::string reflex = "on";     // [reflex] mode
   float reflex_fps_limit = 0.0f;  // [reflex] fps_limit

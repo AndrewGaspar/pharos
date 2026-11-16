@@ -67,6 +67,11 @@ struct Vk {
   PFN_vkBindBufferMemory BindBufferMemory = nullptr;
   PFN_vkMapMemory MapMemory = nullptr;
   PFN_vkGetPhysicalDeviceMemoryProperties GetPhysicalDeviceMemoryProperties = nullptr;
+  PFN_vkCreateQueryPool CreateQueryPool = nullptr;
+  PFN_vkCmdResetQueryPool CmdResetQueryPool = nullptr;
+  PFN_vkCmdWriteTimestamp CmdWriteTimestamp = nullptr;
+  PFN_vkGetQueryPoolResults GetQueryPoolResults = nullptr;
+  PFN_vkGetPhysicalDeviceProperties GetPhysicalDeviceProperties = nullptr;
 } vk;
 
 // ---- NGX Vulkan API (driver _nvngx.dll) ----
@@ -106,6 +111,12 @@ struct State {
   // to generate a frame), host-visible so we can read them after the slot's fence.
   VkBuffer disable_buf[kRing] = {};
   volatile uint8_t* disable_map[kRing] = {};
+  // GPU time of each submission (timestamps at the start/end of our command buffer).
+  VkQueryPool timestamps = VK_NULL_HANDLE;
+  bool ts_written[kRing] = {};
+  double ts_period_ns = 1.0;
+  double perf_gpu_ms = 0;
+  uint32_t perf_gpu_n = 0;
 
   PFN_GetParams alloc_params = nullptr;
   PFN_CreateFeature1 create = nullptr;
@@ -119,6 +130,7 @@ struct State {
   // Display-size D3D11 textures owned by us (DXVK images): the real frame, the generated frame.
   ID3D11Texture2D* real = nullptr;
   ID3D11Texture2D* interp = nullptr;
+  ID3D11Texture2D* outreal = nullptr;  // debug: DLSS-G's OutputReal ([fg] show=outreal)
   ID3D11UnorderedAccessView* interp_uav = nullptr;  // debug: pre-fill with magenta
   uint32_t tex_w = 0, tex_h = 0;
   DXGI_FORMAT tex_format = DXGI_FORMAT_UNKNOWN;
@@ -136,7 +148,7 @@ struct State {
 
   // perf
   int64_t perf_last = 0;
-  uint32_t perf_real = 0, perf_generated = 0, perf_fail = 0, perf_disabled = 0;
+  uint32_t perf_real = 0, perf_generated = 0, perf_fail = 0, perf_disabled = 0, perf_resets = 0;
   double perf_eval_cpu_ms = 0;
 } S;
 
@@ -163,7 +175,11 @@ bool load_vulkan() {
          dev_fn(vk.CmdPipelineBarrier, "vkCmdPipelineBarrier") && dev_fn(vk.CreateBuffer, "vkCreateBuffer") &&
          dev_fn(vk.GetBufferMemoryRequirements, "vkGetBufferMemoryRequirements") &&
          dev_fn(vk.AllocateMemory, "vkAllocateMemory") && dev_fn(vk.BindBufferMemory, "vkBindBufferMemory") &&
-         dev_fn(vk.MapMemory, "vkMapMemory") &&
+         dev_fn(vk.MapMemory, "vkMapMemory") && dev_fn(vk.CreateQueryPool, "vkCreateQueryPool") &&
+         dev_fn(vk.CmdResetQueryPool, "vkCmdResetQueryPool") && dev_fn(vk.CmdWriteTimestamp, "vkCmdWriteTimestamp") &&
+         dev_fn(vk.GetQueryPoolResults, "vkGetQueryPoolResults") &&
+         (vk.GetPhysicalDeviceProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+              vk.gipa(S.instance, "vkGetPhysicalDeviceProperties"))) != nullptr &&
          (vk.GetPhysicalDeviceMemoryProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(
               vk.gipa(S.instance, "vkGetPhysicalDeviceMemoryProperties"))) != nullptr;
 }
@@ -189,13 +205,30 @@ bool submit(F&& record, bool wait) {
   for (auto* r : S.held[i]) r->Release();
   S.held[i].swap(S.pending_refs);
   S.pending_refs.clear();
+  if (S.timestamps && S.ts_written[i]) {
+    uint64_t ts[2] = {};
+    if (vk.GetQueryPoolResults(S.device, S.timestamps, i * 2, 2, sizeof(ts), ts, sizeof(uint64_t),
+                               VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+      S.perf_gpu_ms += double(ts[1] - ts[0]) * S.ts_period_ns / 1e6;
+      ++S.perf_gpu_n;
+    }
+    S.ts_written[i] = false;
+  }
   vk.ResetCommandBuffer(S.cmd[i], 0);
   VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
   bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
   vk.BeginCommandBuffer(S.cmd[i], &bi);
+  if (S.timestamps) {
+    vk.CmdResetQueryPool(S.cmd[i], S.timestamps, i * 2, 2);
+    vk.CmdWriteTimestamp(S.cmd[i], VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, S.timestamps, i * 2);
+  }
   full_barrier(S.cmd[i]);
   bool ok = record(S.cmd[i]);
   full_barrier(S.cmd[i]);
+  if (S.timestamps) {
+    vk.CmdWriteTimestamp(S.cmd[i], VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, S.timestamps, i * 2 + 1);
+    S.ts_written[i] = true;
+  }
   vk.EndCommandBuffer(S.cmd[i]);
   S.interop->FlushRenderingCommands();
   S.interop->LockSubmissionQueue();
@@ -282,6 +315,14 @@ bool init(IDXGISwapChain* sc) {
   VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
   fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
   for (auto& f : S.fence) vk.CreateFence(S.device, &fci, nullptr, &f);
+
+  VkPhysicalDeviceProperties props{};
+  vk.GetPhysicalDeviceProperties(S.pd, &props);
+  S.ts_period_ns = props.limits.timestampPeriod;
+  VkQueryPoolCreateInfo qci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+  qci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+  qci.queryCount = kRing * 2;
+  vk.CreateQueryPool(S.device, &qci, nullptr, &S.timestamps);
 
   VkPhysicalDeviceMemoryProperties mp{};
   vk.GetPhysicalDeviceMemoryProperties(S.pd, &mp);
@@ -401,6 +442,7 @@ bool ensure_textures(const D3D11_TEXTURE2D_DESC& bb) {
   safe_release(S.real);
   safe_release(S.interp_uav);
   safe_release(S.interp);
+  safe_release(S.outreal);
   D3D11_TEXTURE2D_DESC d{};
   d.Width = bb.Width;
   d.Height = bb.Height;
@@ -416,7 +458,8 @@ bool ensure_textures(const D3D11_TEXTURE2D_DESC& bb) {
   D3D11_SUBRESOURCE_DATA init{magenta.data(), bb.Width * 4, 0};
   bool fill = config().fg_debug_fill && (bb.Format == DXGI_FORMAT_R8G8B8A8_UNORM || bb.Format == DXGI_FORMAT_B8G8R8A8_UNORM);
   if (FAILED(S.dev->CreateTexture2D(&d, nullptr, &S.real)) ||
-      FAILED(S.dev->CreateTexture2D(&d, fill ? &init : nullptr, &S.interp))) {
+      FAILED(S.dev->CreateTexture2D(&d, fill ? &init : nullptr, &S.interp)) ||
+      FAILED(S.dev->CreateTexture2D(&d, fill ? &init : nullptr, &S.outreal))) {
     ACO_LOG("fg: failed to create %ux%u format %d textures", d.Width, d.Height, d.Format);
     safe_release(S.real);
     return false;
@@ -442,6 +485,9 @@ bool ensure_feature(uint32_t w, uint32_t h, uint32_t rw, uint32_t rh, VkFormat f
   p.set(NVSDK_NGX_Parameter_VisibilityNodeMask, 1u);
   p.set(NVSDK_NGX_Parameter_Width, w);
   p.set(NVSDK_NGX_Parameter_Height, h);
+  p.set(NVSDK_NGX_DLSSG_Parameter_Width, w);
+  p.set(NVSDK_NGX_DLSSG_Parameter_Height, h);
+  p.set(NVSDK_NGX_DLSSG_Parameter_MultiFrameCount, 1u);  // read at create time
   // Which numbering NGX expects for the backbuffer format on Vulkan is undocumented; [fg]
   // bb_format_dxgi=1 passes the DXGI value of the backbuffer instead of the VkFormat.
   unsigned int fmt_param = config().fg_bb_format_dxgi ? static_cast<unsigned int>(S.tex_format) : static_cast<unsigned int>(fmt);
@@ -472,10 +518,12 @@ bool ensure_feature(uint32_t w, uint32_t h, uint32_t rw, uint32_t rh, VkFormat f
 const float kIdentity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
 
 // Generates the frame between the previous real frame and S.real (current) into S.interp.
-bool generate(const FgInputs& in) {
-  NVSDK_NGX_Resource_VK bb{}, depth{}, mv{}, out{};
+bool generate(const FgInputs& in, ID3D11Texture2D* swap_bb) {
+  NVSDK_NGX_Resource_VK bb{}, depth{}, mv{}, out{}, outreal{};
   VkTex bb_t;
-  if (!ngx_res(S.real, false, &bb, &bb_t) || !ngx_res(in.depth, false, &depth) || !ngx_res(in.mv, false, &mv) ||
+  // [fg] input=swapchain passes the game's (rotating) swapchain image itself; =copy our copy of it.
+  ID3D11Texture2D* input = config().fg_input == "copy" ? S.real : swap_bb;
+  if (!ngx_res(input, false, &bb, &bb_t) || !ngx_res(in.depth, false, &depth) || !ngx_res(in.mv, false, &mv) ||
       !ngx_res(S.interp, true, &out))
     return false;
   if (!ensure_feature(S.tex_w, S.tex_h, in.render_w, in.render_h, bb_t.info.format)) return false;
@@ -486,6 +534,11 @@ bool generate(const FgInputs& in) {
   p.set(NVSDK_NGX_DLSSG_Parameter_Depth, static_cast<void*>(&depth));
   p.set(NVSDK_NGX_DLSSG_Parameter_MVecs, static_cast<void*>(&mv));
   p.set(NVSDK_NGX_DLSSG_Parameter_OutputInterpolated, static_cast<void*>(&out));
+  if (config().fg_show == "outreal" && ngx_res(S.outreal, true, &outreal)) {
+    p.set(NVSDK_NGX_DLSSG_Parameter_OutputReal, static_cast<void*>(&outreal));
+    p.set(NVSDK_NGX_DLSSG_Parameter_OutputRealSubrectWidth, S.tex_w);
+    p.set(NVSDK_NGX_DLSSG_Parameter_OutputRealSubrectHeight, S.tex_h);
+  }
   p.set(NVSDK_NGX_DLSSG_Parameter_MultiFrameCount, 1u);
   p.set(NVSDK_NGX_DLSSG_Parameter_MultiFrameIndex, 1u);
   for (const char* m : {NVSDK_NGX_DLSSG_Parameter_CameraViewToClip, NVSDK_NGX_DLSSG_Parameter_ClipToCameraView,
@@ -498,6 +551,27 @@ bool generate(const FgInputs& in) {
   p.set(NVSDK_NGX_DLSSG_Parameter_MvecScaleY, cfg.fg_mv_scale);
   p.set(NVSDK_NGX_DLSSG_Parameter_JitterOffsetX, in.jitter_x);
   p.set(NVSDK_NGX_DLSSG_Parameter_JitterOffsetY, in.jitter_y);
+  // A valid (if synthetic) camera frame: an all-zero basis is "not a valid frame" for DLSS-G.
+  p.set(NVSDK_NGX_DLSSG_Parameter_CameraPosX, 0.0f);
+  p.set(NVSDK_NGX_DLSSG_Parameter_CameraPosY, 0.0f);
+  p.set(NVSDK_NGX_DLSSG_Parameter_CameraPosZ, 0.0f);
+  p.set(NVSDK_NGX_DLSSG_Parameter_CameraUpX, 0.0f);
+  p.set(NVSDK_NGX_DLSSG_Parameter_CameraUpY, 1.0f);
+  p.set(NVSDK_NGX_DLSSG_Parameter_CameraUpZ, 0.0f);
+  p.set(NVSDK_NGX_DLSSG_Parameter_CameraRightX, 1.0f);
+  p.set(NVSDK_NGX_DLSSG_Parameter_CameraRightY, 0.0f);
+  p.set(NVSDK_NGX_DLSSG_Parameter_CameraRightZ, 0.0f);
+  p.set(NVSDK_NGX_DLSSG_Parameter_CameraFwdX, 0.0f);
+  p.set(NVSDK_NGX_DLSSG_Parameter_CameraFwdY, 0.0f);
+  p.set(NVSDK_NGX_DLSSG_Parameter_CameraFwdZ, 1.0f);
+  p.set(NVSDK_NGX_DLSSG_Parameter_CameraPinholeOffsetX, 0.0f);
+  p.set(NVSDK_NGX_DLSSG_Parameter_CameraPinholeOffsetY, 0.0f);
+  // The value that marks an invalid motion vector: NOT 0 (that would mark every static pixel
+  // invalid); Streamline uses FLT_MIN.
+  p.set(NVSDK_NGX_DLSSG_Parameter_MvecInvalidValue, 1.17549435e-38f);
+  p.set(NVSDK_NGX_DLSSG_Parameter_LinearizedDepth_Scale, 1.0f);
+  p.set(NVSDK_NGX_DLSSG_Parameter_LinearizedDepth_NearFarPartition, 600.0f);
+  p.set(NVSDK_NGX_DLSSG_Parameter_AutomodeOverrideReset, 0u);
   p.set(NVSDK_NGX_DLSSG_Parameter_CameraNear, 0.1f);
   p.set(NVSDK_NGX_DLSSG_Parameter_CameraFar, 100000.0f);
   p.set(NVSDK_NGX_DLSSG_Parameter_CameraFOV, 1.0f);
@@ -506,6 +580,7 @@ bool generate(const FgInputs& in) {
   p.set(NVSDK_NGX_DLSSG_Parameter_DepthInverted, 1u);
   p.set(NVSDK_NGX_DLSSG_Parameter_CameraMotionIncluded, 1u);
   p.set(NVSDK_NGX_DLSSG_Parameter_Reset, S.reset ? 1u : 0u);
+  if (S.reset) ++S.perf_resets;
   p.set(NVSDK_NGX_DLSSG_Parameter_NotRenderingGameFrames, 0u);
   p.set(NVSDK_NGX_DLSSG_Parameter_OrthoProjection, 0u);
   p.set(NVSDK_NGX_DLSSG_Parameter_MvecDilated, 0u);
@@ -519,6 +594,8 @@ bool generate(const FgInputs& in) {
   p.set(NVSDK_NGX_DLSSG_Parameter_InputBackbufferSubrectHeight, S.tex_h);
   p.set(NVSDK_NGX_DLSSG_Parameter_OutputInterpolatedSubrectWidth, S.tex_w);
   p.set(NVSDK_NGX_DLSSG_Parameter_OutputInterpolatedSubrectHeight, S.tex_h);
+  // Experiments with undocumented knobs (strings in nvngx_dlssg.dll), [fg] extra=name:value,...
+  for (const auto& kv : cfg.fg_extra) p.set(kv.first.c_str(), kv.second);
 
   // The slot this evaluation will use: read what DLSS-G reported there last time, then reset it.
   int slot = S.ring;
@@ -541,6 +618,17 @@ bool generate(const FgInputs& in) {
   }, false);
   S.perf_eval_cpu_ms += (now_us() - t0) / 1000.0;
   static int logged = 0;
+  if (logged < 3) {
+    // What NGX leaves in the parameter block after an evaluation.
+    for (const char* n : {"DLSSG.MustCallEval", "DLSSG.MultiFrameCount", "DLSSG.MultiFrameCountMax",
+                          "DLSSG.DynamicMaxFrameCount", "DLSSG.NvAppOvrAppliedVal.MultiFrameCount",
+                          "DLSSG.NvAppOvrAppliedVal.StreamlineMode", "DLSSG.StreamlineMode",
+                          "DLSSG.ReflexWarp.Available", "DLSSG.Dynamic.ReflexDriven", "DLSSG.EvalFlags"}) {
+      unsigned int v = 0xdeadbeef;
+      bool ok = p.get(n, &v);
+      ACO_LOG("fg:   after eval %s = %s%u", n, ok ? "" : "(unset) ", v);
+    }
+  }
   if (logged < 3 || (NVSDK_NGX_FAILED(r) && logged < 20)) {
     ++logged;
     ACO_LOG("fg: Evaluate -> %s (reset=%d, render %ux%u, jitter %.3f,%.3f)", ngx::result_str(r), S.reset,
@@ -555,11 +643,13 @@ void perf_report() {
   if (!S.perf_last) S.perf_last = now;
   double secs = (now - S.perf_last) / 1e6;
   if (secs < 2.0) return;
-  ACO_LOG("perf: fg real %.1f fps + generated %.1f fps = %.1f presents/s (fail %u, dlssg-disabled %u), eval CPU %.2f ms/frame",
-          S.perf_real / secs, S.perf_generated / secs, (S.perf_real + S.perf_generated) / secs, S.perf_fail, S.perf_disabled,
-          S.perf_real ? S.perf_eval_cpu_ms / S.perf_real : 0.0);
+  ACO_LOG("perf: fg real %.1f fps + generated %.1f fps = %.1f presents/s (fail %u, dlssg-disabled %u, resets %u), eval CPU %.2f ms GPU %.3f ms/frame",
+          S.perf_real / secs, S.perf_generated / secs, (S.perf_real + S.perf_generated) / secs, S.perf_fail, S.perf_disabled, S.perf_resets,
+          S.perf_real ? S.perf_eval_cpu_ms / S.perf_real : 0.0, S.perf_gpu_n ? S.perf_gpu_ms / S.perf_gpu_n : 0.0);
+  S.perf_gpu_ms = 0;
+  S.perf_gpu_n = 0;
   S.perf_last = now;
-  S.perf_real = S.perf_generated = S.perf_fail = S.perf_disabled = 0;
+  S.perf_real = S.perf_generated = S.perf_fail = S.perf_disabled = S.perf_resets = 0;
   S.perf_eval_cpu_ms = 0;
 }
 
@@ -616,9 +706,9 @@ bool fg_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent real,
     bb->GetDesc(&bd);
     if (ensure_textures(bd)) {
       S.imm->CopyResource(S.real, bb);
-      if (generate(in)) {
+      if (generate(in, bb)) {
         // Generated frame first (it lies between the previous real frame and this one) ...
-        S.imm->CopyResource(bb, cfg.fg_show == "real" ? S.real : S.interp);
+        S.imm->CopyResource(bb, cfg.fg_show == "real" ? S.real : cfg.fg_show == "outreal" ? S.outreal : S.interp);
         *hr = real(sc, sync, flags);
         int64_t t_gen = now_us();
         ++S.perf_generated;
@@ -627,7 +717,7 @@ bool fg_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent real,
           wait_until(t_gen + static_cast<int64_t>(S.frame_interval_us / 2));
         ID3D11Texture2D* bb2 = nullptr;
         if (SUCCEEDED(sc->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&bb2)))) {
-          S.imm->CopyResource(bb2, cfg.fg_show == "generated" ? S.interp : S.real);
+          S.imm->CopyResource(bb2, cfg.fg_show == "generated" ? S.interp : cfg.fg_show == "outreal" ? S.outreal : S.real);
           bb2->Release();
         }
         *hr = real(sc, sync, flags);
