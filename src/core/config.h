@@ -17,6 +17,7 @@ namespace aco {
 // render_scale=0        ; >0: written to ACO.ini PixelDensity at startup (needs a game restart)
 // mip_bias=auto         ; auto = log2(render/display) + mip_bias_offset, or a fixed number
 // mip_bias_offset=0
+// latency_log=0        ; 1 = write latency_taa.csv / latency_present.csv (see core/latency.h)
 struct Config {
   bool enabled = true;
   std::string backend = "dlss";
@@ -27,6 +28,7 @@ struct Config {
   float render_scale = 0.0f;
   std::string mip_bias = "auto";
   float mip_bias_offset = 0.0f;
+  bool latency_log = false;
 };
 
 const Config& config();

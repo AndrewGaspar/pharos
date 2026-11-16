@@ -2,9 +2,20 @@
 # aco — headless AC Origins instances in podman.
 #
 # Model: an instance is a reflink clone of a "gold" prefix. `aco up` boots a long-lived container
-# running Ubisoft Connect (logged in) on a private Xvfb; `aco game` (re)starts only the game inside
-# it, optionally with mod files applied. Connect stays up between game restarts, so the Ubisoft
-# login is only exercised once per container boot.
+# with a headless gamescope display; `aco game` (re)starts the game inside it, optionally with mod
+# files applied.
+#
+# Bridge mode (default): containers never run Ubisoft Connect. The host daemon `ubid` (from
+# ~/code/ubisoft-linux) holds the account's single login; per game launch we write a launch
+# context with `ubi context` and run `ubi-bridge.exe` in the prefix, which answers the game's
+# Ubisoft SDK and fetches Denuvo tokens/tickets from ubid's broker (127.0.0.1:47810, hence
+# --network host). One login for everything, so nothing gets kicked. The bridge never uploads
+# saves. With host networking, the container's X server shares the host's abstract socket
+# namespace, so displays :0-:9 are reserved inside the container (lock files) to keep the game
+# from ever claiming :0 and capturing the user's desktop X clients.
+#
+# Legacy Connect mode (`aco up --connect`): Connect runs in the container and logs in itself;
+# notes below.
 #
 # Ubisoft login tokens ("keep me logged in") are SINGLE USE with reuse detection: every login
 # rotates the token, and presenting an already-used token revokes the whole token family. The
@@ -16,9 +27,10 @@
 #   aco gold                 snapshot the user's Connect prefix as gold (credentials stripped)
 #   aco login                serve gold's Connect over VNC (gvncviewer localhost:99) for manual use
 #   aco create <name>        reflink-clone gold (free on btrfs)
-#   aco up <name> [--res WxH] [--vnc]   boot container + Connect, logging in with the stored
-#                                       password if needed (see CREDS_FILE below)
-#   aco game <name> [--mod <dir>]       (re)start the game inside a running container
+#   aco up <name> [--res WxH]           boot the container (bridge mode)
+#   aco up <name> --connect [--vnc]     legacy: boot + Connect, password login (CREDS_FILE below)
+#   aco game <name> [--mod <dir>] [--profile <p>]   (re)start the game inside a running container
+#                            (graphics settings pinned from tools/profiles/<p>.ini, default ultra-high)
 #   aco kill-game <name>
 #   aco shot <name> [file]   full-res screenshot of the instance display
 #   aco keys <name> <xdotool args...>   e.g. aco keys t1 keydown Return sleep 0.15 keyup Return
@@ -31,12 +43,19 @@ SRC_PREFIX=${ACO_SRC_PREFIX:-/home/ajg/Games/ubisoft-connect}
 INST_ROOT=${ACO_INST_ROOT:-/home/ajg/Games/aco-dlss-instances}
 PROTON=${ACO_PROTON:-$HOME/.local/share/Steam/compatibilitytools.d/GE-Proton11-12-x86_64}
 IMAGE=${ACO_IMAGE:-localhost/aco-headless:latest}
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 GOLD=$INST_ROOT/_gold
 GAME_REL="drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher/games/Assassin's Creed Origins"
 UPC_REL="drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher"
 CONNECT_APPDATA="drive_c/users/steamuser/AppData/Local/Ubisoft Game Launcher"
 CRED=ConnectSecureStorage.dat
 ACO_APPID=3539
+UBI_ROOT=${ACO_UBI_ROOT:-$HOME/code/ubisoft-linux}
+UBI=$UBI_ROOT/target/release/ubi
+BRIDGE_EXE=$UBI_ROOT/target/x86_64-pc-windows-gnu/release/ubi-bridge.exe
+CONNECT_EXES=(upc.exe UbisoftConnect.exe UbisoftGameLauncher.exe UbisoftGameLauncher64.exe UplayService.exe
+  UplayWebCore.exe UbisoftExtension.exe)
+GAME_WIN="C:\\Program Files (x86)\\Ubisoft\\Ubisoft Game Launcher\\games\\Assassin's Creed Origins\\ACOrigins.exe"
 CONNECT_WIN='C:\Program Files (x86)\Ubisoft\Ubisoft Game Launcher\UbisoftConnect.exe'
 
 die() { echo "aco: $*" >&2; exit 1; }
@@ -92,15 +111,18 @@ cmd_create() {
 # Either way the X display is :0 inside the container.
 start_container() {
   local name=$1; shift
-  local dst res=2560x1600 vnc=0 xvfb=0; dst=$(inst "$name")
+  local dst res=2560x1600 vnc=0 xvfb=0 mode=bridge; dst=$(inst "$name")
   while (($#)); do
     case $1 in
       --res) res=$2; shift 2;;
       --vnc) vnc=1; xvfb=1; shift;;
       --xvfb) xvfb=1; shift;;
+      --connect) mode=connect; shift;;
       *) die "unknown option $1";;
     esac
   done
+  [[ $mode == bridge && $xvfb == 1 ]] && die "--xvfb/--vnc need --connect (bridge mode uses host networking)"
+  local netopt=(); [[ $mode == bridge ]] && netopt=(--network host)
   podman rm -f "$(ctr "$name")" >/dev/null 2>&1 || true
   # CDI only injects 64-bit driver libs; 32-bit Connect helpers (upc.exe) need lib32 Vulkan.
   local lib32=() f
@@ -112,7 +134,7 @@ start_container() {
     --hostname "$(cat /etc/hostname)" \
     --device nvidia.com/gpu=all --userns=keep-id --user 1000:1000 --shm-size=2g \
     --security-opt label=disable \
-    "${vncopt[@]}" \
+    "${vncopt[@]}" "${netopt[@]}" \
     -v "$dst/prefix:$SRC_PREFIX" \
     -v "$PROTON:$PROTON:ro" \
     -v /usr/lib/nvidia/wine:/usr/lib/nvidia/wine:ro \
@@ -120,7 +142,7 @@ start_container() {
     "${lib32[@]}" \
     -v /etc/machine-id:/etc/machine-id:ro \
     -e HOME=/home/steamuser -e USER=steamuser \
-    -e DISPLAY=:0 -e XDG_RUNTIME_DIR=/tmp/xdg -e ACO_XVFB="$xvfb" \
+    -e XDG_RUNTIME_DIR=/tmp/xdg -e ACO_XVFB="$xvfb" -e ACO_MODE="$mode" \
     -e WINEPREFIX="$SRC_PREFIX" \
     -e STEAM_COMPAT_DATA_PATH="$SRC_PREFIX" \
     -e STEAM_COMPAT_CLIENT_INSTALL_PATH=/tmp/steam \
@@ -133,7 +155,16 @@ start_container() {
     -e ACO_RES="$res" -e ACO_VNC="$vnc" -e ACO_PROTON="$PROTON" -e ACO_CONNECT="$CONNECT_WIN" \
     "$IMAGE" bash -c '
       mkdir -p /tmp/xdg /tmp/steam; chmod 700 /tmp/xdg
-      echo "boot $(date -Is) xvfb=$ACO_XVFB" >> /out/run.log
+      echo "boot $(date -Is) mode=$ACO_MODE xvfb=$ACO_XVFB" >> /out/run.log
+      if [ "$ACO_MODE" = bridge ]; then
+        # Host networking shares the abstract X socket namespace with the host: never take :0-:9.
+        # Xwayland skips displays whose lock file names a live process (this shell).
+        for d in 0 1 2 3 4 5 6 7 8 9; do printf "%10d\n" $$ > /tmp/.X$d-lock; done
+        W=${ACO_RES%x*}; H=${ACO_RES#*x}
+        exec gamescope --backend headless -W $W -H $H -w $W -h $H -r 165 -- \
+          bash -c "echo \$DISPLAY > /tmp/display; exec sleep infinity" >/out/gamescope.log 2>&1
+      fi
+      export DISPLAY=:0; echo :0 > /tmp/display
       run_connect() { exec python3 "$ACO_PROTON/proton" waitforexitandrun "$ACO_CONNECT" >>/out/run.log 2>&1; }
       if [ "$ACO_XVFB" = 1 ]; then
         Xvfb :0 -screen 0 ${ACO_RES}x24 -nolisten tcp >/out/xvfb.log 2>&1 &
@@ -143,6 +174,7 @@ start_container() {
       else
         W=${ACO_RES%x*}; H=${ACO_RES#*x}
         export -f run_connect
+        unset DISPLAY
         exec gamescope --backend headless -W $W -H $H -w $W -h $H -r 165 -- bash -c run_connect >/out/gamescope.log 2>&1
       fi' >/dev/null
 }
@@ -158,10 +190,20 @@ logged_in_since() {  # logged_in_since <name> <line-offset>
   tail -n +"$(($2 + 1))" "$(launcher_log "$1")" 2>/dev/null | grep -q "AccountStartupUser.*User:"
 }
 
+# podman exec with the instance's X display (written by the container at boot).
+xexec() {
+  local name=$1; shift
+  podman exec "$(ctr "$name")" bash -c 'export DISPLAY=$(cat /tmp/display 2>/dev/null); [ -n "$DISPLAY" ] || { echo "no display yet" >&2; exit 1; }; exec "$@"' _ "$@"
+}
+xexec_i() {
+  local name=$1; shift
+  podman exec -i "$(ctr "$name")" bash -c 'export DISPLAY=$(cat /tmp/display 2>/dev/null); [ -n "$DISPLAY" ] || exit 1; exec "$@"' _ "$@"
+}
+
 xclick() { cmd_keys "$1" mousemove "$2" "$3" sleep 0.2 mousedown 1 sleep 0.12 mouseup 1 sleep 0.3; }
 
 type_secret() {  # type_secret <name> <line-number-in-creds>
-  sed -n "${2}p" "$CREDS_FILE" | tr -d '\n' | podman exec -i "$(ctr "$1")" xdotool type --delay 40 --file -
+  sed -n "${2}p" "$CREDS_FILE" | tr -d '\n' | xexec_i "$1" xdotool type --delay 40 --file -
 }
 
 password_login() {
@@ -182,11 +224,28 @@ password_login() {
   xclick "$name" 1092 842; sleep 0.5; xclick "$name" 1280 685  # ticking adds a "Device name" field and re-centers the form
   for i in $(seq 600); do [[ -s $TWOFA_FILE ]] && break; sleep 1; done
   [[ -s $TWOFA_FILE ]] || { log "$name: no 2FA code provided"; return 1; }
-  head -1 "$TWOFA_FILE" | tr -dc '0-9' | podman exec -i "$(ctr "$name")" xdotool type --delay 80 --file -
+  head -1 "$TWOFA_FILE" | tr -dc '0-9' | xexec_i "$name" xdotool type --delay 80 --file -
   rm -f "$TWOFA_FILE"
   cmd_keys "$name" keydown Return sleep 0.15 keyup Return
   for i in $(seq 30); do logged_in_since "$name" "$n0" && return 0; sleep 1; done
   cmd_shot "$name" "$(inst "$name")/out/login-failed.png" >/dev/null
+  return 1
+}
+
+# Finish a login left waiting at the 2FA prompt (e.g. after `aco up` gave up): waits for the code
+# in TWOFA_FILE and types it into the open form.
+cmd_2fa() {
+  local name=$1 i n0; n0=$(wc -l < "$(launcher_log "$name")" 2>/dev/null || echo 0)
+  log "$name: waiting for 2FA code in $TWOFA_FILE"
+  for i in $(seq 1800); do [[ -s $TWOFA_FILE ]] && break; sleep 1; done
+  [[ -s $TWOFA_FILE ]] || { log "$name: no 2FA code provided"; return 1; }
+  xclick "$name" 1280 685; cmd_keys "$name" key ctrl+a BackSpace
+  head -1 "$TWOFA_FILE" | tr -dc '0-9' | xexec_i "$name" xdotool type --delay 80 --file -
+  rm -f "$TWOFA_FILE"
+  cmd_keys "$name" keydown Return sleep 0.15 keyup Return
+  for i in $(seq 30); do logged_in_since "$name" "$n0" && { log "$name: logged in (2FA)"; return 0; }; sleep 1; done
+  cmd_shot "$name" "$(inst "$name")/out/login-failed.png" >/dev/null
+  log "$name: 2FA login FAILED; see $(inst "$name")/out/login-failed.png"
   return 1
 }
 
@@ -198,9 +257,16 @@ cmd_up() {
   [[ -d $dst ]] || die "no instance $name (aco create $name)"
   podman container exists "$(ctr "$name")" && die "$name already up"
   local n0; n0=$(wc -l < "$(launcher_log "$name")" 2>/dev/null || echo 0)
+  local mode=bridge a; for a in "$@"; do [[ $a == --connect ]] && mode=connect; done
+  echo "$mode" > "$dst/mode"
   start_container "$name" "$@"
-  log "$name: booting"
+  log "$name: booting ($mode mode)"
   local i
+  if [[ $mode == bridge ]]; then
+    for i in $(seq 50); do podman exec "$(ctr "$name")" test -s /tmp/display 2>/dev/null && break; sleep 0.2; done
+    log "$name: up, display $(podman exec "$(ctr "$name")" cat /tmp/display 2>/dev/null)"
+    return 0
+  fi
   for i in $(seq 60); do
     logged_in_since "$name" "$n0" && { log "$name: logged in (stored token)"; return 0; }
     # The CEF login page takes a while to render; give it time before typing.
@@ -216,12 +282,50 @@ cmd_kill_game() {
   podman exec "$(ctr "$1")" bash -c 'pkill -x ACOrigins.exe || true; for i in $(seq 40); do pgrep -x ACOrigins.exe | xargs -r ps -o stat= -p | grep -qv Z || exit 0; sleep 0.5; done; pkill -9 -x ACOrigins.exe; true'
 }
 
+# Bridge mode launch (see header): fresh launch context from ubid, restart ubi-bridge.exe, then
+# start the game with the arguments Connect would pass it.
+bridge_launch() {
+  local name=$1 dst f; dst=$(inst "$name")
+  local upc="$dst/prefix/$UPC_REL" game="$dst/prefix/$GAME_REL"
+  [[ -x $UBI && -f $BRIDGE_EXE ]] || die "build ubisoft-linux first ($UBI, $BRIDGE_EXE)"
+  "$UBI" status >/dev/null || die "ubid not available (ubi status)"
+  # Connect must never run in a bridge-mode prefix (it would log in and kick the shared session).
+  for f in "${CONNECT_EXES[@]}"; do [[ -f $upc/$f ]] && mv "$upc/$f" "$upc/$f.off"; done
+  mkdir -p "$dst/prefix/drive_c/ubi"; cp "$BRIDGE_EXE" "$dst/prefix/drive_c/ubi/ubi-bridge.exe"
+  local ctxf="$dst/out/context.json" acct
+  ( umask 077
+    if [[ ! -s $dst/account_id ]]; then
+      "$UBI" --source aco-dlss context origins -o "$ctxf" --install-dir "$game" >/dev/null
+      python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["account_id"])' "$ctxf" > "$dst/account_id"
+    fi
+    acct=$(cat "$dst/account_id")
+    # Retry: ubid's Ubisoft "demux" connection occasionally drops a request.
+    rm -f "$ctxf"
+    for i in 1 2 3; do "$UBI" --source aco-dlss context origins -o "$ctxf" --install-dir "$game" \
+      --savegame-path "C:\\Program Files (x86)\\Ubisoft\\Ubisoft Game Launcher\\savegames\\$acct\\$ACO_APPID" >/dev/null && break; sleep 2; done )
+  [[ -s $ctxf ]] || die "ubi context failed"
+  podman exec "$(ctr "$name")" bash -c 'pkill -x ubi-bridge.exe; for i in $(seq 20); do pgrep -x ubi-bridge.exe >/dev/null || exit 0; sleep 0.25; done; pkill -9 -x ubi-bridge.exe; true'
+  rm -f "$dst/out/bridge-ipc.log"
+  podman exec -d -e UBI_BRIDGE_LOG='Z:\out\bridge-ipc.log' -e ACO_PROTON="$PROTON" "$(ctr "$name")" bash -c \
+    'export DISPLAY=$(cat /tmp/display); exec python3 "$ACO_PROTON/proton" run "C:\\ubi\\ubi-bridge.exe" "Z:\\out\\context.json" >/out/bridge.log 2>&1'
+  local i; for i in $(seq 150); do grep -q "uplay_ipc_pipe" "$dst/out/bridge-ipc.log" 2>/dev/null && break; sleep 0.2; done
+  grep -q "uplay_ipc_pipe" "$dst/out/bridge-ipc.log" 2>/dev/null || die "ubi-bridge did not start (see $dst/out/bridge*.log)"
+  # `run`, not `waitforexitandrun` (that would wait for the bridge's wineserver).
+  podman exec -d -e ACO_DLSS_OUT='Z:\out' -e ACO_PROTON="$PROTON" -e ACO_EXE="$GAME_WIN" -e ACO_APPID="$ACO_APPID" "$(ctr "$name")" bash -c '
+    export DISPLAY=$(cat /tmp/display)
+    b64() { printf %s "$1" | base64 -w0; }
+    export UPLAY_ARGUMENTS="-upc_uplay_id $ACO_APPID -upc_game_version 1 -upc_exe_path $(b64 "$ACO_EXE") -upc_working_directory $(b64 "${ACO_EXE%\\*}")"
+    echo "game $(date -Is) (bridge)" >> /out/run.log
+    exec python3 "$ACO_PROTON/proton" run "$ACO_EXE" >>/out/run.log 2>&1'
+}
+
 cmd_game() {
   local name=$1; shift
-  local dst mod=""; dst=$(inst "$name")
+  local dst mod="" profile=ultra-high; dst=$(inst "$name")
   while (($#)); do
     case $1 in
       --mod) mod=$(realpath "$2"); shift 2;;
+      --profile) profile=$2; shift 2;;
       *) die "unknown option $1";;
     esac
   done
@@ -243,10 +347,20 @@ cmd_game() {
       mkdir -p "$(dirname "$game/$f")"; cp -a "$mod/$f" "$game/$f"; echo "$f" >> "$dst/mod-files"
     done
   fi
-  # NB: the game is spawned by the long-running Connect, so env vars set here do not reach it
-  # (use dxvk.conf in the mod dir for DXVK options, e.g. "dxvk.hud = fps").
-  podman exec -d -e ACO_DLSS_OUT='Z:\out' -e ACO_PROTON="$PROTON" -e ACO_CONNECT="$CONNECT_WIN" "$(ctr "$name")" bash -c \
-    'echo "game $(date -Is)" >> /out/run.log; exec python3 "$ACO_PROTON/proton" run "$ACO_CONNECT" uplay://launch/'"$ACO_APPID"'/0 >>/out/run.log 2>&1'
+  # Pin graphics settings so measurements are comparable across runs (PixelDensity is left to the
+  # caller, e.g. tools/bench).
+  local pf="$HERE/tools/profiles/$profile.ini" aco_ini="$dst/prefix/drive_c/users/steamuser/Documents/Assassin's Creed Origins/ACO.ini"
+  [[ -f $pf ]] || die "no profile $pf"
+  grep -E '^[A-Za-z]+=' "$pf" | while IFS='=' read -r k v; do sed -i "s/^$k=.*/$k=$v/" "$aco_ini"; done
+  log "$name: graphics profile $profile"
+  if [[ $(cat "$dst/mode" 2>/dev/null) == connect ]]; then
+    # NB: the game is spawned by the long-running Connect, so env vars set here do not reach it
+    # (use dxvk.conf in the mod dir for DXVK options, e.g. "dxvk.hud = fps").
+    podman exec -d -e ACO_DLSS_OUT='Z:\out' -e ACO_PROTON="$PROTON" -e ACO_CONNECT="$CONNECT_WIN" "$(ctr "$name")" bash -c \
+      'echo "game $(date -Is)" >> /out/run.log; exec python3 "$ACO_PROTON/proton" run "$ACO_CONNECT" uplay://launch/'"$ACO_APPID"'/0 >>/out/run.log 2>&1'
+  else
+    bridge_launch "$name"
+  fi
   echo "game launching in $name"
 }
 
@@ -255,6 +369,7 @@ cmd_game() {
 cmd_shot() {
   local name=$1 out=${2:-$(inst "$1")/out/shot-$(date +%H%M%S).png}
   podman exec "$(ctr "$name")" bash -c '
+    export DISPLAY=$(cat /tmp/display)
     if [ "$ACO_XVFB" = 1 ]; then exec import -window root png:-; fi
     rm -f /tmp/gamescope.png
     xprop -root -f GAMESCOPECTRL_REQUEST_SCREENSHOT 32c -set GAMESCOPECTRL_REQUEST_SCREENSHOT 1
@@ -267,8 +382,8 @@ cmd_shot() {
   [[ -s $out ]] || die "screenshot failed"
   echo "$out"
 }
-cmd_keys() { local name=$1; shift; podman exec "$(ctr "$name")" xdotool "$@"; }
-cmd_exec() { local name=$1; shift; podman exec "$(ctr "$name")" "$@"; }
+cmd_keys() { local name=$1; shift; xexec "$name" xdotool "$@"; }
+cmd_exec() { local name=$1; shift; xexec "$name" "$@"; }
 cmd_down() { podman rm -f -t 5 "$(ctr "$1")" >/dev/null; }
 cmd_rm() { cmd_down "$1" 2>/dev/null || true; rm -rf --one-file-system "${INST_ROOT:?}/${1:?}"; }
 
@@ -276,5 +391,6 @@ c=${1:-}; shift || true
 case $c in
   gold|login|create|up|game|shot|keys|exec|down|rm) "cmd_$c" "$@";;
   kill-game) cmd_kill_game "$@";;
+  2fa) cmd_2fa "$@";;
   *) sed -n '2,32p' "$0"; exit 1;;
 esac

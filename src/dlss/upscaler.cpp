@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "core/cbshadow.h"
+#include "core/latency.h"
 #include "core/config.h"
 #include "core/ctxhooks.h"
 #include "core/log.h"
@@ -775,7 +776,7 @@ bool upscaler_on_draw(ID3D11DeviceContext* ctx, ShaderClass cls, const std::func
   if (!S.dev || !S.own_state) return false;
   switch (cls) {
     case ShaderClass::LinearZ: return on_linear_z(ctx);
-    case ShaderClass::TemporalAA: return on_taa(ctx);
+    case ShaderClass::TemporalAA: latency_on_taa(ctx); return on_taa(ctx);
     case ShaderClass::UIComposite: return on_composite(ctx, draw);
     default: return false;
   }

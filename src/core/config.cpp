@@ -48,13 +48,15 @@ Config load() {
   c.render_scale = read_float(L"render_scale", 0.0f);
   c.mip_bias = read_str(L"mip_bias", "auto");
   c.mip_bias_offset = read_float(L"mip_bias_offset", 0.0f);
+  c.latency_log = read_float(L"latency_log", 0.0f) != 0.0f;
   return c;
 }
 
 bool same(const Config& a, const Config& b) {
   return a.enabled == b.enabled && a.backend == b.backend && a.preset == b.preset && a.debug == b.debug &&
          a.jitter_x == b.jitter_x && a.jitter_y == b.jitter_y && a.mv_x == b.mv_x && a.mv_y == b.mv_y &&
-         a.render_scale == b.render_scale && a.mip_bias == b.mip_bias && a.mip_bias_offset == b.mip_bias_offset;
+         a.render_scale == b.render_scale && a.mip_bias == b.mip_bias && a.mip_bias_offset == b.mip_bias_offset &&
+         a.latency_log == b.latency_log;
 }
 } // namespace
 
@@ -76,9 +78,9 @@ bool config_reload() {
   bool changed = !g_loaded || !same(c, g_config);
   if (changed) {
     g_config = c;
-    ACO_LOG("config: enabled=%d backend=%s preset=%s debug=%s jitter=(%g,%g) mv=(%g,%g) render_scale=%g mip_bias=%s%+g",
+    ACO_LOG("config: enabled=%d backend=%s preset=%s debug=%s jitter=(%g,%g) mv=(%g,%g) render_scale=%g mip_bias=%s%+g latency_log=%d",
             c.enabled, c.backend.c_str(), c.preset.c_str(), c.debug.c_str(), c.jitter_x, c.jitter_y, c.mv_x, c.mv_y,
-            c.render_scale, c.mip_bias.c_str(), c.mip_bias_offset);
+            c.render_scale, c.mip_bias.c_str(), c.mip_bias_offset, c.latency_log);
   }
   g_loaded = true;
   return changed;

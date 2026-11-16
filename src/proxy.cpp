@@ -13,6 +13,7 @@
 #include "core/vtidx.h"
 #include "core/config.h"
 #include "core/ctxhooks.h"
+#include "core/latency.h"
 #include "dlss/upscaler.h"
 #include "trace/trace.h"
 
@@ -56,11 +57,13 @@ HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain* self, UINT sync, UINT flags
   if (!(flags & DXGI_PRESENT_TEST)) {
     trace_on_present(self);
     upscaler_on_present(self);
+    latency_on_present_begin(self);
   }
   LARGE_INTEGER a, b, f;
   QueryPerformanceCounter(&a);
   HRESULT hr = orig<decltype(hk_Present)>(self, SwapChain_Present)(self, sync, flags);
   QueryPerformanceCounter(&b);
+  if (!(flags & DXGI_PRESENT_TEST)) latency_on_present_end();
   QueryPerformanceFrequency(&f);
   g_present_ms += 1000.0 * double(b.QuadPart - a.QuadPart) / double(f.QuadPart);
   if (++g_present_n == 128) {
@@ -74,8 +77,11 @@ HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1* self, UINT sync, UINT fla
   if (!(flags & DXGI_PRESENT_TEST)) {
     trace_on_present(self);
     upscaler_on_present(self);
+    latency_on_present_begin(self);
   }
-  return orig<decltype(hk_Present1)>(self, SwapChain1_Present1)(self, sync, flags, p);
+  HRESULT hr = orig<decltype(hk_Present1)>(self, SwapChain1_Present1)(self, sync, flags, p);
+  if (!(flags & DXGI_PRESENT_TEST)) latency_on_present_end();
+  return hr;
 }
 HRESULT STDMETHODCALLTYPE hk_ResizeBuffers(IDXGISwapChain* self, UINT n, UINT w, UINT h, DXGI_FORMAT f, UINT fl) {
   ACO_LOG("ResizeBuffers %ux%u fmt=%d n=%u", w, h, f, n);
