@@ -132,7 +132,8 @@ start_container() {
     lib32+=(-v "$f:$f:ro")
   done
   local vncopt=(); ((vnc)) && vncopt=(-p 127.0.0.1:5999:5900)
-  podman run -d --rm --name "$(ctr "$name")" \
+  # --init: a minimal PID 1 (catatonit) reaps orphaned game processes; gamescope does not.
+  podman run -d --rm --init --name "$(ctr "$name")" \
     --hostname "$(cat /etc/hostname)" \
     --device nvidia.com/gpu=all --userns=keep-id --user 1000:1000 --shm-size=2g \
     --security-opt label=disable \
