@@ -1034,6 +1034,31 @@ void fg12_before_resize() {
 
 bool fg12_proxy_active() { return P.proxy == 1; }
 
+// Runtime Frame Generation on/off ([fg] toggle_key, default F9; initial state [fg] enabled). The
+// D3D12 device, NGX and the present thread stay alive while off; frames then go out like mode=off.
+bool g_fg_on = true;
+void update_toggle() {
+  const Config& cfg = config();
+  static bool init = false, last_cfg = true, key_was_down = false;
+  if (!init || cfg.fg_enabled != last_cfg) {  // start-up, or [fg] enabled changed in the live ini
+    if (init) ACO_LOG("fg12: [fg] enabled=%d in the ini -> Frame Generation %s", cfg.fg_enabled, cfg.fg_enabled ? "on" : "off");
+    init = true;
+    last_cfg = cfg.fg_enabled;
+    g_fg_on = cfg.fg_enabled;
+    S.reset = true;
+  }
+  if (int vk = config_key_vk(cfg.fg_toggle_key)) {
+    bool down = (GetAsyncKeyState(vk) & 0x8000) != 0;
+    if (down && !key_was_down) {
+      g_fg_on = !g_fg_on;
+      S.reset = true;  // first evaluation after re-enabling: no stale history
+      S.last_real_present = 0;
+      ACO_LOG("fg12: hotkey %s -> Frame Generation %s", cfg.fg_toggle_key.c_str(), g_fg_on ? "on" : "off");
+    }
+    key_was_down = down;
+  }
+}
+
 bool fg12_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent real, HRESULT* hr, uint64_t frames) {
   const Config& cfg = config();
   const bool proxy = P.proxy == 1;
@@ -1043,8 +1068,12 @@ bool fg12_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent rea
   if (proxy) join(cfg.fg_sync == "gpu" ? 0 : 1);
 
   // NGX/D3D12 initialisation runs on its own thread; presents stay normal until it is ready.
-  const bool want = cfg.fg_mode == "d3d12" && frames >= 300;
-  if (want && P.init_state == 0) {
+  update_toggle();
+  // NGX/D3D12 are initialised whenever mode=d3d12 (also while toggled off, so F9 is instant).
+  const bool want_init = cfg.fg_mode == "d3d12" && frames >= 300;
+  const bool want = want_init && g_fg_on;
+  if (!want) S.reset = true;
+  if (want_init && P.init_state == 0) {
     ID3D11Device* dev = nullptr;
     if (SUCCEEDED(sc->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void**>(&dev)))) {
       P.init_state = 1;

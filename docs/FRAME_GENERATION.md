@@ -125,6 +125,23 @@ ceiling, then play with `[fg] mode=d3d12` and read `perf: fg12 present thread st
 aco_dlss.log — a generated/real `Present` above ~1 ms means the display path throttles presents;
 MangoHud counts both presents (expect ~2x the game rate up to the refresh rate).
 
+### Live toggle (F9, `[fg] toggle_key`, initial state `[fg] enabled`)
+
+With `mode=d3d12` the D3D12 device, NGX and the present thread stay alive; the hotkey (edge-detected
+like F10) flips Frame Generation. Off: no evaluation, no generated present, no pacing — each frame
+is copied from the proxy backbuffer and presented on the game thread as with `mode=off`. On again:
+the first evaluation passes Reset=1. Reflex frame IDs are per game Present, so they stay monotonic
+across toggles. 2560x1600, t1, DLSS Performance, Reflex on, latency-bench:
+
+| | `mode=off` | `mode=d3d12`, FG on | `mode=d3d12`, FG toggled off (`enabled=0`) |
+|---|---|---|---|
+| game fps | 120.5 | 80.1 (75.8 + 75.8 presents/s) | 117.8 |
+| input → frame done, median (p10–p90) | 35.6 ms (32.4–39.6) | 55.4 ms (47.4–63.9) | 36.1 ms (33.6–40.1) |
+
+`tools/fg-toggle-test t1 6`: six F9 presses while running: no hang or crash, no exceptions,
+generated frames back after every re-enable (~80 + 80 presents/s, verify: generated strictly
+between its neighbours), each re-enable logged with one reset.
+
 Still open on this route: frame pacing quality not measured on a real display (this is headless
 gamescope); latency (above); HUD-less/UI handling (the HUD-less input is the DLSS output, the UI is
 interpolated with the scene); camera matrices are identity (DLSS-G relies on motion vectors).
