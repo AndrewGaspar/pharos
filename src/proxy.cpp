@@ -21,6 +21,7 @@
 #include "fg/vk_device_ext.h"
 #include "core/memtool.h"
 #include "world/npc.h"
+#include "world/teleport.h"
 #include "world/world.h"
 #include "core/framedump.h"
 #include "core/mapstats.h"
@@ -81,6 +82,7 @@ HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain* self, UINT sync, UINT flags
     mapstats_on_present();
     peek_on_present();
     cloth_on_present();
+    teleport_on_present();
   }
   LARGE_INTEGER a, b, f;
   QueryPerformanceCounter(&a);

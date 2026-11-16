@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# teleport <instance> <location | x y z [cam_yaw [cam_pitch]]> [--hold S] [--settle S] [--shot FILE]
+#
+# Moves the player (Discovery Tour or story mode, in the world) to a named location from
+# tools/locations.txt or to explicit coordinates (Z up). The mod writes the player entity's
+# position, verifies it took and watches it for --hold seconds (default 4), re-placing it if it
+# drops through ground that hasn't streamed in yet (src/world/teleport.cpp). Then the camera is
+# turned to the location's heading (tools/camera; yaw 0 = +X, 90 = +Y, pitch < 0 looks down), this
+# script waits --settle seconds (default 0) for textures/NPCs to stream, and --shot screenshots.
+#
+#   tools/teleport t2 list
+#   tools/teleport t2 alexandria-agora --settle 8 --shot /tmp/a.png
+#   tools/teleport t2 -749.7 3574.2 207.8 90 -5
+set -euo pipefail
+here=$(cd "$(dirname "$0")/.." && pwd)
+name=${1:?instance}; shift
+out=${ACO_INST_ROOT:-$HOME/Games/aco-dlss-instances}/$name/out
+table=$here/tools/locations.txt
+
+if [[ ${1:-} == list || -z ${1:-} ]]; then
+  grep -v '^\s*#' "$table" | grep -v '^\s*$'
+  exit 0
+fi
+
+hold="" settle=0 shot="" args=()
+while (($#)); do
+  case $1 in
+    --hold) hold=$2; shift 2;;
+    --settle) settle=$2; shift 2;;
+    --shot) shot=$2; shift 2;;
+    *) args+=("$1"); shift;;
+  esac
+done
+
+if [[ ${#args[@]} -eq 1 ]]; then
+  line=$(awk -v n="${args[0]}" '$1 == n {print $2, $3, $4, $5, $6; exit}' "$table")
+  [[ -n $line ]] || { echo "teleport: unknown location '${args[0]}' (tools/teleport $name list)" >&2; exit 1; }
+  read -r -a args <<< "$line"
+fi
+((${#args[@]} >= 3)) || { echo "teleport: need a location name or x y z [cam_yaw [cam_pitch]]" >&2; exit 1; }
+
+req="${args[0]} ${args[1]} ${args[2]}"
+[[ -n $hold ]] && req+=" hold=$hold"
+rm -f "$out/teleport.done"
+echo "$req" > "$out/teleport.txt.tmp" && mv "$out/teleport.txt.tmp" "$out/teleport.txt"
+
+t0=$SECONDS
+end=$((SECONDS + 120))
+until [[ -s $out/teleport.done ]]; do
+  ((SECONDS < end)) || { echo "teleport: no result from the mod in 120 s (game not rendering?)" >&2; exit 1; }
+  sleep 0.25
+done
+result=$(cat "$out/teleport.done")
+echo "teleport: $result (wall $((SECONDS - t0)) s)"
+[[ $result == ok* ]] || exit 1
+if ((${#args[@]} >= 4)); then
+  "$here/tools/camera" "$name" "${args[3]}" ${args[4]:+"${args[4]}"} || true
+fi
+if [[ $settle != 0 ]]; then sleep "$settle"; fi
+if [[ -n $shot ]]; then "$here/scripts/aco" shot "$name" "$shot"; fi
+exit 0
