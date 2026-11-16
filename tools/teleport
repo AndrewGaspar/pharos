@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# teleport <instance> <location | x y z [yaw]> [--hold S] [--settle S] [--shot FILE] [--no-wait]
+#
+# Moves the player (Discovery Tour or story mode) to a named location from tools/locations.txt or
+# to explicit coordinates (Z up; yaw in degrees, 0 = +X, 90 = +Y). The mod holds the player at the
+# target for --hold seconds (default 4) while the world streams in, releases it and checks that it
+# stays put. Then this script waits --settle seconds (default 0) for LODs/NPCs to finish
+# streaming and, with --shot, takes a screenshot.
+#
+#   tools/teleport t2 list                  # show named locations
+#   tools/teleport t2 alexandria-agora --settle 10 --shot /tmp/a.png
+#   tools/teleport t2 -749.7 3574.2 207.8 90
+set -euo pipefail
+here=$(cd "$(dirname "$0")/.." && pwd)
+name=${1:?instance}; shift
+out=${ACO_INST_ROOT:-$HOME/Games/aco-dlss-instances}/$name/out
+table=$here/tools/locations.txt
+
+if [[ ${1:-} == list || -z ${1:-} ]]; then
+  grep -v '^\s*#' "$table" | grep -v '^\s*$'
+  exit 0
+fi
+
+hold="" settle=0 shot="" wait=1 coords=()
+while (($#)); do
+  case $1 in
+    --hold) hold=$2; shift 2;;
+    --settle) settle=$2; shift 2;;
+    --shot) shot=$2; shift 2;;
+    --no-wait) wait=0; shift;;
+    *) coords+=("$1"); shift;;
+  esac
+done
+
+if [[ ${#coords[@]} -eq 1 ]]; then
+  line=$(awk -v n="${coords[0]}" '$1 == n {print $2, $3, $4, $5; exit}' "$table")
+  [[ -n $line ]] || { echo "teleport: unknown location '${coords[0]}' (tools/teleport $name list)" >&2; exit 1; }
+  read -r -a coords <<< "$line"
+fi
+((${#coords[@]} >= 3)) || { echo "teleport: need a location name or x y z [yaw]" >&2; exit 1; }
+
+req="${coords[*]}"
+[[ -n $hold ]] && req+=" hold=$hold"
+rm -f "$out/teleport.done"
+echo "$req" > "$out/teleport.txt.tmp" && mv "$out/teleport.txt.tmp" "$out/teleport.txt"
+((wait)) || exit 0
+
+t0=$SECONDS
+end=$((SECONDS + 120))
+until [[ -s $out/teleport.done ]]; do
+  ((SECONDS < end)) || { echo "teleport: no result from the mod in 120 s" >&2; exit 1; }
+  sleep 0.25
+done
+result=$(cat "$out/teleport.done")
+echo "teleport: $result (wall $((SECONDS - t0)) s)"
+[[ $result == ok* ]] || exit 1
+((settle > 0)) && sleep "$settle"
+[[ -n $shot ]] && "$here/scripts/aco" shot "$name" "$shot"
+exit 0

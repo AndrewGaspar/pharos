@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# where <instance>: print the player's position and heading ("x y z yaw_deg"; Z up, yaw 0 = +X,
+# 90 = +Y). Needs the mod running in the game (src/world/teleport.cpp answers <out>/where).
+set -euo pipefail
+name=${1:?instance}
+out=${ACO_INST_ROOT:-$HOME/Games/aco-dlss-instances}/$name/out
+rm -f "$out/where.txt"
+touch "$out/where"
+end=$((SECONDS + 15))
+until [[ -s $out/where.txt ]]; do
+  ((SECONDS < end)) || { echo "where: no answer from the mod in 15 s (game not running / not rendering?)" >&2; exit 1; }
+  sleep 0.2
+done
+cat "$out/where.txt"

@@ -1,0 +1,3 @@
+# Named locations for tools/teleport: name x y z yaw_deg  (Z up; yaw 0 = +X, 90 = +Y)
+# Coordinates were read with tools/where after reaching each place in game.
+dt-start -749.725 3574.178 207.752 -5   # Discovery Tour spawn (Alexandria outskirts)
