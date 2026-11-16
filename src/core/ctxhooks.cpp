@@ -8,6 +8,7 @@
 #include <mutex>
 
 #include "core/cbshadow.h"
+#include "core/ctxgate.h"
 #include "core/hook.h"
 #include "core/log.h"
 #include "core/memtool.h"
@@ -18,6 +19,22 @@
 #include "trace/trace.h"
 
 namespace aco {
+
+std::atomic<int> g_ctx_gate{0};
+thread_local int g_ctx_gate_exempt = 0;
+ID3D11DeviceContext* g_ctx_gate_imm = nullptr;
+
+void ctx_gate_wait() {
+  LARGE_INTEGER f, c0, c;
+  QueryPerformanceFrequency(&f);
+  QueryPerformanceCounter(&c0);
+  const LONGLONG deadline = f.QuadPart / 50;  // 20 ms: never stall the game for long
+  while (g_ctx_gate.load(std::memory_order_acquire) > 0) {
+    SwitchToThread();
+    QueryPerformanceCounter(&c);
+    if (c.QuadPart - c0.QuadPart > deadline) return;
+  }
+}
 
 namespace {
 
@@ -66,12 +83,14 @@ inline ShaderClass ps_class(ID3D11DeviceContext* ctx) {
 // ---- context hooks ---------------------------------------------------------------------------
 
 void STDMETHODCALLTYPE hk_PSSetShader(ID3D11DeviceContext* self, ID3D11PixelShader* ps, ID3D11ClassInstance* const* ci, UINT n) {
+  ctx_gate(self);
   if (CtxState* s = state_for(self)) s->ps.store(shader_class_fast(ps), std::memory_order_relaxed);
   ORIG(decltype(hk_PSSetShader), Context_PSSetShader)(self, ps, ci, n);
 }
 
 void STDMETHODCALLTYPE hk_CSSetShader(ID3D11DeviceContext* self, ID3D11ComputeShader* cs, ID3D11ClassInstance* const* ci,
                                       UINT n) {
+  ctx_gate(self);
   if (CtxState* s = state_for(self)) s->cs.store(shader_class_fast(cs), std::memory_order_relaxed);
   ORIG(decltype(hk_CSSetShader), Context_CSSetShader)(self, cs, ci, n);
 }
@@ -82,6 +101,7 @@ inline bool culling_cs(ID3D11DeviceContext* ctx) {
 }
 
 void STDMETHODCALLTYPE hk_ClearState(ID3D11DeviceContext* self) {
+  ctx_gate(self);
   if (CtxState* s = state_for(self)) {
     s->ps.store(ShaderClass::None, std::memory_order_relaxed);
     s->cs.store(ShaderClass::None, std::memory_order_relaxed);
@@ -92,6 +112,7 @@ void STDMETHODCALLTYPE hk_ClearState(ID3D11DeviceContext* self) {
 // Common draw path: trace, then let the upscaler intercept classified passes.
 template <typename F>
 inline void draw_common(ID3D11DeviceContext* self, const char* op, const char* args, F&& issue) {
+  ctx_gate(self);
   trace_draw(self, op, args);
   ShaderClass c = ps_class(self);
   if (c != ShaderClass::None && upscaler_on_draw(self, c, issue)) return;
@@ -139,6 +160,7 @@ void STDMETHODCALLTYPE hk_DrawInstancedIndirect(ID3D11DeviceContext* self, ID3D1
               [&] { ORIG(decltype(hk_DrawInstancedIndirect), Context_DrawInstancedIndirect)(self, buf, off); });
 }
 void STDMETHODCALLTYPE hk_Dispatch(ID3D11DeviceContext* self, UINT x, UINT y, UINT z) {
+  ctx_gate(self);
   if (trace_capturing()) {
     char args[64];
     snprintf(args, sizeof(args), "%u,%u,%u", x, y, z);
@@ -153,6 +175,7 @@ void STDMETHODCALLTYPE hk_Dispatch(ID3D11DeviceContext* self, UINT x, UINT y, UI
   ORIG(decltype(hk_Dispatch), Context_Dispatch)(self, x, y, z);
 }
 void STDMETHODCALLTYPE hk_DispatchIndirect(ID3D11DeviceContext* self, ID3D11Buffer* buf, UINT off) {
+  ctx_gate(self);
   char args[64] = "";
   if (trace_capturing()) snprintf(args, sizeof(args), "\"%p\",%u", static_cast<void*>(buf), off);
   trace_dispatch(self, "DispatchIndirect", args);
@@ -163,28 +186,34 @@ void STDMETHODCALLTYPE hk_DispatchIndirect(ID3D11DeviceContext* self, ID3D11Buff
   ORIG(decltype(hk_DispatchIndirect), Context_DispatchIndirect)(self, buf, off);
 }
 void STDMETHODCALLTYPE hk_CopyResource(ID3D11DeviceContext* self, ID3D11Resource* dst, ID3D11Resource* src) {
+  ctx_gate(self);
   trace_copy_resource(self, dst, src);
   ORIG(decltype(hk_CopyResource), Context_CopyResource)(self, dst, src);
 }
 void STDMETHODCALLTYPE hk_CopySubresourceRegion(ID3D11DeviceContext* self, ID3D11Resource* dst, UINT dsub, UINT x, UINT y,
                                                 UINT z, ID3D11Resource* src, UINT ssub, const D3D11_BOX* box) {
+  ctx_gate(self);
   trace_copy_subresource(self, dst, dsub, x, y, z, src, ssub, box);
   ORIG(decltype(hk_CopySubresourceRegion), Context_CopySubresourceRegion)(self, dst, dsub, x, y, z, src, ssub, box);
 }
 void STDMETHODCALLTYPE hk_ClearRenderTargetView(ID3D11DeviceContext* self, ID3D11RenderTargetView* v, const FLOAT c[4]) {
+  ctx_gate(self);
   trace_clear_rtv(self, v, c);
   ORIG(decltype(hk_ClearRenderTargetView), Context_ClearRenderTargetView)(self, v, c);
 }
 void STDMETHODCALLTYPE hk_ClearDepthStencilView(ID3D11DeviceContext* self, ID3D11DepthStencilView* v, UINT f, FLOAT d,
                                                 UINT8 st) {
+  ctx_gate(self);
   trace_clear_dsv(self, v, f, d, st);
   ORIG(decltype(hk_ClearDepthStencilView), Context_ClearDepthStencilView)(self, v, f, d, st);
 }
 void STDMETHODCALLTYPE hk_ClearUAVFloat(ID3D11DeviceContext* self, ID3D11UnorderedAccessView* v, const FLOAT c[4]) {
+  ctx_gate(self);
   trace_clear_uav(self, v, true);
   ORIG(decltype(hk_ClearUAVFloat), Context_ClearUnorderedAccessViewFloat)(self, v, c);
 }
 void STDMETHODCALLTYPE hk_ClearUAVUint(ID3D11DeviceContext* self, ID3D11UnorderedAccessView* v, const UINT c[4]) {
+  ctx_gate(self);
   trace_clear_uav(self, v, false);
   ORIG(decltype(hk_ClearUAVUint), Context_ClearUnorderedAccessViewUint)(self, v, c);
 }
@@ -202,6 +231,7 @@ HRESULT STDMETHODCALLTYPE hk_FinishCommandList(ID3D11DeviceContext* self, BOOL r
   return hr;
 }
 void STDMETHODCALLTYPE hk_ExecuteCommandList(ID3D11DeviceContext* self, ID3D11CommandList* cl, BOOL restore) {
+  ctx_gate(self);
   trace_execute_command_list(self, cl);
   if (!upscaler_on_execute_command_list(self, cl, restore))
     ORIG(decltype(hk_ExecuteCommandList), Context_ExecuteCommandList)(self, cl, restore);

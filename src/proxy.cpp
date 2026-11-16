@@ -118,6 +118,7 @@ HRESULT STDMETHODCALLTYPE hk_GetBuffer(IDXGISwapChain* self, UINT index, REFIID 
   return fg12_get_buffer(self, index, riid, out, orig<decltype(hk_GetBuffer)>(self, SwapChain_GetBuffer));
 }
 HRESULT STDMETHODCALLTYPE hk_ResizeBuffers(IDXGISwapChain* self, UINT n, UINT w, UINT h, DXGI_FORMAT f, UINT fl) {
+  if (n && config().fg_mode == "d3d12" && config().fg_buffers > 0 && n < UINT(config().fg_buffers)) n = config().fg_buffers;
   ACO_LOG("ResizeBuffers %ux%u fmt=%d n=%u", w, h, f, n);
   reflex_on_resize();
   fg12_before_resize();
@@ -140,6 +141,10 @@ void install_swapchain(IDXGISwapChain* sc) {
 }
 
 HRESULT STDMETHODCALLTYPE hk_CreateSwapChain(IDXGIFactory* self, IUnknown* dev, DXGI_SWAP_CHAIN_DESC* desc, IDXGISwapChain** out) {
+  if (desc && config().fg_mode == "d3d12" && config().fg_buffers > 0 && desc->BufferCount < UINT(config().fg_buffers)) {
+    ACO_LOG("fg: swapchain buffer count %u -> %d", desc->BufferCount, config().fg_buffers);
+    desc->BufferCount = config().fg_buffers;
+  }
   HRESULT hr = orig<decltype(hk_CreateSwapChain)>(self, Factory_CreateSwapChain)(self, dev, desc, out);
   if (SUCCEEDED(hr) && out && *out) install_swapchain(*out);
   return hr;

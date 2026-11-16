@@ -18,14 +18,18 @@
 
 #include <atomic>
 #include <cmath>
+#include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <cstdio>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "core/config.h"
+#include "core/ctxgate.h"
 #include "core/log.h"
 #include "dlss/ngx.h"
 #include "dlss/upscaler.h"
@@ -113,6 +117,12 @@ struct State {
 
   Shared color, depth, mv, hudless, out, outreal, scratch;
   ID3D11Texture2D* real = nullptr;  // D3D11-only copy of the real frame for presenting after the generated one
+  UINT64 eval_v = 0;  // D3D12 fence value when the last evaluation using this set is done
+  // [fg] sync=cpu: the other texture set (frames alternate), swapped in by swap_sets().
+  Shared alt_color, alt_depth, alt_mv, alt_hudless, alt_out;
+  ID3D11Texture2D* alt_real = nullptr;
+  UINT64 alt_eval_v = 0;
+  HANDLE game_event = nullptr;  // for CPU waits on the game thread (wait_d3d12 uses fence_event)
   uint32_t tex_w = 0, tex_h = 0;
   DXGI_FORMAT tex_fmt = DXGI_FORMAT_UNKNOWN;
 
@@ -240,10 +250,30 @@ bool submit(F&& record, bool cpu_wait) {
   UINT64 v_out = ++S.fence_value;
   S.q->Signal(S.fence12, v_out);
   S.slot_value[slot] = v_out;
-  // D3D12 -> D3D11: later context work (copying the output out) waits for the evaluation.
-  S.imm->Wait(S.fence11, v_out);
+  S.eval_v = v_out;
+  // D3D12 -> D3D11. sync=gpu: later context work waits on the GPU (vkd3d-proton resolves the D3D12
+  // side's wait on the shared fence on the CPU, so this stalls the D3D11 queue on a CPU round trip).
+  // sync=cpu: whoever copies the output out first waits on the CPU (wait_eval).
+  if (cpu_wait || config().fg_sync == "gpu") S.imm->Wait(S.fence11, v_out);
   if (cpu_wait) wait_d3d12(v_out);
   return ok;
+}
+
+// CPU wait for a D3D12 fence value with a caller-owned event; false on timeout.
+bool wait_eval(UINT64 v, HANDLE event, DWORD timeout_ms) {
+  if (!v || S.fence12->GetCompletedValue() >= v) return true;
+  S.fence12->SetEventOnCompletion(v, event);
+  return WaitForSingleObject(event, timeout_ms) == WAIT_OBJECT_0 || S.fence12->GetCompletedValue() >= v;
+}
+
+void swap_sets() {
+  std::swap(S.color, S.alt_color);
+  std::swap(S.depth, S.alt_depth);
+  std::swap(S.mv, S.alt_mv);
+  std::swap(S.hudless, S.alt_hudless);
+  std::swap(S.out, S.alt_out);
+  std::swap(S.real, S.alt_real);
+  std::swap(S.eval_v, S.alt_eval_v);
 }
 
 bool init(ID3D11Device* dev) {
@@ -307,6 +337,7 @@ bool init(ID3D11Device* dev) {
     return false;
   }
   S.fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  S.game_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 
   D3D12_QUERY_HEAP_DESC qh{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, kRing * 2, 0};
   UINT64 freq = 0;
@@ -414,8 +445,9 @@ bool ensure_feature(uint32_t w, uint32_t h, uint32_t rw, uint32_t rh, DXGI_FORMA
 
 bool ensure_textures(const D3D11_TEXTURE2D_DESC& bb) {
   DXGI_FORMAT f = storage_format(bb.Format);
-  if (S.real && S.tex_w == bb.Width && S.tex_h == bb.Height && S.tex_fmt == f) return true;
+  if (S.real && S.alt_real && S.tex_w == bb.Width && S.tex_h == bb.Height && S.tex_fmt == f) return true;
   safe_release(S.real);
+  safe_release(S.alt_real);
   S.tex_w = S.tex_h = 0;
   D3D11_TEXTURE2D_DESC d{};
   d.Width = bb.Width;
@@ -426,8 +458,10 @@ bool ensure_textures(const D3D11_TEXTURE2D_DESC& bb) {
   d.SampleDesc.Count = 1;
   d.Usage = D3D11_USAGE_DEFAULT;
   d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-  if (FAILED(S.dev->CreateTexture2D(&d, nullptr, &S.real))) return false;
+  if (FAILED(S.dev->CreateTexture2D(&d, nullptr, &S.real)) || FAILED(S.dev->CreateTexture2D(&d, nullptr, &S.alt_real)))
+    return false;
   if (!make_shared(S.color, bb.Width, bb.Height, f, false) || !make_shared(S.out, bb.Width, bb.Height, f, true) ||
+      !make_shared(S.alt_color, bb.Width, bb.Height, f, false) || !make_shared(S.alt_out, bb.Width, bb.Height, f, true) ||
       !make_shared(S.outreal, bb.Width, bb.Height, f, true) || !make_shared(S.scratch, bb.Width, bb.Height, f, true))
     return false;
   S.tex_w = bb.Width;
@@ -553,7 +587,14 @@ bool generate(const FgInputs& in, ID3D11Texture2D* bb) {
 
   NVSDK_NGX_Result r = NVSDK_NGX_Result_Fail;
   int64_t t0 = now_us();
+  // [fg] skip (bisecting): d3d12 = no D3D12 submission/fences at all, eval = submit without DLSS-G.
+  if (cfg.fg_skip == "d3d12") return true;
+  const bool skip_eval = cfg.fg_skip == "eval";
   bool ok = submit([&](ID3D12GraphicsCommandList* cl) {
+    if (skip_eval) {
+      r = NVSDK_NGX_Result_Success;
+      return true;
+    }
     for (unsigned i = 1; i <= count; ++i) {
       p.set(NVSDK_NGX_DLSSG_Parameter_MultiFrameCount, count);
       p.set(NVSDK_NGX_DLSSG_Parameter_MultiFrameIndex, i);
@@ -670,16 +711,17 @@ void verify_read() {
 }
 
 // What goes into the backbuffer for the generated (first) or real (second) present.
-void fill(ID3D11Texture2D* dst, bool generated_slot, const std::string& show) {
+void fill(ID3D11Texture2D* dst, bool generated_slot, const std::string& show, ID3D11Texture2D* gen,
+          ID3D11Texture2D* real) {
   if (show == "compare" || show == "compare_gen") {
     // Debug: left half the real frame, right half OutputReal / the generated frame.
     D3D11_BOX left{0, 0, 0, S.tex_w / 2, S.tex_h, 1};
-    S.imm->CopySubresourceRegion(dst, 0, 0, 0, 0, S.real, 0, &left);
-    S.imm->CopySubresourceRegion(dst, 0, S.tex_w / 2, 0, 0, show == "compare_gen" ? S.out.t11 : S.outreal.t11, 0, &left);
+    S.imm->CopySubresourceRegion(dst, 0, 0, 0, 0, real, 0, &left);
+    S.imm->CopySubresourceRegion(dst, 0, S.tex_w / 2, 0, 0, show == "compare_gen" ? gen : S.outreal.t11, 0, &left);
     return;
   }
-  ID3D11Texture2D* src = generated_slot ? (show == "real" ? S.real : show == "outreal" ? S.outreal.t11 : S.out.t11)
-                                        : (show == "generated" ? S.out.t11 : show == "outreal" ? S.outreal.t11 : S.real);
+  ID3D11Texture2D* src = generated_slot ? (show == "real" ? real : show == "outreal" ? S.outreal.t11 : gen)
+                                        : (show == "generated" ? gen : show == "outreal" ? S.outreal.t11 : real);
   S.imm->CopyResource(dst, src);
 }
 
@@ -705,15 +747,24 @@ struct Presenter {
   UINT sync = 0, flags = 0;
   int64_t half_interval_us = 0;
   std::string show;
+  bool gate = true;  // [fg] present_gate
   std::atomic<HRESULT> hr{S_OK};
   std::atomic<int> init_state{0};  // 0 not started, 1 running, 2 ready, 3 failed
   int64_t arrive_us = 0;  // when the game's Present reached us
+  UINT64 wait_value = 0;  // the generated frame is ready when the D3D12 fence reaches this
+  ID3D11Texture2D* gen_tex = nullptr;   // this job's textures (one of the two sets)
+  ID3D11Texture2D* real_tex = nullptr;
+  std::atomic<uint32_t> gen_dropped{0};  // generated frame not ready in time: real frame only
   double perf_join_ms = 0;
   uint32_t perf_join_n = 0;
   // Present-thread timing: when the generated / real present calls were made after the game's
   // Present arrived (extra display latency of the real frame).
   std::atomic<int64_t> delay_gen_us{0}, delay_real_us{0};
   std::atomic<uint32_t> delay_n{0};
+  // Per-job CPU time of the present thread's steps: pick-up after enqueue, copy into the swapchain
+  // backbuffer (includes waiting for the D3D11 context lock), the real IDXGISwapChain::Present call,
+  // the pacing wait - for the generated (g) and real (r) present.
+  std::atomic<int64_t> seg_us[6] = {};  // pickup, fill_g, present_g, wait, fill_r, present_r
 } P;
 
 ID3D11Texture2D* real_backbuffer(IDXGISwapChain* sc) {
@@ -723,50 +774,88 @@ ID3D11Texture2D* real_backbuffer(IDXGISwapChain* sc) {
   return SUCCEEDED(hr) ? bb : nullptr;
 }
 
+// One frame's presents (generated, then real) for the present thread.
+struct Job {
+  IDXGISwapChain* sc = nullptr;
+  PFN_RealPresent present = nullptr;
+  UINT sync = 0, flags = 0;
+  int64_t half_us = 0;      // pacing: real frame this long after the generated one
+  int64_t arrive_us = 0;    // when the game's Present reached us
+  UINT64 wait_value = 0;    // the generated frame is ready when the D3D12 fence reaches this
+  ID3D11Texture2D* gen = nullptr;
+  ID3D11Texture2D* real = nullptr;
+  std::string show;
+  bool gate = true;
+  bool skip_gen = false;    // superseded before it started: present only the real frame
+};
+std::deque<Job> g_jobs;  // guarded by P.m
+int g_active = 0;        // jobs being processed (0/1), guarded by P.m
+
 void present_loop() {
   g_present_tid = GetCurrentThreadId();
+  g_ctx_gate_exempt = 1;
+  HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
   for (;;) {
     std::unique_lock<std::mutex> lk(P.m);
-    P.cv.wait(lk, [] { return P.job; });
-    P.job = false;
-    IDXGISwapChain* sc = P.sc;
-    PFN_RealPresent present = P.present;
-    UINT sync = P.sync, flags = P.flags;
-    int64_t half = P.half_interval_us;
-    int64_t arrive = P.arrive_us;
-    std::string show = P.show;
+    P.cv.wait(lk, [] { return !g_jobs.empty(); });
+    Job j = g_jobs.front();
+    g_jobs.pop_front();
+    g_active = 1;
     lk.unlock();
 
     HRESULT hr = S_OK;
-    if (ID3D11Texture2D* bb = real_backbuffer(sc)) {
-      fill(bb, true, show);
-      bb->Release();
-      hr = present(sc, sync, flags);
+    int64_t t0 = now_us(), t1 = t0, t2 = t0;
+    bool gen_ready = !j.skip_gen && wait_eval(j.wait_value, event, 100);
+    if (!gen_ready) ++P.gen_dropped;
+    t0 = now_us();
+    if (gen_ready) {
+      if (ID3D11Texture2D* bb = real_backbuffer(j.sc)) {
+        if (j.gate) g_ctx_gate.fetch_add(1);
+        fill(bb, true, j.show, j.gen, j.real);
+        bb->Release();
+        t1 = now_us();
+        hr = j.present(j.sc, j.sync, j.flags);
+        if (j.gate) g_ctx_gate.fetch_sub(1);
+      }
     }
-    int64_t t_gen = now_us();
-    if (half > 0) wait_until(t_gen + half);
-    int64_t t_real = now_us();
-    if (ID3D11Texture2D* bb = real_backbuffer(sc)) {
-      fill(bb, false, show);
+    int64_t t_gen = t2 = now_us();
+    if (gen_ready && j.half_us > 0) wait_until(t_gen + j.half_us);
+    int64_t t_real = now_us(), t4 = t_real;
+    if (j.show == "skip_present2") {
+      // bisecting: no second present
+    } else if (ID3D11Texture2D* bb = real_backbuffer(j.sc)) {
+      if (j.gate) g_ctx_gate.fetch_add(1);
+      fill(bb, false, j.show, j.gen, j.real);
       bb->Release();
-      HRESULT h2 = present(sc, sync, flags);
+      t4 = now_us();
+      HRESULT h2 = j.present(j.sc, j.sync, j.flags);
+      if (j.gate) g_ctx_gate.fetch_sub(1);
       if (SUCCEEDED(hr)) hr = h2;
     }
-    P.delay_gen_us += t_gen - arrive;
-    P.delay_real_us += t_real - arrive;
+    int64_t t5 = now_us();
+    P.seg_us[0] += t0 - j.arrive_us;
+    P.seg_us[1] += t1 - t0;
+    P.seg_us[2] += t2 - t1;
+    P.seg_us[3] += t_real - t2;
+    P.seg_us[4] += t4 - t_real;
+    P.seg_us[5] += t5 - t4;
+    P.delay_gen_us += t_gen - j.arrive_us;
+    P.delay_real_us += t_real - j.arrive_us;
     ++P.delay_n;
     P.hr = hr;
     lk.lock();
-    P.busy = false;
+    g_active = 0;
     P.cv.notify_all();
   }
 }
 
-void join() {
+// Waits (deadline 500 ms) until at most `outstanding` jobs are queued or running.
+void join(size_t outstanding = 0) {
   std::unique_lock<std::mutex> lk(P.m);
-  if (!P.busy) return;
+  auto ok = [outstanding] { return g_jobs.size() + size_t(g_active) <= outstanding; };
+  if (ok()) return;
   int64_t t0 = now_us();
-  P.cv.wait(lk, [] { return !P.busy; });
+  P.cv.wait_for(lk, std::chrono::milliseconds(500), ok);
   P.perf_join_ms += (now_us() - t0) / 1000.0;
   ++P.perf_join_n;
 }
@@ -774,16 +863,25 @@ void join() {
 void enqueue(IDXGISwapChain* sc, PFN_RealPresent present, UINT sync, UINT flags, int64_t half, const std::string& show,
              int64_t arrive) {
   static std::thread thread(present_loop);
+  Job j;
+  j.sc = sc;
+  j.present = present;
+  j.sync = sync;
+  j.flags = flags;
+  j.half_us = half;
+  j.arrive_us = arrive;
+  j.wait_value = config().fg_sync == "gpu" ? 0 : S.eval_v;
+  j.gen = S.out.t11;
+  j.real = S.real;
+  j.show = config().fg_skip == "present2" ? std::string("skip_present2") : show;
+  j.gate = config().fg_present_gate;
   std::lock_guard<std::mutex> lk(P.m);
-  P.arrive_us = arrive;
-  P.sc = sc;
-  P.present = present;
-  P.sync = sync;
-  P.flags = flags;
-  P.half_interval_us = half;
-  P.show = show;
-  P.job = true;
-  P.busy = true;
+  // A job that hasn't started yet is late: its generated frame would only delay the real ones.
+  for (Job& q : g_jobs) {
+    q.skip_gen = true;
+    q.half_us = 0;
+  }
+  g_jobs.push_back(j);
   P.cv.notify_all();
 }
 
@@ -836,6 +934,7 @@ void enable_multithread(ID3D11Device* dev) {
     mt10->Release();
   }
   P.ctx = ctx;  // keeps the reference
+  g_ctx_gate_imm = ctx;
   ACO_LOG("fg12: D3D11 multithread protection %s", ok ? "on" : "UNAVAILABLE");
 }
 
@@ -847,9 +946,13 @@ void perf_join_report() {
   uint32_t n = P.delay_n.exchange(0);
   int64_t dg = P.delay_gen_us.exchange(0), dr = P.delay_real_us.exchange(0);
   ACO_LOG("perf: fg12 present thread: game waited for it %u times (%.2f ms avg); after the game's Present: generated "
-          "presented +%.2f ms, real +%.2f ms",
+          "presented +%.2f ms, real +%.2f ms; generated frames dropped %u",
           P.perf_join_n, P.perf_join_n ? P.perf_join_ms / P.perf_join_n : 0.0, n ? dg / 1000.0 / n : 0.0,
-          n ? dr / 1000.0 / n : 0.0);
+          n ? dr / 1000.0 / n : 0.0, P.gen_dropped.exchange(0));
+  double s[6];
+  for (int i = 0; i < 6; ++i) s[i] = n ? P.seg_us[i].exchange(0) / 1000.0 / n : 0.0;
+  ACO_LOG("perf: fg12 present thread steps (ms/job): pickup %.2f | copy %.2f, Present %.2f (generated) | wait %.2f | "
+          "copy %.2f, Present %.2f (real)", s[0], s[1], s[2], s[3], s[4], s[5]);
   P.perf_join_ms = 0;
   P.perf_join_n = 0;
   last = now;
@@ -868,6 +971,27 @@ HRESULT fg12_get_buffer(IDXGISwapChain* sc, UINT index, const _GUID& riid, void*
         dev->Release();
       }
       ACO_LOG("fg12: proxy backbuffer + present thread enabled");
+    }
+  }
+  {
+    // Diagnostics: DXVK makes each Present wait until the present this many presents back is done.
+    static int64_t last = 0;
+    if (now_us() - last > 10000000) {
+      last = now_us();
+      IDXGIDevice1* d1 = nullptr;
+      UINT lat = 0;
+      if (SUCCEEDED(sc->GetDevice(__uuidof(IDXGIDevice1), reinterpret_cast<void**>(&d1)))) {
+        d1->GetMaximumFrameLatency(&lat);
+        d1->Release();
+      }
+      int want = config().fg_frame_latency;
+      if (want > 0 && config().fg_mode == "d3d12" && lat != UINT(want) &&
+          SUCCEEDED(sc->GetDevice(__uuidof(IDXGIDevice1), reinterpret_cast<void**>(&d1)))) {
+        d1->SetMaximumFrameLatency(want);
+        d1->Release();
+        ACO_LOG("fg12: maximum frame latency %u -> %d", lat, want);
+      }
+      ACO_LOG("fg12: game's maximum frame latency %u", lat);
     }
   }
   if (!P.proxy) return real(sc, index, riid, out);
@@ -914,7 +1038,9 @@ bool fg12_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent rea
   const Config& cfg = config();
   const bool proxy = P.proxy == 1;
   int64_t arrive = now_us();
-  if (proxy) join();
+  // The previous frame's presents may still be running (they use the other texture set); the one
+  // before must be done before we reuse its set.
+  if (proxy) join(cfg.fg_sync == "gpu" ? 0 : 1);
 
   // NGX/D3D12 initialisation runs on its own thread; presents stay normal until it is ready.
   const bool want = cfg.fg_mode == "d3d12" && frames >= 300;
@@ -954,15 +1080,23 @@ bool fg12_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent rea
     bb->GetDesc(&bd);
     if (ensure_textures(bd)) {
       bool verify = cfg.fg_verify && verify_textures();
-      if (verify) {
-        if (S.verify_pending > 0 && --S.verify_pending == 0) verify_read();
-        S.imm->CopyResource(S.prev, S.real);  // S.real still holds the previous real frame
+      if (verify && S.verify_pending > 0 && --S.verify_pending == 0) verify_read();
+      if (cfg.fg_sync != "gpu") {
+        // Frames alternate between two texture sets; the one we're about to overwrite was last read
+        // and written by the evaluation two frames ago (normally long done).
+        swap_sets();
+        if (S.fence12->GetCompletedValue() < S.eval_v) {
+          ++S.perf_cpu_waits;
+          wait_eval(S.eval_v, S.game_event, 200);
+        }
       }
+      ID3D11Texture2D* prev_real = cfg.fg_sync != "gpu" ? S.alt_real : nullptr;  // previous real frame
       S.imm->CopyResource(S.real, bb);
       if (generate(in, bb)) {
         if (verify && S.verify_pending <= 0 && now_us() - S.verify_last > 2000000) {
           S.verify_last = now_us();
-          S.imm->CopyResource(S.stage[0], S.prev);
+          S.imm->CopyResource(S.stage[0], prev_real ? prev_real : S.real);
+          wait_eval(S.eval_v, S.game_event, 200);
           S.imm->CopyResource(S.stage[1], S.out.t11);
           S.imm->CopyResource(S.stage[2], S.real);
           S.verify_pending = 4;
@@ -973,12 +1107,14 @@ bool fg12_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent rea
           enqueue(sc, real, sync, flags, half, cfg.fg_show, arrive);
           *hr = P.hr;
         } else {
+          if (proxy) join(0);
           ID3D11Texture2D* dst = proxy ? real_backbuffer(sc) : bb;
           if (dst) {
-            fill(dst, true, cfg.fg_show);
+            if (cfg.fg_sync != "gpu") wait_eval(S.eval_v, S.game_event, 200);
+            fill(dst, true, cfg.fg_show, S.out.t11, S.real);
             *hr = real(sc, sync, flags);
             if (half > 0) wait_until(now_us() + half);
-            fill(dst, false, cfg.fg_show);
+            fill(dst, false, cfg.fg_show, S.out.t11, S.real);
             *hr = real(sc, sync, flags);
             if (proxy) dst->Release();
           }
@@ -996,7 +1132,8 @@ bool fg12_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent rea
     safe_release(in.hudless);
   }
   if (!done && proxy && bb) {
-    // A normal present of the game's frame.
+    // A normal present of the game's frame (after any queued FG presents).
+    join(0);
     if (ID3D11Texture2D* swap_bb = real_backbuffer(sc)) {
       P.ctx->CopyResource(swap_bb, bb);
       swap_bb->Release();

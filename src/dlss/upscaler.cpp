@@ -1,4 +1,5 @@
 #include "dlss/upscaler.h"
+#include "core/ctxgate.h"
 
 #include <windows.h>
 #include <d3d11_1.h>
@@ -449,6 +450,7 @@ void run_job(const Job& job) {
   ID3D10Multithread* mt = nullptr;
   if (FAILED(S.imm->QueryInterface(__uuidof(ID3D10Multithread), reinterpret_cast<void**>(&mt)))) mt = nullptr;
   if (mt) mt->Enter();
+  ++g_ctx_gate_exempt;  // holds the context lock: must not wait at the FG present gate
   // Run on a private context state so the game's bindings are untouched.
   ID3DDeviceContextState* prev = nullptr;
   S.imm1->SwapDeviceContextState(S.own_state, &prev);
@@ -480,6 +482,7 @@ void run_job(const Job& job) {
 
   S.imm1->SwapDeviceContextState(prev, nullptr);
   if (prev) prev->Release();
+  --g_ctx_gate_exempt;
   if (mt) {
     mt->Leave();
     mt->Release();

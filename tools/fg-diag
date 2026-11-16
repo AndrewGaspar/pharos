@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# fg-diag <instance> <label> [section.key=value ...]
+# Frame Generation diagnosis run: fresh launch (tools/fg-launch) with the overrides, lets it settle,
+# then prints the FG/Present/Reflex perf lines of a ~20 s window. Every wait has a deadline.
+set -uo pipefail
+name=$1 label=$2; shift 2
+here=$(cd "$(dirname "$0")/.." && pwd)
+L=/home/ajg/Games/aco-dlss-instances/$name/out/aco_dlss.log
+timeout 420 "$here/tools/fg-launch" "$name" "$@" >/dev/null 2>&1 || { echo "$label: launch failed"; exit 1; }
+end=$((SECONDS + 90))
+until grep -q "perf: reflex sleep\|perf: fg real" "$L" 2>/dev/null || ((SECONDS >= end)); do sleep 2; done
+sleep 15
+start=$(wc -l < "$L")
+sleep 20
+echo "##### $label ($*)"
+tail -n +"$start" "$L" | grep -E "perf: (fg|Present|reflex sleep)" | cut -c14- | tail -18
+nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv,noheader
