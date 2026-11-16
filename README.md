@@ -6,18 +6,22 @@ everything happens at the D3D11 API level through a `d3d11.dll` proxy.
 
 Status: DLSS SR working (all quality modes + DLAA). Reflex and Frame Generation are next.
 
-## Results (RTX 5070 Laptop, 2560x1600, Discovery Tour / Siwa, uncapped)
+## Results (RTX 5070 Laptop, 2560x1600, Discovery Tour / Siwa village, uncapped)
 
-| Mode | Render res | FPS | DLSS GPU cost |
-|---|---|---|---|
-| Native, game TAA | 2560x1600 | 97 | — |
-| DLAA (preset M) | 2560x1600 | 85 | 5.8 ms |
-| DLSS Quality | 1706x1066 | 135 | 3.0 ms |
-| DLSS Balanced | 1484x928 | 156 | 2.4 ms |
-| DLSS Performance | 1280x800 | ~175 (CPU-bound) | 1.9 ms |
+Render scale 0.5 (DLSS Performance, 1280x800 -> 2560x1600), same view, GPU-bound:
+
+| Mode | FPS | Upscaler GPU cost |
+|---|---|---|
+| No AA, bilinear upscale (reference) | 160 | 0.05 ms |
+| Game TAA | 150 | — |
+| DLSS, preset K (DLSS 4) | 140 | 1.6 ms |
+| DLSS, preset M (DLSS 4.5) | 129 | 2.2 ms |
+
+(Numbers before commit f6383a3 were inflated: a constant-buffer shadowing bug made ~70% of
+frames silently fall back to the game's TAA.)
 
 At the same render resolution DLSS is far cleaner than the game's TAA (which, below 100% scale,
-is simply bilinear-upscaled by the UI composite). The mod's hooks have no measurable CPU cost.
+is simply bilinear-upscaled by the UI composite).
 
 ## How it works
 
