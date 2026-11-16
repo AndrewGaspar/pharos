@@ -22,7 +22,7 @@ for c in $(podman ps --format '{{.Names}}' --filter status=running | grep '^aco-
   n=${c#aco-}; [[ $n == "$name" ]] && continue
   ini="$root/$n/$rel"; [[ -f $ini ]] || continue
   cp "$ini" "$root/$n/.gpu-exclusive.ini"; saved+=("$n")
-  sed -i "/^\[reflex\]/,\$ { s/^fps_limit=.*/fps_limit=5/; s/^mode=.*/mode=on/ }" "$ini"
+  sed -i "/^\[reflex\]/,/^\[/ { s/^fps_limit=.*/fps_limit=5/; s/^mode=.*/mode=on/ }" "$ini"
 done
 if ((${#saved[@]})); then echo "gpu-exclusive: throttled ${saved[*]} to 5 fps" >&2; sleep 4; fi
 "$@" 9>&-   # children must not inherit the lock fd (detached podman exec sessions would hold it forever)
