@@ -4,7 +4,8 @@ NVIDIA DLSS 4.5 Super Resolution for **Assassin's Creed Origins** (PC, v1.62), r
 TAA. Built from source with mingw; no game code is patched (the exe is Denuvo + VMProtect protected),
 everything happens at the D3D11 API level through a `d3d11.dll` proxy.
 
-Status: DLSS SR (all quality modes + DLAA) and NVIDIA Reflex working. Frame Generation is next.
+Status: DLSS SR (all quality modes + DLAA), NVIDIA Reflex and DLSS Frame Generation (D3D12 route via
+vkd3d-proton, F9 toggle) working; see [docs/FRAME_GENERATION.md](docs/FRAME_GENERATION.md).
 
 ## Results (RTX 5070 Laptop, 2560x1600, Discovery Tour / Siwa village, uncapped)
 
