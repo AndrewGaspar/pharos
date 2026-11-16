@@ -22,8 +22,15 @@ DXVK D3D11 device:
    copies → D3D11 reads back, all 32768 pixels correct).
 3. **Per frame**: D3D11 copies backbuffer, depth (R32_TYPELESS → shared R32_FLOAT), motion vectors
    and the HUD-less DLSS output into the shared textures, `Signal(v)`, flush; the D3D12 queue
-   `Wait(v)`, evaluates DLSS-G, `Signal(v+1)`; the D3D11 context `Wait(v+1)` before copying the
-   generated frame out. No CPU waits in steady state (ring of 3 allocators).
+   `Wait(v)`, evaluates DLSS-G, `Signal(v+1)`. **The D3D11 queue never waits for D3D12**
+   (`[fg] sync=cpu`, default): vkd3d-proton resolves a queue wait on a *shared* fence on the CPU in
+   its submission thread (`d3d12_command_queue_wait_shared`, to avoid wait-before-signal), so a
+   D3D11 GPU wait on the D3D12 signal (`sync=gpu`, the first version) put a CPU round trip into the
+   D3D11 queue every frame and everything the game submitted after it waited: at 2560x1600 that
+   halved the game's frame rate with the GPU 40–60 % busy. Instead frames alternate between two
+   texture sets; the present thread waits on the CPU for the D3D12 fence before copying a generated
+   frame out, and the game thread waits on the CPU only if the set it is about to overwrite (two
+   frames old) is still being evaluated.
 4. **NGX**: the core's `NVSDK_NGX_D3D12_Init` export takes *(app id, path, device, version,
    feature info)* — the version before the feature info, unlike the SDK header's inline overload
    (passing them in header order gives "installed NGX API is older than the one used by client").
@@ -36,7 +43,11 @@ DXVK D3D11 device:
    by both threads → multithread protection (`ID3D10Multithread`). **DXVK's
    `SwapDeviceContextState` doesn't take that lock** (all other context methods do), so the DLSS-SR
    upscaler holds it explicitly around its job; without that the game crashed within seconds in
-   DXVK's CS chunk emission (null chunk, two threads emitting). `present_thread=0` presents both
+   DXVK's CS chunk emission (null chunk, two threads emitting). That lock is an unfair spinlock, so
+   while the present thread copies + presents, the render thread waits at its next context hook
+   (`core/ctxgate.h`, `[fg] present_gate`). Present jobs queue (at most two outstanding, one per
+   texture set): the game doesn't wait for the previous frame's pacing, and a job superseded before
+   it starts presents only its real frame (counted as "generated frames dropped"). `present_thread=0` presents both
    inline with the pacing wait on the render thread (which then settles at frame time = 2x work,
    halving the base rate); `=2` uses the proxy with inline presents (a bisecting aid).
 6. **Init** (D3D12 device + NGX, ~1 s) runs on its own thread; presents stay normal until ready.
@@ -75,9 +86,48 @@ longer halved; output is ~1.6x FG-off. Input latency to the real frame grows by 
 target 2560x1600 the DLSS-G cost per frame is higher in absolute terms but smaller relative to the
 frame; not measured yet (instances run at 768x480).
 
+### At 2560x1600 (2026-11-16, after the `sync=cpu` fix)
+
+t1, 2560x1600, DLSS Performance (render 1280x800), Reflex on, Ultra High, gpu-exclusive,
+latency-bench (40 mouse-look injections); FG-off runs before and after the FG-on run:
+
+| | FG off (2 runs) | FG on (`mode=d3d12`, defaults) | FG on, first version (`sync=gpu`, coordinator's run) |
+|---|---|---|---|
+| game (real) frames/s | 110.2 / 115.3 | 78.5 | 58 |
+| presented frames/s | 110 / 115 | 159.5 (79.7 + 79.7) | 117 |
+| input → frame done, median (p10–p90) | 35.6 / 34.5 ms (32–45) | 54.7 ms (47–63) | 85.1 ms |
+| generated / real frame presented after the game's Present | – | +21.3 / +27.6 ms | +18.6 / +27.1 ms |
+| DLSS-G GPU time (wall, overlapping the game's work) | – | ~5 ms | 2.7 ms |
+| generated frames dropped | – | 0 | – |
+
+How the collapse was found (`tools/fg-diag`, per-step timing of the present thread, `[fg] skip`):
+the generated frame's `Present` blocked ~8 ms and the GPU was 40–60 % busy; `skip=eval` (fence
+round trip, no DLSS-G) was just as slow, `skip=d3d12` (no fences; copies + two presents) ran at
+115 fps with the GPU at 95 %. Presentation itself is not capped: `present_rate.exe` (a trivial
+frame, same swapchain shape) presents ~10000/s at 2560x1600 through DXVK + headless gamescope.
+Reflex off, `pacing=0`, `present_thread=0`, a higher frame latency or more swapchain buffers did
+not help; removing the D3D11 GPU wait did.
+
+Latency: the base rate drops ~30 % (DLSS-G at 2560x1600 plus copies on a GPU-bound frame) and the
+real frame reaches the screen later — the generated frame needs the game's frame finished on the
+GPU plus DLSS-G (~19 ms after the game's Present), the real frame follows half a frame later.
+Next steps to reduce it: Reflex/latency markers that describe the FG presents (DXVK logs frame-ID
+mismatches, so its low-latency pacing doesn't see our presents), presenting the generated frame as
+soon as DLSS-G finishes instead of polling from the present thread, fewer full-resolution copies
+(the real-frame copy could reuse the shared input texture).
+
+Verification at 2560x1600 (verify=1, running): `|gen-prev| 9.5, |gen-cur| 10.4, |prev-cur| 18.8`,
+generated strictly between its neighbours in 95 % of moving samples; images coherent.
+
+Checking on the user's display path (Hyprland 165 Hz, MangoHud, not gamescope): run
+`tools/interop-test/present_rate.exe 2560 1600 5` with the same Proton to get the raw present
+ceiling, then play with `[fg] mode=d3d12` and read `perf: fg12 present thread steps` in
+aco_dlss.log — a generated/real `Present` above ~1 ms means the display path throttles presents;
+MangoHud counts both presents (expect ~2x the game rate up to the refresh rate).
+
 Still open on this route: frame pacing quality not measured on a real display (this is headless
-gamescope); the p90 latency tail; HUD-less/UI handling (the HUD-less input is the DLSS output, the
-UI is interpolated with the scene); camera matrices are identity (DLSS-G relies on motion vectors).
+gamescope); latency (above); HUD-less/UI handling (the HUD-less input is the DLSS output, the UI is
+interpolated with the scene); camera matrices are identity (DLSS-G relies on motion vectors).
 
 ## Vulkan route (`mode=on`, not working)
 
