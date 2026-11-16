@@ -488,6 +488,7 @@ bool ensure_feature(uint32_t w, uint32_t h, uint32_t rw, uint32_t rh, VkFormat f
   p.set(NVSDK_NGX_DLSSG_Parameter_Width, w);
   p.set(NVSDK_NGX_DLSSG_Parameter_Height, h);
   p.set(NVSDK_NGX_DLSSG_Parameter_MultiFrameCount, 1u);  // read at create time
+  for (const auto& kv : config().fg_create_extra) p.set(kv.first.c_str(), kv.second);
   // Which numbering NGX expects for the backbuffer format on Vulkan is undocumented; [fg]
   // bb_format_dxgi=1 passes the DXGI value of the backbuffer instead of the VkFormat.
   unsigned int fmt_param = config().fg_bb_format_dxgi ? static_cast<unsigned int>(S.tex_format) : static_cast<unsigned int>(fmt);
@@ -519,12 +520,15 @@ const float kIdentity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
 
 // Generates the frame between the previous real frame and S.real (current) into S.interp.
 bool generate(const FgInputs& in, ID3D11Texture2D* swap_bb) {
-  NVSDK_NGX_Resource_VK bb{}, depth{}, mv{}, out{}, outreal{};
+  NVSDK_NGX_Resource_VK bb{}, depth{}, mv{}, out{}, outreal{}, hudless{};
   VkTex bb_t;
   // [fg] input=swapchain passes the game's (rotating) swapchain image itself; =copy our copy of it.
   ID3D11Texture2D* input = config().fg_input == "copy" ? S.real : swap_bb;
+  // [fg] swap_outputs=1 (debug): hand S.outreal to NGX as OutputInterpolated and S.interp as
+  // OutputReal, to tell "parameter not honoured" from "texture not writable".
+  bool swap = config().fg_swap_outputs;
   if (!ngx_res(input, false, &bb, &bb_t) || !ngx_res(in.depth, false, &depth) || !ngx_res(in.mv, false, &mv) ||
-      !ngx_res(S.interp, true, &out))
+      !ngx_res(swap ? S.outreal : S.interp, true, &out))
     return false;
   if (!ensure_feature(S.tex_w, S.tex_h, in.render_w, in.render_h, bb_t.info.format)) return false;
 
@@ -534,7 +538,13 @@ bool generate(const FgInputs& in, ID3D11Texture2D* swap_bb) {
   p.set(NVSDK_NGX_DLSSG_Parameter_Depth, static_cast<void*>(&depth));
   p.set(NVSDK_NGX_DLSSG_Parameter_MVecs, static_cast<void*>(&mv));
   p.set(NVSDK_NGX_DLSSG_Parameter_OutputInterpolated, static_cast<void*>(&out));
-  if (config().fg_show == "outreal" && ngx_res(S.outreal, true, &outreal)) {
+  // HUD-less colour: the DLSS output (the scene at display resolution before the UI composite).
+  if (config().fg_hudless && in.hudless && ngx_res(in.hudless, false, &hudless)) {
+    p.set(NVSDK_NGX_DLSSG_Parameter_HUDLess, static_cast<void*>(&hudless));
+    p.set(NVSDK_NGX_DLSSG_Parameter_HUDLessSubrectWidth, S.tex_w);
+    p.set(NVSDK_NGX_DLSSG_Parameter_HUDLessSubrectHeight, S.tex_h);
+  }
+  if ((config().fg_show == "outreal" || swap) && ngx_res(swap ? S.interp : S.outreal, true, &outreal)) {
     p.set(NVSDK_NGX_DLSSG_Parameter_OutputReal, static_cast<void*>(&outreal));
     p.set(NVSDK_NGX_DLSSG_Parameter_OutputRealSubrectWidth, S.tex_w);
     p.set(NVSDK_NGX_DLSSG_Parameter_OutputRealSubrectHeight, S.tex_h);
