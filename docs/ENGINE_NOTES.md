@@ -321,6 +321,8 @@ destructor unregistering from [RVA 0x52521f0]) <- 0xf8c5ce <- 0xf0f4e9 <- 0xf1f4
 4. story, vanilla, while gdb hardware breakpoints were pausing threads repeatedly.
 Abrupt mass spawn/despawn (instant teleports, debugger stalls) triggers it; it is not caused by the
 density settings. Long soaks must move the player normally (`tools/npc-re/walker.sh`), not teleport.
+Shipping candidate `npc_density=3 npc_distance=1`: 26-minute story-mode soak in Alexandria with
+the walker (229-353 spawned, cap 600), no hang.
 
 ### Dead ends
 
