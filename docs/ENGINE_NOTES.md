@@ -163,6 +163,20 @@ yaw 0 = +X, 90 = +Y.
   on the ground, the player's model stays invisible (only its shadow is drawn) until the character
   moves, so the player is placed 1 m above the ground and lands. The rotation rows are overwritten
   by the character controller (writing a heading has no effect).
+- **Story mode** behaves the same (same entity class, same static chains; 4.8 km Alexandria ->
+  Memphis tested). The table coordinates belong to the **Egypt** world: the DLC regions are separate
+  worlds with their own coordinates (The Hidden Ones = Sinai; the user's latest save is there), and
+  placing the player at Egypt coordinates in Sinai drops it through empty terrain until the game
+  respawns it. Also the story's terrain differs in places (Giza's sand is ~20 m higher than in the
+  Discovery Tour, so the DT Sphinx point is underground). Once the player is airborne the
+  character's physics body owns the position (entity writes stop taking, also when rewritten every
+  frame), so a bad target can't be rescued; the game respawns the player at a nearby safe point.
+  World switch: map -> Atlas (Tab) -> hover a region's fast-travel icon -> hold right mouse.
+- **Saves**: the game keeps everything in `savegames/<account>/3539/{1..6}.save` (pairs of file +
+  backup): 1/2 profile/settings (2.5 KB), **3/4 the story** (~108 KB, autosaved e.g. on entering a
+  named location, which a teleport does), 5/6 Discovery Tour state (~40 KB, written on exit).
+  There is no manual save on PC. `scripts/aco fixture-save` / `scripts/aco fixture` archive and
+  install all six; `scripts/aco-dt <inst> --story` continues the first profile.
 - **Arrival**: the player hangs at the target while collision streams in (about 1 s across the
   map), then falls the 1 m. Textures/LODs are complete within ~5 s at 768x480. NPCs keep spawning
   for longer (compare with the same place after the game's own fast travel).

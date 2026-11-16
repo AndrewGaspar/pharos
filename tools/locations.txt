@@ -3,12 +3,14 @@
 # position on the ground (the mod places the player 1 m above it). Coordinates were read with
 # tools/where after reaching each place once through the Discovery Tour map (fast travel to the tour
 # station named in the description); the camera heading is the one fast travel arrives with.
+# They are Egypt-world coordinates (Discovery Tour and story mode in Egypt, not the DLC worlds).
 alexandria-port     -691.024  3568.871 207.102  -89.4 -8   # Alexandria harbour market stalls (DT "Alexandria: A Commercial Hub")
 alexandria-dt-start -749.725  3574.178 207.752   -4.9 -8   # Discovery Tour spawn in Alexandria, street towards the harbour
-giza-sphinx          898.180   157.941 212.163   90.0 -8   # Giza: Great Sphinx and pyramid (DT "The Riddles of the Sphinx")
+giza-sphinx          898.180   157.941 212.163   90.0 -8   # Giza: Great Sphinx and pyramid (DT "The Riddles of the Sphinx"); DT only, see giza-story
 memphis-temple      1472.273 -1127.190 201.865   32.5 -8   # Memphis: temple forecourt (DT "Mummies of Ancient Egypt")
 krokodilopolis      -890.474 -4244.940 202.077  -91.6 -8   # Krokodilopolis street, Faiyum (DT "Rediscovering Egypt")
 faiyum-dionysias   -2394.983 -3369.929 209.276  178.6 -8   # Dionysias temple, west Faiyum oasis (fast travel point)
 desert-black       -4564.138 -3518.307 227.835  150.1 -8   # Black Desert, open rocky desert (DT "Deserts of Egypt")
 siwa               -6398.568  -260.095 129.999   52.8 -8   # Siwa village temple avenue (DT "Ancient Egyptian Hieroglyphs")
 cyrene             -5778.489  3724.313 260.520    8.0 -8   # Cyrene: Greek city street towards the hippodrome (fast travel point)
+giza-story          866.300   178.600 235.339  -32.0 -8   # Giza for STORY mode (sand is ~20 m higher there; from a game respawn point near the Sphinx)

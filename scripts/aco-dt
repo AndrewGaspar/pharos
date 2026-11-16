@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
-# aco-dt <instance> [location] — drive a freshly launched game (aco game ...) into Discovery Tour
-# free roam; with a location (tools/teleport <inst> list), teleport there afterwards.
+# aco-dt <instance> [--story] [location] — drive a freshly launched game (aco game ...) into
+# Discovery Tour free roam; with a location (tools/teleport <inst> list), teleport there afterwards.
+# --story: continue the story instead (main menu > Play > first profile, which loads its latest
+# save; e.g. a fixture installed with `scripts/aco fixture`).
 #
 # Screen states are recognised by comparing fixed regions of the (2560x1600-scaled) display against
 # reference crops in tools/ref/. Input is only sent when a state is positively recognised, so we
 # never press Return on an unknown screen (which could e.g. load a story save).
 set -euo pipefail
-name=${1:?instance}
-location=${2:-}
+name=${1:?instance}; shift
+story=0; [[ ${1:-} == --story ]] && { story=1; shift; }
+location=${1:-}
 here=$(cd "$(dirname "$0")/.." && pwd)
 ref=$here/tools/ref
 tmp=$(mktemp -d)
@@ -57,7 +60,12 @@ while ((SECONDS < deadline)); do
   st=$(classify)
   case $st in
     title) echo "aco-dt: title -> pressing Return"; press Return; sleep 8;;
-    menu)  echo "aco-dt: main menu -> Discovery Tour"; click 380 592; sleep 3
+    menu)  if ((story)); then
+             echo "aco-dt: main menu -> Play -> first profile (continue story)"
+             click 507 263; sleep 3; click 533 400; sleep 3
+           else
+             echo "aco-dt: main menu -> Discovery Tour"; click 380 592; sleep 3
+           fi
            # Wait for the player to be in the world (the mod answers tools/where; while loading the
            # player stands in the Animus void near (-100, 33.5, 0.2)), then let streaming settle.
            # Without the mod's teleport support this falls back to a fixed wait.
@@ -68,7 +76,7 @@ while ((SECONDS < deadline)); do
              sleep 2
            done
            if ((in_world)); then sleep 12; else sleep $((45 - (SECONDS - t_load) > 0 ? 45 - (SECONDS - t_load) : 0)); fi
-           echo "aco-dt: in Discovery Tour ($((SECONDS - t_load)) s after selecting it)"
+           echo "aco-dt: in $( ((story)) && echo story mode || echo Discovery Tour) ($((SECONDS - t_load)) s after selecting it)"
            if [[ -n $location ]]; then "$here/tools/teleport" "$name" "$location" --settle 5 || exit 1; fi
            exit 0;;
     *)     sleep 3;;

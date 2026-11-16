@@ -107,7 +107,8 @@ void write_file(const wchar_t* name, const char* text) {
 
 // The write happens on the render thread while the simulation thread updates the entity, so a
 // single write can be lost; rewriting it every frame instead fights the character controller
-// (it derives motion from the displacement and the player gets flung or respawned). So: write
+// (it derives motion from the displacement and the player gets flung or respawned), and once the
+// player is airborne the physics body owns the position (entity writes no longer take). So: write
 // once, check a few frames later, and only rewrite if it didn't take or the player fell through.
 enum class Phase { Idle, Place, Verify, Watch };
 struct {
