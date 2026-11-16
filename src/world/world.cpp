@@ -57,7 +57,7 @@ void f_set(uint8_t* p, UINT off, float v) { memcpy(p + off, &v, 4); }
 void world_on_culling_dispatch(ID3D11DeviceContext* ctx, const std::function<void()>& dispatch) {
   const Config& cfg = config();
   g_dispatches.fetch_add(1, std::memory_order_relaxed);
-  bool active = cfg.world_lod_distance != 1.0f || cfg.world_min_triangle_area != 1.0f;
+  bool active = cfg.world_lod_distance != 1.0f;
 
   ID3D11DeviceContext1* c1 = nullptr;
   ctx->QueryInterface(__uuidof(ID3D11DeviceContext1), reinterpret_cast<void**>(&c1));
@@ -91,7 +91,6 @@ void world_on_culling_dispatch(ID3D11DeviceContext* ctx, const std::function<voi
   }
   if (cfg.world_lod_distance > 0.0f)
     f_set(data, kLODDistanceScale, f_at(data, kLODDistanceScale) / cfg.world_lod_distance);
-  f_set(data, kMinTriangleArea, f_at(data, kMinTriangleArea) * cfg.world_min_triangle_area);
 
   D3D11_MAPPED_SUBRESOURCE m{};
   if (SUCCEEDED(ctx->Map(own, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
@@ -115,10 +114,9 @@ void world_on_present() {
   if (last) {
     const Config& cfg = config();
     ACO_LOG("world: %u culling dispatches, %u patched, %u unshadowed | game LODDistanceScale=%g bias=%g "
-            "FOVDistanceFactor=%g MinTriangleArea=%g | lod_distance=%g min_triangle_area=%g",
+            "FOVDistanceFactor=%g MinTriangleArea=%g | lod_distance=%g",
             g_dispatches.exchange(0), g_patched.exchange(0), g_unshadowed.exchange(0), g_seen_scale.load(),
-            g_seen_bias.load(), g_seen_fov.load(), g_seen_tri.load(), cfg.world_lod_distance,
-            cfg.world_min_triangle_area);
+            g_seen_bias.load(), g_seen_fov.load(), g_seen_tri.load(), cfg.world_lod_distance);
   }
   last = now;
 }

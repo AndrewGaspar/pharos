@@ -15,8 +15,8 @@ namespace aco {
 // culled. MiscCullingConsts (b8) also holds MinTriangleArea, the small-object cull threshold.
 //
 // [world] lod_distance=k divides GeometricObjectLODDistanceScale by k: every LOD transition and
-// the cull distance move k times further out. [world] min_triangle_area=m multiplies
-// MinTriangleArea (lower draws smaller/more distant details). Applied per dispatch: the game's
+// the cull distance move k times further out. (MinTriangleArea is 0 in this game, i.e. unused.)
+// Applied per dispatch: the game's
 // b8 contents (read through the CB shadow) are copied into our own constant buffer with the
 // fields changed, bound for that dispatch only, and the game's binding is restored.
 void world_on_culling_dispatch(ID3D11DeviceContext* ctx, const std::function<void()>& dispatch);

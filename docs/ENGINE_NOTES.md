@@ -113,3 +113,26 @@ dt at +0x20) is the real frame delta; the throttle is only this table.
 cloth steps at least once per rendered frame. Verified with `mode=scale scale=20` (cloth visibly
 freezes for ~0.3 s between steps). The code is ordinary (not virtualized); the patch only touches
 the read-only data table after checking its values and the referencing instruction.
+
+## Graphics settings and draw distance
+
+- The ACO.ini quality keys are a 24-entry settings table (descriptor table at RVA 0x49af000, 0x2c
+  bytes each: level count, default, flag, name). Current levels live in a settings object
+  (`levels[idx]` at +0x1c + 4*idx; getter RVA 0xa58ec0, setter 0xa668b0); the applied copy is a
+  global array at RVA 0x48717b0 (Environment = idx 10 at 0x48717d8, Shadow = 16 at 0x48717f0).
+- **Environment** only scales streaming memory pools: x1 for levels 0-3, x2 for 4-5 (RVA 0x89a970,
+  reader `GetEnvironmentLevel` 0x8983c0). It is not a distance scale.
+- **Clutter** maps to a clutter spacing factor (RVA 0x13cd0f0: 100 / 2 / 1.25 / 1 / 0.8 for levels
+  0-4; lower = denser).
+- Character, Shadow, CrowdDensity, ... are not read by engine code directly; CrowdDensity, Culling,
+  Lighting, Particle, PostEffect and Wind have a single level on PC.
+- The ~45 `DisplayOptionSection` classes (LODOptions, ShadowRenderSettings, CullingOptions, ...;
+  vtables mapped in tools/lod-re/children.py) exist as 4 identical template blocks + 1 active
+  copy, identical across quality presets, and are not read live (writes have no effect).
+- **World geometry LOD / culling is GPU-driven**: ~16k indirect draws per frame; the instance
+  culling compute shaders (12 permutations, cbuffer `MiscCullingConsts` at b8) compute
+  `d' = (dist * objScale * FOVDistanceFactor + GeometricObjectLODDistanceBias) *
+  GeometricObjectLODDistanceScale` and select/cull by the mesh's LOD ranges. Game values: scale 1,
+  bias 0, FOV factor ~1.0055, MinTriangleArea 0. `[world] lod_distance` patches the scale.
+- Characters (NPCs) are not part of that GPU path (they stay visible when world LOD is cut).
+- Shadow cascades are set up on the CPU (shaders only see cascade matrices / fade params).

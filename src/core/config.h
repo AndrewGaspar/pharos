@@ -40,8 +40,7 @@ struct Config {
   std::string reflex_marker_set = "minimal";  // [reflex] marker_set: minimal | full (experiments)
   bool reflex_optimize = false;   // [reflex] optimize: bUseMarkersToOptimize
   bool reflex_probe = false;
-  float world_lod_distance = 1.0f;        // [world] lod_distance
-  float world_min_triangle_area = 1.0f;   // [world] min_triangle_area      // [reflex] probe (input thread diagnostics)
+  float world_lod_distance = 1.0f;        // [world] lod_distance      // [reflex] probe (input thread diagnostics)
   std::string cloth_mode = "game";  // [cloth] mode: game | render | scale (see cloth/cloth.h)
   float cloth_scale = 1.0f;         // [cloth] scale (mode=scale, diagnostics)
 };

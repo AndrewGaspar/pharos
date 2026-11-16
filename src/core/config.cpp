@@ -54,7 +54,6 @@ Config load() {
   c.reflex_fps_limit = read_float(L"fps_limit", 0.0f, L"reflex");
   c.reflex_probe = read_float(L"probe", 0.0f, L"reflex") != 0.0f;
   c.world_lod_distance = read_float(L"lod_distance", 1.0f, L"world");
-  c.world_min_triangle_area = read_float(L"min_triangle_area", 1.0f, L"world");
   c.reflex_markers = read_float(L"markers", 1.0f, L"reflex") != 0.0f;
   c.reflex_marker_set = read_str(L"marker_set", "minimal", L"reflex");
   c.toggle_key = read_str(L"toggle_key", "F10");
@@ -72,7 +71,7 @@ bool same(const Config& a, const Config& b) {
          a.reflex_probe == b.reflex_probe && a.reflex_markers == b.reflex_markers &&
          a.reflex_marker_set == b.reflex_marker_set && a.reflex_optimize == b.reflex_optimize &&
          a.toggle_key == b.toggle_key && a.cloth_mode == b.cloth_mode && a.cloth_scale == b.cloth_scale &&
-         a.world_lod_distance == b.world_lod_distance && a.world_min_triangle_area == b.world_min_triangle_area;
+         a.world_lod_distance == b.world_lod_distance;
 }
 } // namespace
 
