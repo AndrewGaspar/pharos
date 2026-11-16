@@ -286,6 +286,8 @@ on a lock in a Havok object destructor (RVA 0x2dbf530 -> 0x2e169d0 -> 0x2e78ef0,
 from the registry at [RVA 0x52521f0]). The same configuration then ran 5+ minutes without
 problems on a fresh launch. A lock-order deadlock in Havok object teardown that heavy spawn/despawn
 churn makes more likely is the best guess; not proven to be caused by the higher count itself.
+After that: story mode, `npc_density=5 npc_distance=2`, 12-minute soak with 8 teleports between the
+Alexandria harbour (535-607 spawned) and Memphis (130-306), 84-89 fps, no hang (`tools/npc-re/soak.sh`).
 
 ### Dead ends
 
