@@ -5,8 +5,13 @@ import sys, time
 from live import Live
 
 L = Live()
-mgr = [a for a in L.vt(0x363beb0) if L.q(a + 0x10) and L.q(L.q(a + 0x10)) == L.base + 0x363cc80]
-mgr = mgr[-1]
+def find_mgr():
+    # Same chain the game uses: [rva 0x4c27f18] -> +0xc0 World -> +0x13c0 -> +0x38 SpawningManager.
+    w = L.q(L.q(L.base + 0x4c27f18) + 0xc0)
+    m = L.q(L.q(w + 0x13c0) + 0x38)
+    assert L.q(m) == L.base + 0x363beb0, 'unexpected SpawningManager vtable'
+    return m
+mgr = find_mgr()
 n = int(sys.argv[1]) if len(sys.argv) > 1 else 1
 dt = float(sys.argv[2]) if len(sys.argv) > 2 else 5
 for i in range(n):

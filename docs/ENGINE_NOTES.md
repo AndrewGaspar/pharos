@@ -250,6 +250,34 @@ view frustum). Beyond that, more NPCs would need more MetaAI units per objective
 `MetaAIObjectiveSpawnerCustomData`, 3962 instances, unit lists at +0x7c) or more stations, i.e.
 changing what the virtual population is built from at load; not attempted.
 
+### Mod settings (`src/world/npc.cpp`) and measurements
+
+- `[world] npc_density=k`: SpawnSettings+0x38 = round(game value * k), checked every second
+  (re-applied after a world reload; restored at k=1). Pointer chain validated by vtables, the three
+  readers' instruction bytes are checked once (v1.62 only; otherwise disabled).
+- `[world] npc_distance=k`: SpawnSettings+0x70 = 1.0 * k, plus a background thread (idle priority,
+  every 10 s while active) that finds `SphereStrategyParams` (vtable RVA 0x37a48f8, +0x28 == 4) in
+  private RW memory and writes spawn/despawn distance = original * k (originals tracked per object;
+  all reads/writes through Read/WriteProcessMemory so memory freed meanwhile cannot fault). ~700-950
+  templates live at a time in Alexandria.
+
+2560x1600, DLSS Performance + FG, Ultra High (Environment=5 -> game cap 240), t1 under
+`tools/gpu-exclusive`, 120 s settle per step, fixed camera:
+
+| place | density / distance | spawned | real fps | game VRAM |
+|---|---|---|---|---|
+| Story, Alexandria harbour market (fixture `story-alexandria-port`) | 1 / 1 | 208 | 85.2 | 4915 MiB |
+| | 3 / 1 | 343 | 84.8 | 4979 MiB |
+| | 5 / 2 | 579 (2.8x) | 85.7 | 4979 MiB |
+| Discovery Tour, Alexandria street (DT start) | 1 / 1 | 191 | 79.8 | 4465 MiB |
+| | 3 / 1 | 336 | 78.2 | 4465 MiB |
+| | 5 / 2 | 563 (2.95x) | 81.4 | 4465 MiB |
+
+No measurable frame-rate cost at this point: the game stays GPU-bound (Reflex still sleeps
+0.4-2.5 ms per frame) and the busiest task threads go from ~63% to ~70% of a core. Discovery Tour
+and story mode use the same spawning system and budget (same counts at the same cap); DT just has
+no hostile/quest population.
+
 ### Stability
 
 One hang in ~4 test runs: ~40 s after jumping from ~415 to ~566 spawned within seconds
