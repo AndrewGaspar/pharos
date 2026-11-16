@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# cloth-walk <instance> <label> [frames=24] [key=w]
+# Holds W (character runs, camera follows), dumps consecutive frames via the mod's framedump
+# trigger, and builds a contact sheet of the player character (768x480 instances) to
+# build/cloth/<label>.png plus per-frame hem/arm diffs (tools/framediff.py).
+set -euo pipefail
+name=$1 label=$2 n=${3:-24} key=${4:-w}
+here=$(cd "$(dirname "$0")/.." && pwd)
+O=/home/ajg/Games/aco-dlss-instances/$name/out
+out=$here/build/cloth; mkdir -p "$out"
+rm -rf "$O/frames"
+"$here/scripts/aco" keys "$name" keydown "$key"
+sleep 1.5
+echo "$n" > "$O/framedump"
+for _ in $(seq 60); do
+  [[ -f $O/frames/times.txt ]] && (( $(wc -l < "$O/frames/times.txt") >= n )) && break
+  sleep 0.5
+done
+"$here/scripts/aco" keys "$name" keyup "$key"
+rm -rf "$out/$label"; mkdir -p "$out/$label"
+for ((i = 0; i < n; i++)); do
+  f=$(printf %04d "$i")
+  magick "$O/frames/$f.ppm" -crop 140x150+315+215 +repage -resize 200% -gravity north -background black \
+    -splice 0x18 -fill white -pointsize 16 -annotate +0+0 "$i" "$out/$label/$f.png"
+done
+magick montage "$out/$label"/*.png -tile 12x -geometry +2+2 -background gray "$out/$label.png"
+cp -r "$O/frames" "$out/$label/frames"
+python3 "$here/tools/framediff.py" "$out/$label/frames" hem=345,290,75,35 arm=318,250,30,55 | tail -3
+echo "$out/$label.png"

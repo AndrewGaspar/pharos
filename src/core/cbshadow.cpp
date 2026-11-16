@@ -12,6 +12,7 @@
 
 #include "core/hook.h"
 #include "core/log.h"
+#include "core/mapstats.h"
 #include "core/vtidx.h"
 
 namespace aco {
@@ -83,6 +84,7 @@ HRESULT STDMETHODCALLTYPE hk_Map(ID3D11DeviceContext* self, ID3D11Resource* res,
                                  D3D11_MAPPED_SUBRESOURCE* out) {
   HRESULT hr = orig<decltype(hk_Map)>(self, Context_Map)(self, res, sub, type, flags, out);
   if (SUCCEEDED(hr) && out && (type == D3D11_MAP_WRITE_DISCARD || type == D3D11_MAP_WRITE_NO_OVERWRITE)) {
+    mapstats_note(res, false);
     if (uint32_t size = shadow_size(res)) {
       std::lock_guard lock(g_mutex);
       auto& s = g_shadows[{self, res}];
@@ -109,6 +111,7 @@ void STDMETHODCALLTYPE hk_Unmap(ID3D11DeviceContext* self, ID3D11Resource* res, 
 void STDMETHODCALLTYPE hk_UpdateSubresource(ID3D11DeviceContext* self, ID3D11Resource* res, UINT sub, const D3D11_BOX* box,
                                             const void* data, UINT rowpitch, UINT depthpitch) {
   if (data) {
+    mapstats_note(res, true);
     if (uint32_t size = shadow_size(res)) {
       std::lock_guard lock(g_mutex);
       auto& s = g_shadows[{self, res}];

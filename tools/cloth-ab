@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# cloth-ab <instance> [fps=165]
+# With the instance's frame cap raised, captures the running player character with
+# [cloth] mode=game and mode=render back to back (tools/cloth-walk, key s). Run it through
+# tools/gpu-exclusive so the frame rate is real.
+set -euo pipefail
+name=$1 fps=${2:-165}
+here=$(cd "$(dirname "$0")/.." && pwd)
+gi="/home/ajg/Games/aco-dlss-instances/$name/prefix/drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher/games/Assassin's Creed Origins/aco_dlss.ini"
+sed -i "/^\[reflex\]/,/^\[/ s/^fps_limit=.*/fps_limit=$fps/" "$gi"
+for mode in game render game render; do
+  sed -i "/^\[cloth\]/,\$ s/^mode=.*/mode=$mode/" "$gi"
+  sleep 2
+  # turn around between runs so the character keeps running in open ground
+  "$here/scripts/aco" keys "$name" keydown w; sleep 2.0; "$here/scripts/aco" keys "$name" keyup w; sleep 0.4
+  i=1; while [[ -d $here/build/cloth/ab-$mode-$i ]]; do i=$((i + 1)); done
+  "$here/tools/cloth-walk" "$name" "ab-$mode-$i" 24 s | tail -1
+done
+sed -i "/^\[reflex\]/,/^\[/ s/^fps_limit=.*/fps_limit=120/" "$gi"

@@ -16,6 +16,10 @@
 #include "core/latency.h"
 #include "reflex/reflex.h"
 #include "core/dump.h"
+#include "core/framedump.h"
+#include "core/mapstats.h"
+#include "core/peek.h"
+#include "cloth/cloth.h"
 #include "dlss/upscaler.h"
 #include "trace/trace.h"
 
@@ -62,6 +66,10 @@ HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain* self, UINT sync, UINT flags
     latency_on_present_begin(self);
     reflex_on_present_begin(self);
     dump_poll();
+    framedump_on_present(self);
+    mapstats_on_present();
+    peek_on_present();
+    cloth_on_present();
   }
   LARGE_INTEGER a, b, f;
   QueryPerformanceCounter(&a);
