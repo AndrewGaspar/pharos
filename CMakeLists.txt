@@ -27,6 +27,9 @@ add_library(aco_d3d11 SHARED
   src/core/peek.cpp
   src/cloth/cloth.cpp
   src/reflex/reflex.cpp
+  src/fg/fg.cpp
+  src/fg/fg_d3d12.cpp
+  src/fg/vk_device_ext.cpp
   src/core/ctxhooks.cpp
   src/dlss/ngx.cpp
   src/dlss/kernels.cpp
@@ -35,7 +38,8 @@ add_library(aco_d3d11 SHARED
   src/proxy.cpp
   src/d3d11.def)
 set_target_properties(aco_d3d11 PROPERTIES OUTPUT_NAME d3d11 PREFIX "")
-target_include_directories(aco_d3d11 PRIVATE src ${DLSS_SDK}/include)
+set(VULKAN_HEADERS ${CMAKE_SOURCE_DIR}/third_party/Vulkan-Headers-1.4.329 CACHE PATH "Khronos Vulkan-Headers root")
+target_include_directories(aco_d3d11 PRIVATE src ${DLSS_SDK}/include ${VULKAN_HEADERS}/include)
 target_compile_definitions(aco_d3d11 PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE __USE_MINGW_ANSI_STDIO=1)
 target_compile_options(aco_d3d11 PRIVATE -Wall -Wno-unknown-pragmas -fno-strict-aliasing)
 target_link_options(aco_d3d11 PRIVATE -static -static-libgcc -static-libstdc++ -Wl,--enable-stdcall-fixup)

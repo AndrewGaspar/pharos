@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# fg-launch <instance> [section.key=value ...]
+# Frame Generation dev loop: fresh game launch with build/mod plus ini overrides, waits until the
+# mod's Frame Generation is running (new log only), then drives the menus into Discovery Tour.
+set -euo pipefail
+name=$1; shift
+here=$(cd "$(dirname "$0")/.." && pwd)
+I=/home/ajg/Games/aco-dlss-instances/$name
+mod=$(mktemp -d); cp -a "$here/build/mod/." "$mod/"
+for kv in "$@"; do
+  sec=${kv%%.*}; rest=${kv#*.}; key=${rest%%=*}; val=${rest#*=}
+  python3 -I - "$mod/aco_dlss.ini" "$sec" "$key" "$val" <<'PY'
+import sys
+p, sec, key, val = sys.argv[1:]
+lines = open(p).read().split("\n"); cur = None; done = False
+for i, l in enumerate(lines):
+    s = l.strip()
+    if s.startswith("["): cur = s[1:-1]
+    elif cur == sec and s.split("=")[0] == key: lines[i] = f"{key}={val}"; done = True
+if not done: sys.exit(f"no {sec}.{key} in {p}")
+open(p, "w").write("\n".join(lines))
+PY
+done
+"$here/scripts/aco" kill-game "$name" >/dev/null 2>&1 || true
+rm -f "$I/out/aco_dlss.log" "$I"/out/nvngx*.log
+"$here/scripts/aco" game "$name" --mod "$mod" >/dev/null
+rm -rf "$mod"
+"$here/scripts/aco-dt" "$name"

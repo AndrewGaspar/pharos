@@ -2,6 +2,7 @@
 
 #include <windows.h>
 #include <d3d11_1.h>
+#include <d3d10.h>
 #include <dxgi.h>
 #include <shlobj.h>
 
@@ -188,6 +189,11 @@ struct State {
   bool ngx_tried = false, ngx_ok = false;
   bool reset_next = true;
   uint64_t last_job_frame = 0;
+  // Last job executed (for Frame Generation).
+  ID3D11Resource* fg_depth = nullptr;
+  uint32_t fg_rw = 0, fg_rh = 0;
+  float fg_jx = 0, fg_jy = 0;
+  uint64_t fg_frame = 0;
   int eval_failures = 0;
   LARGE_INTEGER last_eval_time{};
 
@@ -437,6 +443,12 @@ void run_job(const Job& job) {
             job.render_w, job.render_h, dw, dh, job.jitter_x, job.jitter_y, static_cast<void*>(job.depth));
   if (!dw || !dh) return;
   if (!ensure_output(dw, dh)) return;
+  // DXVK's SwapDeviceContextState doesn't take the context's multithread lock (other methods do), and
+  // with Frame Generation's present thread ([fg] present_thread=1) another thread uses the immediate
+  // context: hold the lock for the whole job. A no-op unless multithread protection is on.
+  ID3D10Multithread* mt = nullptr;
+  if (FAILED(S.imm->QueryInterface(__uuidof(ID3D10Multithread), reinterpret_cast<void**>(&mt)))) mt = nullptr;
+  if (mt) mt->Enter();
   // Run on a private context state so the game's bindings are untouched.
   ID3DDeviceContextState* prev = nullptr;
   S.imm1->SwapDeviceContextState(S.own_state, &prev);
@@ -444,6 +456,14 @@ void run_job(const Job& job) {
   const Config& cfg = config();
   bool done = false;
   S.n_jobs++;
+  if (job.depth) job.depth->AddRef();
+  if (S.fg_depth) S.fg_depth->Release();
+  S.fg_depth = job.depth;
+  S.fg_rw = job.render_w;
+  S.fg_rh = job.render_h;
+  S.fg_jx = job.jitter_x * cfg.jitter_x;
+  S.fg_jy = job.jitter_y * cfg.jitter_y;
+  S.fg_frame = S.frame.load();
   int timer = S.gpu_timer.start(S.imm);
   if (cfg.debug == "motion") {
     blit(S.mv_srv, job.render_w, job.render_h, kernels::kBlitMotion, 0.05f);
@@ -460,6 +480,10 @@ void run_job(const Job& job) {
 
   S.imm1->SwapDeviceContextState(prev, nullptr);
   if (prev) prev->Release();
+  if (mt) {
+    mt->Leave();
+    mt->Release();
+  }
 }
 
 void split_here(ID3D11DeviceContext* ctx, std::shared_ptr<Job> job) {
@@ -821,6 +845,23 @@ bool upscaler_on_execute_command_list(ID3D11DeviceContext* ctx, ID3D11CommandLis
   }
   orig_ExecuteCommandList(ctx, cl, restore);
   u->Release();
+  return true;
+}
+
+bool upscaler_fg_inputs(FgInputs* o) {
+  // Only valid when DLSS ran for the frame being presented.
+  if (!S.mv || !S.fg_depth || !S.out || S.fg_frame + 1 < S.frame.load()) return false;
+  o->mv = S.mv;
+  o->mv->AddRef();
+  o->depth = S.fg_depth;
+  o->depth->AddRef();
+  o->hudless = S.out;
+  o->hudless->AddRef();
+  o->render_w = S.fg_rw;
+  o->render_h = S.fg_rh;
+  o->jitter_x = S.fg_jx;
+  o->jitter_y = S.fg_jy;
+  o->frame = S.fg_frame;
   return true;
 }
 

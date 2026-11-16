@@ -12,3 +12,8 @@ NVAPI_COMMIT=51e5aae4bc40c3ccd3fb7d4dfd94256e7bfc496e
 if [[ ! -d nvapi-$NVAPI_COMMIT ]]; then
   curl -L https://github.com/NVIDIA/nvapi/archive/$NVAPI_COMMIT.tar.gz | tar xz
 fi
+# Khronos Vulkan headers (Apache-2.0/MIT) for the Frame Generation path (NGX Vulkan on DXVK's device).
+VKH=1.4.329
+if [[ ! -d Vulkan-Headers-$VKH ]]; then
+  curl -L https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/v$VKH.tar.gz | tar xz
+fi

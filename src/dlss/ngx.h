@@ -5,6 +5,8 @@
 
 #include <string>
 
+struct ID3D12Resource;
+
 namespace aco::ngx {
 
 // Thin dynamic binding to the NVIDIA driver's NGX core (_nvngx.dll). We don't link NVIDIA's static
@@ -22,6 +24,7 @@ class Params {
 
   void set(const char* name, void* v);
   void set(const char* name, ID3D11Resource* v);
+  void set(const char* name, ID3D12Resource* v);
   void set(const char* name, int v);
   void set(const char* name, unsigned int v);
   void set(const char* name, float v);
@@ -37,6 +40,8 @@ class Params {
 };
 
 bool init(ID3D11Device* dev, const std::wstring& data_path);
+// The driver's NGX core (_nvngx.dll), loaded on first use (also by the Vulkan Frame Generation path).
+HMODULE core_module();
 void shutdown(ID3D11Device* dev);
 bool initialized();
 bool dlss_available();
