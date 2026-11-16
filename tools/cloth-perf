@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# cloth-perf <instance> — uncapped fps with [cloth] mode=game vs render, alternating (run through
+# tools/gpu-exclusive). Prints the mean of the perf lines collected during each 8 s window.
+set -euo pipefail
+name=$1
+gi="/home/ajg/Games/aco-dlss-instances/$name/prefix/drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher/games/Assassin's Creed Origins/aco_dlss.ini"
+log=/home/ajg/Games/aco-dlss-instances/$name/out/aco_dlss.log
+sed -i "/^\[reflex\]/,/^\[/ s/^fps_limit=.*/fps_limit=0/" "$gi"
+for mode in game render game render; do
+  sed -i "/^\[cloth\]/,\$ s/^mode=.*/mode=$mode/" "$gi"
+  sleep 3
+  n0=$(wc -l < "$log")
+  sleep 8
+  tail -n +"$((n0 + 1))" "$log" | grep -E "perf: [0-9.]+ fps" | sed 's/.*perf: \([0-9.]*\) fps (\([0-9.]*\) ms avg.*/\1 \2/' |
+    awk -v m="$mode" '{f+=$1; t+=$2; n++} END {printf "%-7s %6.1f fps  %5.2f ms  (%d samples)\n", m, f/n, t/n, n}'
+done
+sed -i "/^\[reflex\]/,/^\[/ s/^fps_limit=.*/fps_limit=120/" "$gi"

@@ -18,6 +18,10 @@
 #include "core/dump.h"
 #include "fg/fg.h"
 #include "fg/vk_device_ext.h"
+#include "core/framedump.h"
+#include "core/mapstats.h"
+#include "core/peek.h"
+#include "cloth/cloth.h"
 #include "dlss/upscaler.h"
 #include "trace/trace.h"
 
@@ -66,6 +70,10 @@ HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain* self, UINT sync, UINT flags
     reflex_on_present_begin(self);
     dump_poll();
     fg_on_present(self);
+    framedump_on_present(self);
+    mapstats_on_present();
+    peek_on_present();
+    cloth_on_present();
   }
   LARGE_INTEGER a, b, f;
   QueryPerformanceCounter(&a);
@@ -103,6 +111,7 @@ HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1* self, UINT sync, UINT fla
 }
 HRESULT STDMETHODCALLTYPE hk_ResizeBuffers(IDXGISwapChain* self, UINT n, UINT w, UINT h, DXGI_FORMAT f, UINT fl) {
   ACO_LOG("ResizeBuffers %ux%u fmt=%d n=%u", w, h, f, n);
+  reflex_on_resize();
   return orig<decltype(hk_ResizeBuffers)>(self, SwapChain_ResizeBuffers)(self, n, w, h, f, fl);
 }
 
