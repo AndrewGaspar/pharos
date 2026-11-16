@@ -1,6 +1,6 @@
 # DLSS Frame Generation for a D3D11 game under Proton
 
-Status: **blocked on the Vulkan route; recommend the D3D12 (vkd3d-proton) route next.**
+Status: **blocked on the Vulkan route; recommend the D3D12 (vkd3d-proton) route next.** No generated frame has been produced yet.
 Everything up to the generated image works: DLSS-G is created and evaluated on DXVK's VkDevice every
 frame (~2.1–2.7 ms GPU at 768x480), reports interpolation enabled, copies the real frame to
 `OutputReal`, and the mod presents generated + real frames. But DLSS-G's *generation kernels* never
@@ -54,9 +54,12 @@ The snippet uses **64-bit image view handles** ("Enabling texmode_raw" →
 small values as the 32-bit `vkGetImageViewHandleNVX` (e.g. 0x3a for both), which looks wrong for a
 64-bit handle. Hiding the 64-bit entry points from the snippet ([fg] hide_handle64=1) doesn't make
 it fall back: evaluation then fails with `PlatformError` ("vkGetImageViewHandle64NVX() function not
-available") — raw texture mode is mandatory. **Prime suspect: 64-bit image view handles obtained
-through winevulkan are not valid for kernels launched through it** (DXVK's working DLSS-SR path uses
-32-bit handles). (Correction: an earlier commit message claimed hide_handle64 produced generated
+available") — raw texture mode is mandatory. A native Linux Vulkan test (no Wine) shows the 64-bit
+handle *also* equals the 32-bit one there (0x9/0x9 storage, 0x8/0x8 sampled), so identical values are
+normal and winevulkan is not truncating them. The handle values are therefore not obviously wrong;
+why the kernels' image accesses are lost remains open (candidates: how NGX's Wine core maps the
+cubin launch / descriptor residency for images it didn't create itself, or something DLSS-SR's
+DXVK-driven launches do that NGX's own Vulkan backend doesn't). (Correction: an earlier commit message claimed hide_handle64 produced generated
 frames — those screenshots were real frames presented after the failed evaluation; `tools/fg-shots`
 now refuses to run when Frame Generation isn't presenting.)
 
@@ -147,11 +150,10 @@ DLSS-G's GPU work then executes.
 
 ## Next steps (recommended)
 
-1. **Pin down the 64-bit handle problem** (launch marshalling looks fine, see above): compare
-   `vkGetImageViewHandle64NVX` through winevulkan with a native Linux Vulkan call on the same kind
-   of image (a tiny native test program), and read winevulkan's thunk for it in the Proton source.
-   If the thunk is at fault, the fix belongs in Wine/Proton (or our hook could call the native
-   driver directly).
+1. (Optional, uncertain payoff) keep digging into the Vulkan route: handle values and launch form
+   look normal, so the next step would be a minimal standalone Windows Vulkan program under the same
+   Proton that runs DLSS-G through NGX on its own images — if that fails too, the Vulkan route is
+   broken in the driver's Wine NGX core and only NVIDIA can fix it.
 2. Otherwise switch to the **D3D12 route**: a vkd3d-proton D3D12 device in-process, DLSS-G via NGX
    D3D12 (the path Proton officially supports), frames shared from DXVK with
    `D3D11_RESOURCE_MISC_SHARED_NTHANDLE` textures + a shared fence, presenting through DXVK's
