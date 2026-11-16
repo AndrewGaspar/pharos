@@ -10,5 +10,6 @@ namespace aco {
 void reflex_on_device(ID3D11Device* dev);   // the game's (newest) device
 void reflex_on_present_begin(IDXGISwapChain* sc);
 void reflex_on_present_end();
+void reflex_on_resize();  // swapchain resized: pause Reflex until stable again
 
 } // namespace aco

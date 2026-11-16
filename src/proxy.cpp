@@ -104,6 +104,7 @@ HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1* self, UINT sync, UINT fla
 }
 HRESULT STDMETHODCALLTYPE hk_ResizeBuffers(IDXGISwapChain* self, UINT n, UINT w, UINT h, DXGI_FORMAT f, UINT fl) {
   ACO_LOG("ResizeBuffers %ux%u fmt=%d n=%u", w, h, f, n);
+  reflex_on_resize();
   return orig<decltype(hk_ResizeBuffers)>(self, SwapChain_ResizeBuffers)(self, n, w, h, f, fl);
 }
 

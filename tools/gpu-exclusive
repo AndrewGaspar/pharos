@@ -1,19 +1,28 @@
 #!/usr/bin/env bash
 # gpu-exclusive <instance> <command...>
-# Runs a measurement with the GPU to itself: takes a lock (so measurements from parallel
-# workstreams queue up instead of overlapping), freezes every other running aco-* container
-# (podman pause), runs the command, and unfreezes them again, also on failure or interrupt.
+# Runs a measurement with the GPU (nearly) to itself: takes a lock (so measurements from parallel
+# workstreams queue up instead of overlapping), throttles every other running instance's game to
+# 5 fps through its live aco_dlss.ini (Reflex fps_limit), runs the command, and restores the other
+# instances' settings afterwards (also on failure/interrupt). Freezing containers (podman pause)
+# was tried first and leaves the paused games hung after resuming.
 set -euo pipefail
 name=$1; shift
-lock=/home/ajg/Games/aco-dlss-instances/.gpu-exclusive.lock
-exec 9>"$lock"
+root=/home/ajg/Games/aco-dlss-instances
+rel="prefix/drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher/games/Assassin's Creed Origins/aco_dlss.ini"
+exec 9>"$root/.gpu-exclusive.lock"
 flock 9
-paused=()
-resume() { for c in "${paused[@]}"; do podman unpause "$c" >/dev/null 2>&1 || true; done; }
-trap resume EXIT INT TERM
+saved=()
+restore() {
+  for n in "${saved[@]}"; do
+    [[ -f "$root/$n/.gpu-exclusive.ini" ]] && cp "$root/$n/.gpu-exclusive.ini" "$root/$n/$rel" && rm -f "$root/$n/.gpu-exclusive.ini"
+  done
+}
+trap restore EXIT INT TERM
 for c in $(podman ps --format '{{.Names}}' --filter status=running | grep '^aco-'); do
-  [[ $c == "aco-$name" ]] && continue
-  podman pause "$c" >/dev/null && paused+=("$c")
+  n=${c#aco-}; [[ $n == "$name" ]] && continue
+  ini="$root/$n/$rel"; [[ -f $ini ]] || continue
+  cp "$ini" "$root/$n/.gpu-exclusive.ini"; saved+=("$n")
+  sed -i "/^\[reflex\]/,\$ { s/^fps_limit=.*/fps_limit=5/; s/^mode=.*/mode=on/ }" "$ini"
 done
-((${#paused[@]})) && echo "gpu-exclusive: paused ${paused[*]}" >&2
+if ((${#saved[@]})); then echo "gpu-exclusive: throttled ${saved[*]} to 5 fps" >&2; sleep 4; fi
 "$@"
