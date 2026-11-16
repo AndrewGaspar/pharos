@@ -617,8 +617,9 @@ bool ensure_feature(uint32_t w, uint32_t h, uint32_t rw, uint32_t rh, VkFormat f
   p.set(NVSDK_NGX_Parameter_Height, h);
   p.set(NVSDK_NGX_DLSSG_Parameter_Width, w);
   p.set(NVSDK_NGX_DLSSG_Parameter_Height, h);
-  // Generated frames per real frame, read at create time; evaluations then run index 1..count
-  // (frame i at t = i / (count + 1), EndpointCoreInputs::ComputeAndValidateTimeFactor).
+  // MultiFrameCount is read at create time. In 310.9 the LAST index of a sequence is the real-frame
+  // call and earlier ones are generated at t = index / (count + 1) (EndpointCoreInputs::
+  // ComputeAndValidateTimeFactor, reverse-engineered), so count=1 would never generate.
   p.set(NVSDK_NGX_DLSSG_Parameter_MultiFrameCount, static_cast<unsigned int>(config().fg_count));
   for (const auto& kv : config().fg_create_extra) p.set(kv.first.c_str(), kv.second);
   // Which numbering NGX expects for the backbuffer format on Vulkan is undocumented; [fg]

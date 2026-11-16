@@ -61,7 +61,7 @@ Config load() {
   c.fg_swap_outputs = read_float(L"swap_outputs", 0.0f, L"fg") != 0.0f;
   c.fg_hudless = read_float(L"hudless", 1.0f, L"fg") != 0.0f;
   c.fg_refresh_hz = read_float(L"refresh_hz", 165.0f, L"fg");
-  c.fg_count = static_cast<int>(read_float(L"count", 1.0f, L"fg"));
+  c.fg_count = static_cast<int>(read_float(L"count", 2.0f, L"fg"));
   c.fg_show_index = static_cast<int>(read_float(L"show_index", 1.0f, L"fg"));
   c.fg_raw_output = read_float(L"raw_output", 0.0f, L"fg") != 0.0f;
   c.fg_trace_cu = read_float(L"trace_cu", 0.0f, L"fg") != 0.0f;
