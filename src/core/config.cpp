@@ -50,6 +50,13 @@ Config load() {
   c.mip_bias = read_str(L"mip_bias", "auto");
   c.mip_bias_offset = read_float(L"mip_bias_offset", 0.0f);
   c.latency_log = read_float(L"latency_log", 0.0f) != 0.0f;
+  c.fg_mode = read_str(L"mode", "off", L"fg");
+  c.fg_mv_scale = read_float(L"mv_scale", 1.0f, L"fg");
+  c.fg_pacing = read_float(L"pacing", 1.0f, L"fg") != 0.0f;
+  c.fg_show = read_str(L"show", "both", L"fg");
+  c.fg_debug_fill = read_float(L"debug_fill", 0.0f, L"fg") != 0.0f;
+  c.fg_ngx_log = static_cast<int>(read_float(L"ngx_log", 0.0f, L"fg"));
+  c.fg_bb_format_dxgi = read_float(L"bb_format_dxgi", 0.0f, L"fg") != 0.0f;
   c.reflex = read_str(L"mode", "on", L"reflex");
   c.reflex_fps_limit = read_float(L"fps_limit", 0.0f, L"reflex");
   c.reflex_probe = read_float(L"probe", 0.0f, L"reflex") != 0.0f;
@@ -64,7 +71,7 @@ bool same(const Config& a, const Config& b) {
   return a.enabled == b.enabled && a.backend == b.backend && a.preset == b.preset && a.debug == b.debug &&
          a.jitter_x == b.jitter_x && a.jitter_y == b.jitter_y && a.mv_x == b.mv_x && a.mv_y == b.mv_y &&
          a.render_scale == b.render_scale && a.mip_bias == b.mip_bias && a.mip_bias_offset == b.mip_bias_offset &&
-         a.latency_log == b.latency_log && a.reflex == b.reflex && a.reflex_fps_limit == b.reflex_fps_limit &&
+         a.latency_log == b.latency_log && a.fg_mode == b.fg_mode && a.fg_mv_scale == b.fg_mv_scale && a.fg_pacing == b.fg_pacing && a.fg_show == b.fg_show && a.fg_debug_fill == b.fg_debug_fill && a.fg_ngx_log == b.fg_ngx_log && a.fg_bb_format_dxgi == b.fg_bb_format_dxgi && a.reflex == b.reflex && a.reflex_fps_limit == b.reflex_fps_limit &&
          a.reflex_probe == b.reflex_probe && a.reflex_markers == b.reflex_markers &&
          a.reflex_marker_set == b.reflex_marker_set && a.reflex_optimize == b.reflex_optimize &&
          a.toggle_key == b.toggle_key;

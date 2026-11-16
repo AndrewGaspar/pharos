@@ -37,6 +37,8 @@ class Params {
 };
 
 bool init(ID3D11Device* dev, const std::wstring& data_path);
+// The driver's NGX core (_nvngx.dll), loaded on first use (also by the Vulkan Frame Generation path).
+HMODULE core_module();
 void shutdown(ID3D11Device* dev);
 bool initialized();
 bool dlss_available();

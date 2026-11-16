@@ -149,9 +149,14 @@ const char* result_str(NVSDK_NGX_Result r) {
   }
 }
 
+HMODULE core_module() {
+  if (!g.dll) g.dll = load_core();
+  return g.dll;
+}
+
 bool init(ID3D11Device* dev, const std::wstring& data_path) {
   if (g_initialized) return true;
-  g.dll = load_core();
+  if (!g.dll) g.dll = load_core();
   if (!g.dll) {
     ACO_LOG("ngx: NGX core not found (no NVIDIA driver / Proton without PROTON_ENABLE_NVAPI?)");
     return false;

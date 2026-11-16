@@ -33,6 +33,13 @@ struct Config {
   std::string mip_bias = "auto";
   float mip_bias_offset = 0.0f;
   bool latency_log = false;
+  std::string fg_mode = "off";  // [fg] mode: off | on (DLSS Frame Generation)
+  float fg_mv_scale = 1.0f;     // [fg] mv_scale: motion vector normalisation (UV units -> 1)
+  std::string fg_show = "both";  // [fg] show: both | generated | real (debug: present only one kind)
+  bool fg_pacing = true;
+  bool fg_debug_fill = false;
+  int fg_ngx_log = 0;
+  bool fg_bb_format_dxgi = false;  // [fg] bb_format_dxgi           // [fg] ngx_log: 1 = NGX log lines into aco_dlss.log, 2 = verbose   // [fg] debug_fill: pre-fill the output with magenta        // [fg] pacing: present the real frame half a frame after the generated one
   std::string toggle_key = "F10";  // [upscaler] toggle_key: F1..F24 or none (DLSS <-> game TAA)
   std::string reflex = "on";     // [reflex] mode
   float reflex_fps_limit = 0.0f;  // [reflex] fps_limit

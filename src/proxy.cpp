@@ -16,6 +16,8 @@
 #include "core/latency.h"
 #include "reflex/reflex.h"
 #include "core/dump.h"
+#include "fg/fg.h"
+#include "fg/vk_device_ext.h"
 #include "dlss/upscaler.h"
 #include "trace/trace.h"
 
@@ -40,6 +42,7 @@ HMODULE real_d3d11() {
     g_real = nullptr;
   }
   ACO_LOG("real d3d11: %ls -> %p", p.c_str(), static_cast<void*>(g_real));
+  if (g_real && config().fg_mode != "off") fg_hook_dxvk_device_creation(nullptr, g_real);
   return g_real;
 }
 
@@ -62,10 +65,14 @@ HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain* self, UINT sync, UINT flags
     latency_on_present_begin(self);
     reflex_on_present_begin(self);
     dump_poll();
+    fg_on_present(self);
   }
   LARGE_INTEGER a, b, f;
   QueryPerformanceCounter(&a);
-  HRESULT hr = orig<decltype(hk_Present)>(self, SwapChain_Present)(self, sync, flags);
+  auto real_present = orig<decltype(hk_Present)>(self, SwapChain_Present);
+  HRESULT hr = S_OK;
+  if ((flags & DXGI_PRESENT_TEST) || !fg_present(self, sync, flags, real_present, &hr))
+    hr = real_present(self, sync, flags);
   QueryPerformanceCounter(&b);
   if (!(flags & DXGI_PRESENT_TEST)) {
     latency_on_present_end();
@@ -211,6 +218,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
     ACO_LOG("aco-dlss loaded into %ls", exe);
     config_reload();
     upscaler_preinit();
+    fg_preinit();
   }
   return TRUE;
 }

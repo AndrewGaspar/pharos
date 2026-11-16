@@ -34,6 +34,18 @@ bool upscaler_on_execute_command_list(ID3D11DeviceContext* ctx, ID3D11CommandLis
 // Negative texture LOD bias for material samplers when rendering below display resolution.
 void upscaler_adjust_sampler(D3D11_SAMPLER_DESC* desc);
 
+// Inputs for DLSS Frame Generation, from the last DLSS job executed on the immediate context
+// (i.e. the frame about to be presented). Pointers are AddRef'd; the caller releases them.
+struct FgInputs {
+  ID3D11Texture2D* mv = nullptr;       // RG16F, render res, UV units, prev - cur
+  ID3D11Resource* depth = nullptr;     // R32F raw reversed-Z device depth, render res
+  ID3D11Texture2D* hudless = nullptr;  // DLSS output (scene without UI, before the composite), display res
+  uint32_t render_w = 0, render_h = 0;
+  float jitter_x = 0, jitter_y = 0;    // pixels
+  uint64_t frame = 0;                  // upscaler frame counter at execution
+};
+bool upscaler_fg_inputs(FgInputs* out);
+
 // Called from DllMain: applies render_scale from aco_dlss.ini to the game's ACO.ini.
 void upscaler_preinit();
 
