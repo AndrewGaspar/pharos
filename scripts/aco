@@ -27,7 +27,7 @@
 #   aco gold                 snapshot the user's Connect prefix as gold (credentials stripped)
 #   aco login                serve gold's Connect over VNC (gvncviewer localhost:99) for manual use
 #   aco create <name>        reflink-clone gold (free on btrfs)
-#   aco up <name> [--res WxH]           boot the container (bridge mode)
+#   aco up <name> [--res WxH] [--refresh HZ]   boot the container (bridge mode; gamescope refresh, default 165)
 #   aco up <name> --connect [--vnc]     legacy: boot + Connect, password login (CREDS_FILE below)
 #   aco game <name> [--mod <dir>] [--profile <p>] [--fps N]   (re)start the game inside a running
 #                            container (--fps: frame cap via the game's MaxFPS)
@@ -109,7 +109,7 @@ cmd_create() {
   echo "created $dst"
 }
 
-# start_container <name> [--res WxH] [--vnc] [--xvfb]: boots the display + Connect (no game).
+# start_container <name> [--res WxH] [--refresh HZ] [--vnc] [--xvfb]: boots the display + Connect (no game).
 #
 # Display: gamescope --backend headless by default. Its WSI layer presents GPU-side, so frame
 # rates are representative (Xvfb makes NVIDIA's Vulkan present do a ~70 ms CPU copy per frame).
@@ -117,10 +117,11 @@ cmd_create() {
 # Either way the X display is :0 inside the container.
 start_container() {
   local name=$1; shift
-  local dst res=2560x1600 vnc=0 xvfb=0 mode=bridge; dst=$(inst "$name")
+  local dst res=2560x1600 hz=165 vnc=0 xvfb=0 mode=bridge; dst=$(inst "$name")
   while (($#)); do
     case $1 in
       --res) res=$2; shift 2;;
+      --refresh) hz=$2; shift 2;;
       --vnc) vnc=1; xvfb=1; shift;;
       --xvfb) xvfb=1; shift;;
       --connect) mode=connect; shift;;
@@ -160,7 +161,7 @@ start_container() {
     -e WINEDEBUG="${ACO_WINEDEBUG:--all}" \
     -e WINEDLLOVERRIDES="${ACO_DLLOVERRIDES:-d3d11=n,b}" \
     -e PROTON_LOG=1 -e PROTON_LOG_DIR=/out -e ACO_DLSS_OUT='Z:\out' \
-    -e ACO_RES="$res" -e ACO_VNC="$vnc" -e ACO_PROTON="$PROTON" -e ACO_CONNECT="$CONNECT_WIN" \
+    -e ACO_RES="$res" -e ACO_HZ="$hz" -e ACO_VNC="$vnc" -e ACO_PROTON="$PROTON" -e ACO_CONNECT="$CONNECT_WIN" \
     "$IMAGE" bash -c '
       mkdir -p /tmp/xdg /tmp/steam; chmod 700 /tmp/xdg
       echo "boot $(date -Is) mode=$ACO_MODE xvfb=$ACO_XVFB" >> /out/run.log
@@ -169,7 +170,7 @@ start_container() {
         # Xwayland skips displays whose lock file names a live process (this shell).
         for d in 0 1 2 3 4 5 6 7 8 9; do printf "%10d\n" $$ > /tmp/.X$d-lock; done
         W=${ACO_RES%x*}; H=${ACO_RES#*x}
-        exec gamescope --backend headless -W $W -H $H -w $W -h $H -r 165 -- \
+        exec gamescope --backend headless -W $W -H $H -w $W -h $H -r $ACO_HZ -- \
           bash -c "echo \$DISPLAY > /tmp/display; exec sleep infinity" >/out/gamescope.log 2>&1
       fi
       export DISPLAY=:0; echo :0 > /tmp/display
@@ -183,7 +184,7 @@ start_container() {
         W=${ACO_RES%x*}; H=${ACO_RES#*x}
         export -f run_connect
         unset DISPLAY
-        exec gamescope --backend headless -W $W -H $H -w $W -h $H -r 165 -- bash -c run_connect >/out/gamescope.log 2>&1
+        exec gamescope --backend headless -W $W -H $H -w $W -h $H -r $ACO_HZ -- bash -c run_connect >/out/gamescope.log 2>&1
       fi' >/dev/null
 }
 

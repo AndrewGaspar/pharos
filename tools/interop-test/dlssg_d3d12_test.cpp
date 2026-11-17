@@ -3,7 +3,12 @@
 // pixels; motion vectors describe the move. After evaluating frame A then frame B, the generated frame
 // should show the square halfway (if it is untouched/copied, generation doesn't work).
 //   WINEDLLOVERRIDES="d3d11,dxgi,d3d12,d3d12core,nvapi64=n" wine dlssg_d3d12_test.exe <dir with nvngx_dlssg.dll>
-//     [count] [opts r/h] [frames] [step px] [mvscale_x [mvscale_y]]
+//     [count] [opts r/h/u/s] [frames] [step px] [mvscale_x [mvscale_y]] [width height]
+// count = DLSSG.MultiFrameCount (generated frames per real frame: 1 = 2x, 3 = 4x, 5 = 6x). Every
+// generated index gets its own output; the test reports where each one put the square (expected at
+// t = index / (count + 1) between the last two real frames) and each index's GPU time.
+// opts: r OutputReal, h HUDLess, u log UAVs, s one command list + fence signal per index (as the mod).
+// Env DLSSG_CREATE="k=v,..." / DLSSG_EVAL="k=v,..." add unsigned-int parameters (v with '.' = float).
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
@@ -13,7 +18,9 @@
 #include <nvsdk_ngx_params.h>
 
 #include <cstdint>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -27,7 +34,8 @@
   } while (0)
 
 // NVSDK_NGX_Parameter vtable (MSVC layout, overload groups reversed), see src/dlss/ngx.h.
-enum Slot { kSetVoidPtr = 0, kSetD3D12Res = 1, kSetI = 3, kSetUI = 4, kSetF = 6, kSetULL = 7, kGetI = 11, kReset = 16 };
+enum Slot { kSetVoidPtr = 0, kSetD3D12Res = 1, kSetI = 3, kSetUI = 4, kSetF = 6, kSetULL = 7, kGetVoidPtr = 8, kGetI = 11,
+            kGetUI = 12, kGetF = 14, kReset = 16 };
 template <typename F>
 F* slot(NVSDK_NGX_Parameter* p, int i) {
   return reinterpret_cast<F*>((*reinterpret_cast<void***>(p))[i]);
@@ -47,6 +55,39 @@ struct P {
     int v = -1;
     slot<NVSDK_NGX_Result(NVSDK_NGX_Parameter*, const char*, int*)>(p, kGetI)(p, n, &v);
     return v;
+  }
+  // "name=value" or "name=<unset>".
+  std::string show(const char* n) {
+    unsigned u = 0;
+    float fl = 0;
+    void* v = nullptr;
+    char b[160];
+    if (slot<NVSDK_NGX_Result(NVSDK_NGX_Parameter*, const char*, unsigned*)>(p, kGetUI)(p, n, &u) == NVSDK_NGX_Result_Success)
+      snprintf(b, sizeof b, "%s=%u", n, u);
+    else if (slot<NVSDK_NGX_Result(NVSDK_NGX_Parameter*, const char*, float*)>(p, kGetF)(p, n, &fl) == NVSDK_NGX_Result_Success)
+      snprintf(b, sizeof b, "%s=%g", n, fl);
+    else if (slot<NVSDK_NGX_Result(NVSDK_NGX_Parameter*, const char*, void**)>(p, kGetVoidPtr)(p, n, &v) == NVSDK_NGX_Result_Success)
+      snprintf(b, sizeof b, "%s=ptr %p", n, v);
+    else
+      snprintf(b, sizeof b, "%s=<unset>", n);
+    return b;
+  }
+  // DLSSG_CREATE / DLSSG_EVAL: "k=v,k=v" (v containing '.' is a float).
+  void extra(const char* env) {
+    const char* e = getenv(env);
+    if (!e) return;
+    std::string all = e;
+    size_t i = 0;
+    while (i < all.size()) {
+      size_t j = all.find(',', i);
+      std::string kv = all.substr(i, j == std::string::npos ? std::string::npos : j - i);
+      i = j == std::string::npos ? all.size() : j + 1;
+      size_t eq = kv.find('=');
+      if (eq == std::string::npos) continue;
+      std::string k = kv.substr(0, eq), v = kv.substr(eq + 1);
+      if (v.find('.') != std::string::npos) f(k.c_str(), float(atof(v.c_str())));
+      else ui(k.c_str(), unsigned(strtoul(v.c_str(), nullptr, 0)));
+    }
   }
 };
 
@@ -76,7 +117,8 @@ static void STDMETHODCALLTYPE hk_uav(ID3D12Device* d, ID3D12Resource* r, ID3D12R
   g_orig_uav(d, r, cnt, desc, h);
 }
 
-constexpr UINT W = 512, H = 256, SQ = 48, X0 = 100, DX = 120, Y0 = 100;
+UINT W = 512, H = 256;
+constexpr UINT SQ = 48, X0 = 100, Y0 = 100;
 
 struct Ctx {
   ID3D12Device* dev;
@@ -187,27 +229,54 @@ std::vector<uint32_t> readback(Ctx& c, ID3D12Resource* t, D3D12_RESOURCE_STATES 
 }
 
 // Horizontal centre of the bright square in row Y0 + SQ/2, or -1.
-double square_x(const std::vector<uint32_t>& img) {
-  UINT y = Y0 + SQ / 2;
+// Brightness-weighted centroid over the square's rows (above the background's 0x50), pixel centres,
+// so a blended or ghosted square is measured where its mass is; `extent` gets the first/last x
+// brighter than 180 on the middle row.
+double square_x(const std::vector<uint32_t>& img, int* extent = nullptr) {
   double sum = 0, n = 0;
-  for (UINT x = 0; x < W; ++x) {
-    uint32_t px = img[y * W + x];
-    int g = (px >> 8) & 0xff;
-    if (g > 180) sum += x, n += 1;
+  for (UINT y = Y0; y < Y0 + SQ; ++y)
+    for (UINT x = 0; x < W; ++x) {
+      int g = (img[y * W + x] >> 8) & 0xff;
+      if (g > 0x60) sum += (x + 0.5) * (g - 0x60), n += g - 0x60;
+    }
+  if (extent) {
+    extent[0] = extent[1] = -1;
+    for (UINT x = 0; x < W; ++x)
+      if (((img[(Y0 + SQ / 2) * W + x] >> 8) & 0xff) > 180) {
+        if (extent[0] < 0) extent[0] = int(x);
+        extent[1] = int(x);
+      }
   }
   return n ? sum / n : -1;
 }
 
 int main(int argc, char** argv) {
+  // Under `proton run` stdout is lost: DLSSG_OUT=<file> sends it there.
+  if (const char* o = getenv("DLSSG_OUT")) freopen(o, "w", stdout);
+  setvbuf(stdout, nullptr, _IONBF, 0);
   std::wstring dir = L"Z:\\out";
   if (argc > 1) {
     std::string a = argv[1];
     dir.assign(a.begin(), a.end());
   }
   unsigned count = argc > 2 ? atoi(argv[2]) : 1;
-  // Optional resources: "r" = OutputReal, "h" = HUDLess.
+  if (count < 1) count = 1;
+  // Optional resources: "r" = OutputReal, "h" = HUDLess; "s" = one command list per index.
   std::string opts = argc > 3 ? argv[3] : "";
   bool want_real = opts.find('r') != std::string::npos, want_hudless = opts.find('h') != std::string::npos;
+  bool split = opts.find('s') != std::string::npos;
+  // e<k>: evaluate with MultiFrameCount k (created with count); d: alternate k and count per frame
+  // (changing the multiplier without re-creating the feature; the last frame uses k).
+  unsigned ec = count;
+  if (size_t e = opts.find('e'); e != std::string::npos && e + 1 < opts.size()) ec = unsigned(opts[e + 1] - '0');
+  if (ec < 1 || ec > count) ec = count;
+  const bool dyn = opts.find('d') != std::string::npos;
+  const int frames = argc > 4 ? atoi(argv[4]) : 8;
+  const UINT STEP = argc > 5 ? atoi(argv[5]) : 16;
+  // MvecScale passed to DLSS-G (the vectors are in UV units): 1 = "normalised" reading, W = pixel reading.
+  const float MVSCALE_X = argc > 6 ? float(atof(argv[6])) : 1.0f;
+  const float MVSCALE_Y = argc > 7 ? float(atof(argv[7])) : MVSCALE_X;
+  if (argc > 9) W = atoi(argv[8]), H = atoi(argv[9]);
 
   IDXGIFactory4* fac = nullptr;
   CHECK(CreateDXGIFactory1(__uuidof(IDXGIFactory4), reinterpret_cast<void**>(&fac)));
@@ -229,6 +298,14 @@ int main(int argc, char** argv) {
   CHECK(c.dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, c.alloc, nullptr,
                                  __uuidof(ID3D12GraphicsCommandList), reinterpret_cast<void**>(&c.cl)));
   CHECK(c.dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void**>(&c.fence)));
+
+  // Timestamps around every Evaluate (GPU cost per generated index).
+  ID3D12QueryHeap* ts_heap = nullptr;
+  D3D12_QUERY_HEAP_DESC qh{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 2 * count, 0};
+  CHECK(c.dev->CreateQueryHeap(&qh, __uuidof(ID3D12QueryHeap), reinterpret_cast<void**>(&ts_heap)));
+  ID3D12Resource* ts_buf = buffer(c, 2 * count * sizeof(UINT64), D3D12_HEAP_TYPE_READBACK);
+  UINT64 ts_freq = 1;
+  c.q->GetTimestampFrequency(&ts_freq);
 
   {
     void** vt = *reinterpret_cast<void***>(c.dev);
@@ -262,23 +339,20 @@ int main(int argc, char** argv) {
   caps(&cp);
   P capsp{cp};
   printf("FrameGeneration.Available = %d\n", capsp.geti(NVSDK_NGX_Parameter_FrameGeneration_Available));
+  for (const char* n : {NVSDK_NGX_DLSSG_Parameter_MultiFrameCountMax, "DLSSG.DynamicMaxFrameCount", "DLSSG.ReflexWarp.Available",
+                        "DLSSG.Dynamic.ReflexDriven", "DLSSG.TargetFrameRate", "DLSSG.RefreshRate",
+                        "DLSSG.GetCurrentSettingsCallback", "DLSSG.EstimateVRAMCallback", "DLSSG.ModelVersion"})
+    printf("caps: %s\n", capsp.show(n).c_str());
 
   // Inputs.
   auto rt = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
   ID3D12Resource* color[2] = {tex(c, DXGI_FORMAT_R8G8B8A8_UNORM, rt, false), tex(c, DXGI_FORMAT_R8G8B8A8_UNORM, rt, false)};
   ID3D12Resource* depth = tex(c, DXGI_FORMAT_R32_FLOAT, rt, false);
   ID3D12Resource* mv = tex(c, DXGI_FORMAT_R16G16_FLOAT, rt, false);
-  ID3D12Resource* out = tex(c, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
-  ID3D12Resource* scratch = tex(c, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
-  printf("  ours: color %p %p depth %p mv %p out %p scratch %p\n", (void*)color[0], (void*)color[1], (void*)depth,
-         (void*)mv, (void*)out, (void*)scratch);
+  std::vector<ID3D12Resource*> out(count + 1, nullptr);  // out[idx], idx 1..count
+  for (unsigned i = 1; i <= count; ++i) out[i] = tex(c, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
   ID3D12Resource* outreal = tex(c, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
   // Frame f: textured background (static), white square at x = X0 + f*STEP moving right.
-  const int frames = argc > 4 ? atoi(argv[4]) : 8;
-  const UINT STEP = argc > 5 ? atoi(argv[5]) : 16;
-  // MvecScale passed to DLSS-G (the vectors are in UV units): 1 = "normalised" reading, W = pixel reading.
-  const float MVSCALE_X = argc > 6 ? float(atof(argv[6])) : 1.0f;
-  const float MVSCALE_Y = argc > 7 ? float(atof(argv[7])) : MVSCALE_X;
   auto sq_x = [&](int f) { return X0 + f * STEP; };
   std::vector<uint32_t> img(W * H);
   auto draw = [&](int f) {
@@ -307,7 +381,7 @@ int main(int argc, char** argv) {
       }
   };
   std::vector<uint32_t> magenta(W * H, 0xffff00ffu);
-  upload(c, out, magenta.data(), 4, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  for (unsigned i = 1; i <= count; ++i) upload(c, out[i], magenta.data(), 4, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
   NVSDK_NGX_Parameter* raw = nullptr;
   alloc(&raw);
@@ -322,27 +396,50 @@ int main(int argc, char** argv) {
   p.ui(NVSDK_NGX_DLSSG_Parameter_InternalWidth, W);
   p.ui(NVSDK_NGX_DLSSG_Parameter_InternalHeight, H);
   p.ui(NVSDK_NGX_DLSSG_Parameter_MultiFrameCount, count);
+  p.extra("DLSSG_CREATE");
   NVSDK_NGX_Handle* h = nullptr;
   r = create(c.cl, NVSDK_NGX_Feature_FrameGeneration, raw, &h);
   c.run();
-  printf("CreateFeature(FrameGeneration, count %u) -> 0x%x\n", count, r);
+  printf("CreateFeature(FrameGeneration %ux%u, count %u) -> 0x%x\n", W, H, count, r);
   if (NVSDK_NGX_FAILED(r)) return 1;
+  // GetCurrentSettings (what the feature reports about itself after creation).
+  {
+    void* cb = nullptr;
+    slot<NVSDK_NGX_Result(NVSDK_NGX_Parameter*, const char*, void**)>(cp, kGetVoidPtr)(cp, "DLSSG.GetCurrentSettingsCallback", &cb);
+    if (cb) {
+      NVSDK_NGX_Parameter* sp = nullptr;
+      alloc(&sp);
+      NVSDK_NGX_Result sr = reinterpret_cast<PFN_NVSDK_NGX_DLSSG_GetCurrentSettingsCallback>(cb)(h, sp);
+      P spp{sp};
+      printf("GetCurrentSettings -> 0x%x\n", sr);
+      for (const char* n : {NVSDK_NGX_DLSSG_Parameter_MultiFrameCountMax, NVSDK_NGX_DLSSG_Parameter_MultiFrameCount,
+                            "DLSSG.DynamicMaxFrameCount", "DLSSG.Dynamic.ReflexDriven", "DLSSG.TargetFrameRate",
+                            "DLSSG.RefreshRate", "DLSSG.MustCallEval", "DLSSG.ReflexWarp.Available", "DLSSG.ModelVersion",
+                            "DLSSG.NvAppOvrAppliedVal.MultiFrameCount", "DLSSG.MinWidthOrHeight", "DLSSG.EstimatedVRAM"})
+        printf("  settings: %s\n", spp.show(n).c_str());
+    }
+  }
 
   static float ident[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  std::vector<double> gpu_ms(count + 1, 0.0);
+  std::vector<int> gpu_n(count + 1, 0);
+  double wall_ms = 0;  // first Evaluate's start to the last one's end (frames evaluated with ec)
+  int wall_n = 0;
   for (int f = 0; f < frames; ++f) {
+    const unsigned fc = f == frames - 1 ? ec : dyn && (f & 1) ? count : ec;  // this frame's MultiFrameCount
     draw(f);
     upload(c, color[f & 1], img.data(), 4, rt);
     draw_mv(f);
     upload(c, mv, mvs.data(), 4, rt);
-    for (unsigned idx = 1; idx <= count; ++idx) {
+    for (unsigned idx = 1; idx <= fc; ++idx) {
       slot<void(NVSDK_NGX_Parameter*)>(raw, kReset)(raw);
       p.res(NVSDK_NGX_DLSSG_Parameter_Backbuffer, color[f & 1]);
       p.res(NVSDK_NGX_DLSSG_Parameter_Depth, depth);
       p.res(NVSDK_NGX_DLSSG_Parameter_MVecs, mv);
-      p.res(NVSDK_NGX_DLSSG_Parameter_OutputInterpolated, idx == 1 ? out : scratch);
+      p.res(NVSDK_NGX_DLSSG_Parameter_OutputInterpolated, out[idx]);
       if (want_real) p.res(NVSDK_NGX_DLSSG_Parameter_OutputReal, outreal);
       if (want_hudless) p.res(NVSDK_NGX_DLSSG_Parameter_HUDLess, color[f & 1]);
-      p.ui(NVSDK_NGX_DLSSG_Parameter_MultiFrameCount, count);
+      p.ui(NVSDK_NGX_DLSSG_Parameter_MultiFrameCount, fc);
       p.ui(NVSDK_NGX_DLSSG_Parameter_MultiFrameIndex, idx);
       for (const char* m : {NVSDK_NGX_DLSSG_Parameter_CameraViewToClip, NVSDK_NGX_DLSSG_Parameter_ClipToCameraView,
                             NVSDK_NGX_DLSSG_Parameter_ClipToLensClip, NVSDK_NGX_DLSSG_Parameter_ClipToPrevClip,
@@ -365,33 +462,57 @@ int main(int argc, char** argv) {
       p.ui(NVSDK_NGX_DLSSG_Parameter_DepthSubrectWidth, W);
       p.ui(NVSDK_NGX_DLSSG_Parameter_DepthSubrectHeight, H);
       p.ull(NVSDK_NGX_DLSSG_Parameter_BackbufferFrameID, f + 1);
+      p.extra("DLSSG_EVAL");
+      c.cl->EndQuery(ts_heap, D3D12_QUERY_TYPE_TIMESTAMP, 2 * (idx - 1));
       r = eval(c.cl, h, raw, nullptr);
+      c.cl->EndQuery(ts_heap, D3D12_QUERY_TYPE_TIMESTAMP, 2 * (idx - 1) + 1);
       if (NVSDK_NGX_FAILED(r)) printf("Evaluate(frame %d, index %u) -> 0x%x\n", f, idx, r);
+      if (f == frames - 1 && idx == fc) {
+        printf("after the last Evaluate:");
+        for (const char* n : {NVSDK_NGX_DLSSG_Parameter_MultiFrameCount, "DLSSG.DynamicMaxFrameCount",
+                              "DLSSG.OutputDisableInterpolation"})
+          printf(" %s", p.show(n).c_str());
+        printf("\n");
+      }
+      if (idx == fc) c.cl->ResolveQueryData(ts_heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2 * fc, ts_buf, 0);
+      if (split || idx == fc) c.run();
     }
-    c.run();
-  }
-  std::vector<uint32_t> o = readback(c, out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-  UINT magenta_px = 0;
-  for (uint32_t px : o) magenta_px += px == 0xffff00ffu;
-  double sx = square_x(o);
-  {
-    std::vector<std::pair<uint32_t, UINT>> hist;
-    for (uint32_t px : o) {
-      bool found = false;
-      for (auto& h : hist)
-        if (h.first == px) { ++h.second; found = true; break; }
-      if (!found && hist.size() < 8) hist.push_back({px, 1});
+    if (f >= 2) {
+      UINT64* m = nullptr;
+      ts_buf->Map(0, nullptr, reinterpret_cast<void**>(&m));
+      for (unsigned i = 1; i <= fc; ++i) {
+        gpu_ms[i] += double(m[2 * i - 1] - m[2 * i - 2]) * 1000.0 / double(ts_freq);
+        ++gpu_n[i];
+      }
+      if (fc == ec) wall_ms += double(m[2 * fc - 1] - m[0]) * 1000.0 / double(ts_freq), ++wall_n;
+      ts_buf->Unmap(0, nullptr);
     }
-    for (auto& h : hist) printf("  value 0x%08x x%u\n", h.first, h.second);
-    printf("  row %u:", Y0 + SQ / 2);
-    for (UINT x = 0; x < W; x += 16) printf(" %08x", o[(Y0 + SQ / 2) * W + x]);
-    printf("\n");
   }
   double prev_x = sq_x(frames - 2) + SQ / 2.0, cur_x = sq_x(frames - 1) + SQ / 2.0;
-  printf("output: %u/%u pixels untouched; square centre x = %.1f (previous real %.1f, current real %.1f)\n", magenta_px,
-         W * H, sx, prev_x, cur_x);
+  printf("previous real square centre %.1f, current real %.1f (%u px/frame, %ux%u, %s)\n", prev_x, cur_x, STEP, W, H,
+         split ? "one command list per index" : "one command list");
+  bool all_ok = true;
+  double total = 0, last_t = 0;
+  for (unsigned idx = 1; idx <= ec; ++idx) {
+    std::vector<uint32_t> o = readback(c, out[idx], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    UINT magenta_px = 0;
+    for (uint32_t px : o) magenta_px += px == 0xffff00ffu;
+    int ext[2];
+    double sx = square_x(o, ext);
+    double t = (sx - prev_x) / (cur_x - prev_x), want = double(idx) / (ec + 1);
+    double ms = gpu_n[idx] ? gpu_ms[idx] / gpu_n[idx] : 0;
+    total += ms;
+    // Written, between the real frames and after the previous index. (Absolute positions in this
+    // synthetic scene lag t by up to ~0.1: count 1 puts the square at t ~ 0.39.)
+    bool ok = magenta_px == 0 && sx > 0 && t > last_t && t < 1;
+    last_t = t;
+    all_ok = all_ok && ok;
+    printf("index %u/%u: square x = %.1f -> t = %.3f (expected %.3f; bright %d..%d) untouched %u px, GPU %.3f ms %s\n", idx,
+           ec, sx, t, want, ext[0], ext[1], magenta_px, ms, ok ? "ok" : "WRONG");
+  }
+  printf("GPU total %.3f ms (sum of per-index times), %.3f ms first start to last end, per real frame for %u generated frames\n",
+         total, wall_n ? wall_ms / wall_n : 0.0, ec);
   if (want_real) printf("OutputReal square centre x = %.1f\n", square_x(readback(c, outreal, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)));
-  bool interpolated = magenta_px == 0 && sx > prev_x + 2 && sx < cur_x - 2;
-  printf(interpolated ? "RESULT: INTERPOLATED\n" : "RESULT: NOT INTERPOLATED\n");
-  return interpolated ? 0 : 2;
+  printf(all_ok ? "RESULT: INTERPOLATED (every index written, in order between the real frames)\n" : "RESULT: NOT INTERPOLATED\n");
+  return all_ok ? 0 : 2;
 }

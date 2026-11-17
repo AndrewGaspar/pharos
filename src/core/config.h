@@ -45,8 +45,10 @@ struct Config {
   std::string fg_input = "swapchain";  // [fg] input: swapchain | copy
   bool fg_swap_outputs = false;         // [fg] swap_outputs (debug)
   bool fg_hudless = true;
-  float fg_refresh_hz = 165.0f;
-  int fg_count = 1;       // [fg] count: DLSS-G MultiFrameCount (generated frames evaluated per real frame)
+  float fg_refresh_hz = 0.0f;   // [fg] refresh_hz: display refresh (DLSSG.RefreshRate, MFG target); 0 = detect
+  float fg_target_hz = 0.0f;    // [fg] target_hz: presents/s to aim for (cap = target / multiplier); 0 = refresh
+  int fg_count = 2;  // [fg] count: frames presented per real frame (2 = 2x .. 6 = 6x); 0 = auto (dynamic)
+  int fg_count_min = 2, fg_count_max = 4;  // [fg] count_min / count_max: range of count=auto
   int fg_show_index = 1;
   bool fg_raw_output = false;  // [fg] raw_output (debug)
   bool fg_trace_cu = false;

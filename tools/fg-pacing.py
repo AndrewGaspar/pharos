@@ -30,6 +30,10 @@ def load(d):
             for k in hdr:
                 if k != "kind":
                     r[k] = int(r[k])
+            # Multi Frame Generation traces: gi = generated index (1..gn-1), gn = multiplier. Older
+            # traces (2x only) don't have them.
+            r.setdefault("gi", 1 if r["kind"] == "G" else 0)
+            r.setdefault("gn", 2)
             rows.append(r)
     bands = None
     try:
@@ -183,20 +187,26 @@ def main():
         if lat:
             res[f"after_arrival_{k}"] = stats(lat)
             print(fmt(f"{k} present after game arrival", res[f"after_arrival_{k}"]))
-    # Order: every G must be presented after the previous R and before its own R.
+    # Order: every G must be presented after the previous R and before its own R; with Multi Frame
+    # Generation the generated frames of one real frame in index order (gi = 1, 2, ...).
     inv = 0
     for a, b in zip(rows, rows[1:]):
         if a["kind"] == "G" and b["kind"] == "R" and a["frame"] != b["frame"]:
             inv += 1
-        if a["kind"] == "G" and b["kind"] == "G":
+        if a["kind"] == "G" and b["kind"] == "G" and (a["frame"] != b["frame"] or b["gi"] != a["gi"] + 1):
             inv += 1
         if b["call_us"] < a["call_us"]:
             inv += 1
     res["order_violations"] = inv
-    print(f"  ordering violations (timestamps / G-R pairing): {inv}")
+    print(f"  ordering violations (timestamps / G-R pairing / index order): {inv}")
+    mults = sorted({r["gn"] for r in rows if r["kind"] in "GR"})
+    if mults:
+        cnt = {m: sum(1 for r in rows if r["kind"] == "R" and r["gn"] == m) for m in mults}
+        res["multipliers"] = {str(m): c for m, c in cnt.items()}
+        print("  multipliers (real frames): " + ", ".join(f"{m}x {c}" for m, c in cnt.items()))
     # Display-time error vs content time: content of real N = its arrival (game cadence), generated
-    # N = midpoint of the previous and this arrival. (call - content) should be constant.
-    prev_arr = {}
+    # frame k of N (multiplier m) = k/m of the way from the previous arrival to this one. (call -
+    # content) should be constant.
     last = None
     errs = []
     for r in rows:
@@ -204,7 +214,7 @@ def main():
             last = r["arrive_us"]
             errs.append((r["call_us"] - r["arrive_us"]) / 1000)
         elif r["kind"] == "G" and last is not None:
-            errs.append((r["call_us"] - (last + r["arrive_us"]) / 2) / 1000)
+            errs.append((r["call_us"] - (last + (r["arrive_us"] - last) * r["gi"] / max(r["gn"], 2))) / 1000)
     if errs:
         e = np.array(errs)
         res["present_minus_content"] = stats(e - np.median(e))
@@ -220,28 +230,59 @@ def main():
     for a, b in zip(shot_rows, shot_rows[1:]):
         (l, pl), (r_, pr) = shifts(bands, a["shot"], b["shot"])
         sh.append((l, r_, pl, pr))
-    # Triplets R(N-1) G(N) R(N)
+    # Runs R(N-1) G1(N) .. Gk(N) R(N): generated frame i should sit at i/m of the real-to-real shift
+    # (2x: 0.5). d(R, Gi) is the sum of the consecutive shifts up to Gi.
     ratios, agree = [], []
+    per_index = {}  # (i, m) -> ratios
+    nonmono = runs = 0
     for i in range(len(shot_rows) - 2):
-        a, g, b = shot_rows[i], shot_rows[i + 1], shot_rows[i + 2]
-        if not (a["kind"] == "R" and g["kind"] == "G" and b["kind"] == "R" and g["frame"] == b["frame"]):
+        a = shot_rows[i]
+        if a["kind"] != "R" or shot_rows[i + 1]["kind"] != "G":
+            continue
+        j = i + 1
+        while j < len(shot_rows) and shot_rows[j]["kind"] == "G":
+            j += 1
+        if j >= len(shot_rows):
+            continue
+        b = shot_rows[j]
+        gens = shot_rows[i + 1:j]
+        if b["kind"] != "R" or any(g["frame"] != b["frame"] for g in gens):
             continue
         rr = shifts(bands, a["shot"], b["shot"])
+        runs += 1
         for side in (0, 1):
-            d1 = sh[i][side]
             dt = rr[side][0]
-            if abs(dt) < 2.0 or sh[i][2 + side] < 0.05:
+            if abs(dt) < 2.0 or min(sh[m][2 + side] for m in range(i, j)) < 0.05:
                 continue
-            ratios.append(d1 / dt)
-            agree.append(abs(d1 + sh[i + 1][side] - dt))
+            cum, prev_ratio = 0.0, -1e9
+            for m, g in enumerate(gens):
+                cum += sh[i + m][side]
+                q = cum / dt
+                key = (g["gi"], g["gn"])
+                per_index.setdefault(key, []).append(q)
+                ratios.append(q)
+                if q < prev_ratio:
+                    nonmono += 1
+                prev_ratio = q
+            agree.append(abs(cum + sh[j - 1][side] - dt))
     if ratios:
         res["gen_ratio"] = stats(ratios)
         res["gen_ratio_closure_px"] = stats(agree)
-        print(fmt("generated-frame shift ratio (0.5 = midpoint)", res["gen_ratio"], ""))
-        print(fmt("  closure |d(R,G)+d(G,R') - d(R,R')|", res["gen_ratio_closure_px"], "px"))
+        two_x = all(k[1] == 2 for k in per_index)
+        print(fmt("generated-frame shift ratio (0.5 = midpoint)" if two_x else
+                  "generated-frame shift ratio, all indices", res["gen_ratio"], ""))
+        print(fmt("  closure |sum d(R..G..R') - d(R,R')|", res["gen_ratio_closure_px"], "px"))
+        if not two_x:
+            res["gen_ratio_index"] = {}
+            for (gi, gn) in sorted(per_index, key=lambda k: (k[1], k[0])):
+                s = stats(per_index[(gi, gn)])
+                res["gen_ratio_index"][f"{gi}/{gn}"] = s
+                print(fmt(f"  shift ratio index {gi} of {gn}x (expected {gi / gn:.3f})", s, ""))
         r = np.array(ratios)
         res["gen_ratio_inverted"] = int(((r < 0) | (r > 1)).sum())
-        print(f"  ratios outside [0,1] (inverted/overshoot): {res['gen_ratio_inverted']} of {len(r)}")
+        res["gen_ratio_nonmonotonic"] = nonmono
+        print(f"  ratios outside [0,1] (inverted/overshoot): {res['gen_ratio_inverted']} of {len(r)}; "
+              f"out of order within a run: {nonmono} ({runs} runs)")
     # Per-step shift by transition, and the smoothness of position vs present time.
     steps = {}
     for (a, b), s in zip(zip(shot_rows, shot_rows[1:]), sh):

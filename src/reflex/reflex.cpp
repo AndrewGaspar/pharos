@@ -359,6 +359,8 @@ void reflex_on_present_begin(IDXGISwapChain* sc) {
 // [reflex] limiter=cpu: our own frame cap on the render thread (independent of the driver's Reflex
 // limiter, and of whether Reflex is on). Frame starts are kept on a fixed grid of 1/fps_limit; if the
 // game falls behind by more than a frame the grid restarts from now (no catch-up bursts).
+std::atomic<uint64_t> g_wait_us{0};  // reflex_wait_us()
+
 void cpu_limit() {
   const Config& cfg = config();
   const float limit = effective_limit();
@@ -377,6 +379,7 @@ void cpu_limit() {
     else YieldProcessor();
   }
   S.cap_next += interval;
+  g_wait_us += uint64_t(now_us() - now);
 }
 
 void reflex_on_present_end() {
@@ -427,6 +430,7 @@ void reflex_on_present_end() {
   marker(nv::SIMULATION_START);
   S.frame_begun = true;
   S.sleep_ms_sum += (t1 - t0) / 1000.0;
+  g_wait_us += uint64_t(t1 - t0);
   ++S.sleeps;
   if (t1 - S.last_report >= 2000000) {
     if (S.last_report)
@@ -437,5 +441,8 @@ void reflex_on_present_end() {
     S.sleeps = 0;
   }
 }
+
+
+unsigned long long reflex_wait_us() { return g_wait_us.load(); }
 
 } // namespace aco
