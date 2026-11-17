@@ -1037,6 +1037,7 @@ struct Job {
   uint64_t frame = 0;       // BackbufferFrameID of this job's evaluation (trace)
   int pace = 0;             // [fg] pace: 0 ready, 1 smooth, 2 arrival
   double relax = 0.5;       // [fg] pace_relax
+  int64_t dt_us = 0;        // game's frame interval before this frame (pace=content)
   int ts_slot = -1;         // ring slot of this job's evaluation (timestamp check), -1 = none
   UINT64 ts_old = 0;        // that slot's end timestamp before the evaluation
 };
@@ -1079,8 +1080,14 @@ void present_loop() {
     // of how early DLSS-G finished relative to that, so a delay never sticks. arrival: at a fixed
     // lag after the game's Present (lag = recent maximum of DLSS-G ready - arrival), i.e. locked to
     // the game's own frame cadence.
+    // content: both presents on the game's own timeline, a fixed lag L after it: the real frame at
+    // arrive(N) + L and the generated one (content halfway between N-1 and N) at arrive(N) + L - dt/2,
+    // with dt the *actual* interval since the previous game frame. Display time then follows content
+    // time even when the game's frame times vary (with VRR this is what makes motion smooth; an even
+    // present cadence over uneven content times makes the image speed up and slow down).
+    int64_t real_target = 0;
     if (gen_ready && j.half_us > 0) {
-      static int64_t lag_us = 0;
+      static int64_t lag_us = 0, lag_c = 0;
       int64_t ready_lag = t0 - j.arrive_us;
       lag_us = ready_lag > lag_us ? ready_lag : lag_us - (lag_us - ready_lag) / 64;
       int64_t target = 0;
@@ -1088,7 +1095,17 @@ void present_loop() {
         target = P.last_real_call + j.half_us - int64_t(j.relax * double(P.last_real_call + j.half_us - t0));
       else if (j.pace == 2)
         target = j.arrive_us + lag_us;
-      if (target > t0 && target - t0 < 2 * j.half_us) wait_until(target);
+      if (j.pace == 3) {
+        int64_t dt = j.dt_us > 0 ? j.dt_us : 2 * j.half_us;
+        dt = dt < 3000 ? 3000 : dt > 50000 ? 50000 : dt;
+        int64_t need = ready_lag + dt / 2;  // smallest L that has the generated frame ready in time
+        lag_c = need > lag_c ? need : lag_c - (lag_c - need) / 64;
+        target = j.arrive_us + lag_c - dt / 2;
+        real_target = j.arrive_us + lag_c;
+        if (target > t0 && target - t0 < 100000) wait_until(target);
+      } else if (target > t0 && target - t0 < 2 * j.half_us) {
+        wait_until(target);
+      }
     }
     t0 = t1 = t2 = now_us();
     if (gen_ready) {
@@ -1107,7 +1124,13 @@ void present_loop() {
     // The real frame half an interval after the generated one: measured from when the generated
     // Present was called (pace=smooth/arrival) - a Present that blocks must not push the real frame
     // later (pace=ready, the original: from when it returned).
-    if (gen_ready && j.half_us > 0) wait_until((j.pace ? t1 : t_gen) + j.half_us);
+    if (gen_ready && j.half_us > 0) {
+      if (j.pace == 3 && real_target > 0) {
+        if (real_target - now_us() < 100000) wait_until(real_target);
+      } else {
+        wait_until((j.pace ? t1 : t_gen) + j.half_us);
+      }
+    }
     int64_t t_real = now_us(), t4 = t_real;
     if (j.show == "skip_present2") {
       // bisecting: no second present
@@ -1169,7 +1192,11 @@ void enqueue(IDXGISwapChain* sc, PFN_RealPresent present, UINT sync, UINT flags,
   j.show = config().fg_skip == "present2" ? std::string("skip_present2") : show;
   j.gate = config().fg_present_gate;
   j.frame = S.backbuffer_id;
-  j.pace = config().fg_pace == "smooth" ? 1 : config().fg_pace == "arrival" ? 2 : 0;
+  const std::string& pm = config().fg_pace;
+  j.pace = pm == "smooth" ? 1 : pm == "arrival" ? 2 : pm == "content" ? 3 : 0;
+  static int64_t prev_arrive = 0;
+  j.dt_us = prev_arrive ? arrive - prev_arrive : 0;
+  prev_arrive = arrive;
   j.relax = config().fg_pace_relax;
   std::lock_guard<std::mutex> lk(P.m);
   // A job that hasn't started yet is late: its generated frame would only delay the real ones.
