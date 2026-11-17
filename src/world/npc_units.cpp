@@ -237,10 +237,22 @@ void kill_test(uintptr_t mgr) {
           rd<float>(best + 0x10), rd<float>(best + 0x14), rd<float>(best + 0x18), (rd<uint8_t>(best + 0x5a) & 2) != 0);
 }
 
+// Cost accounting (sim thread writes, render thread reads/resets for the 10 s log line).
+std::atomic<uint64_t> g_t_orig{0}, g_t_ours{0}, g_t_ours_max{0}, g_calls{0};
+
 uintptr_t update_hook(void* self, uintptr_t a, uintptr_t b, uintptr_t c) {
+  LARGE_INTEGER t0, t1, t2;
+  QueryPerformanceCounter(&t0);
   uintptr_t r = g_orig_update(self, a, b, c);
+  QueryPerformanceCounter(&t1);
   step(reinterpret_cast<uintptr_t>(self));
   if (reinterpret_cast<uintptr_t>(self) == g_cur_mgr) kill_test(g_cur_mgr);
+  QueryPerformanceCounter(&t2);
+  uint64_t ours = t2.QuadPart - t1.QuadPart;
+  g_t_orig += t1.QuadPart - t0.QuadPart;
+  g_t_ours += ours;
+  if (ours > g_t_ours_max.load()) g_t_ours_max = ours;
+  ++g_calls;
   return r;
 }
 
@@ -298,6 +310,12 @@ void npc_units_on_present() {
     ACO_LOG("npc_units: %u extra units (%u units handled, %u failed), objective list %u, last extra %p (activation %p)",
             g_stat_extras.load(), g_stat_spawners.load(), g_stat_failed.load(), g_list_n.load(),
             reinterpret_cast<void*>(lu), reinterpret_cast<void*>(lu && readable(lu + 0x1b8, 8) ? rd<uintptr_t>(lu + 0x1b8) : 0));
+    LARGE_INTEGER f;
+    QueryPerformanceFrequency(&f);
+    uint64_t calls = g_calls.exchange(0), to = g_t_orig.exchange(0), tu = g_t_ours.exchange(0), tm = g_t_ours_max.exchange(0);
+    if (calls)
+      ACO_LOG("npc_units: cost: %llu MetaAI updates in 10 s, game update %.3f ms avg, ours %.3f ms avg / %.3f ms max",
+              (unsigned long long)calls, 1e3 * to / f.QuadPart / calls, 1e3 * tu / f.QuadPart / calls, 1e3 * tm / f.QuadPart);
   }
 }
 
