@@ -109,7 +109,7 @@ Config load() {
   c.world_lod_mode = read_str(L"lod_mode", "far", L"world");
   c.world_npc_density = read_float(L"npc_density", 1.0f, L"world");
   c.world_npc_distance = read_float(L"npc_distance", 1.0f, L"world");
-  c.world_npc_spawn_ceiling = read_float(L"npc_spawn_ceiling", 900.0f, L"world");
+  c.world_npc_spawn_ceiling = read_float(L"npc_spawn_ceiling", 800.0f, L"world");
   c.world_npc_units = read_float(L"npc_units", 1.0f, L"world");
   c.world_npc_units_kill = read_float(L"npc_units_kill", 0.0f, L"world");
   c.world_npc_units_log = read_float(L"npc_units_log", 0.0f, L"world");

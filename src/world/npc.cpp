@@ -259,7 +259,7 @@ void npc_on_present() {
   // The game froze (every thread waiting) whenever ~1000 or more characters were spawned at once
   // (seen with [world] npc_units), never at <= ~940. The effective cap is maxSpawned x the quality
   // multiplier (RVA 0x12559c0, 0.75-1.2 by Environment quality), so the raw value is clamped to
-  // keep the effective cap at [world] npc_spawn_ceiling (default 900) or below.
+  // keep the effective cap at [world] npc_spawn_ceiling (default 800) or below.
   float mult = reinterpret_cast<float (*)(uintptr_t)>(g_base + kCapMultiplierRva)(s);
   if (!(mult > 0.1f && mult < 4.0f)) mult = 1.2f;  // unexpected: assume the largest shipped value
   uint32_t ceiling = static_cast<uint32_t>(std::clamp(cfg.world_npc_spawn_ceiling, 100.0f, 5000.0f) / mult);
