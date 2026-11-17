@@ -61,6 +61,10 @@ struct Config {
   std::string fg_camera = "engine";  // [fg] camera: engine (the game's matrices) | identity
   bool fg_camera_unjitter = true;     // [fg] camera_unjitter: strip TAA jitter from the projection
   std::string fg_mv_units = "px";    // [fg] mv_units: px (MvecScale = mv_scale x render size) | uv
+  bool fg_auto_cap = true;        // [fg] auto_cap: cap the real frame rate with headroom (feedback, fg_d3d12.cpp)
+  float fg_auto_cap_lag = 0.7f;   // [fg] auto_cap_lag: target DLSS-G done time after the game's Present, in frames
+  float fg_auto_cap_min = 0, fg_auto_cap_max = 0;  // [fg] auto_cap_min / auto_cap_max (fps; 0 = 30 / 240)
+  int fg_sets = 2;  // [fg] sets: texture sets in flight (2 | 3: the present thread may lag two frames)
   std::string fg_pace = "smooth";  // [fg] pace: ready | smooth | arrival (when the generated frame is presented)
   float fg_pace_relax = 0.5f;     // [fg] pace_relax (pace=smooth)
   std::string fg_done_fence = "shared";  // [fg] done_fence: shared | private (fence the CPU waits use)
@@ -75,6 +79,7 @@ struct Config {
   std::string toggle_key = "F10";  // [upscaler] toggle_key: F1..F24 or none (DLSS <-> game TAA)
   std::string reflex = "on";     // [reflex] mode
   float reflex_fps_limit = 0.0f;  // [reflex] fps_limit
+  std::string reflex_limiter = "driver";  // [reflex] limiter: driver (Reflex minimumInterval) | cpu (our own wait)
   bool reflex_markers = true;     // [reflex] markers
   std::string reflex_marker_set = "minimal";  // [reflex] marker_set: minimal | full (experiments)
   bool reflex_optimize = false;   // [reflex] optimize: bUseMarkersToOptimize

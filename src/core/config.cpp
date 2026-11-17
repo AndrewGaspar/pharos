@@ -78,6 +78,11 @@ Config load() {
   c.fg_camera = read_str(L"camera", "engine", L"fg");
   c.fg_camera_unjitter = read_float(L"camera_unjitter", 1.0f, L"fg") != 0.0f;
   c.fg_mv_units = read_str(L"mv_units", "px", L"fg");
+  c.fg_auto_cap = read_float(L"auto_cap", 1.0f, L"fg") != 0.0f;
+  c.fg_auto_cap_lag = read_float(L"auto_cap_lag", 0.7f, L"fg");
+  c.fg_auto_cap_min = read_float(L"auto_cap_min", 0.0f, L"fg");
+  c.fg_auto_cap_max = read_float(L"auto_cap_max", 0.0f, L"fg");
+  c.fg_sets = static_cast<int>(read_float(L"sets", 2.0f, L"fg"));
   c.fg_pace = read_str(L"pace", "smooth", L"fg");
   c.fg_pace_relax = read_float(L"pace_relax", 0.5f, L"fg");
   c.fg_done_fence = read_str(L"done_fence", "shared", L"fg");
@@ -104,6 +109,7 @@ Config load() {
   c.reflex = read_str(L"mode", "on", L"reflex");
   c.reflex_fps_limit = read_float(L"fps_limit", 0.0f, L"reflex");
   c.reflex_probe = read_float(L"probe", 0.0f, L"reflex") != 0.0f;
+  c.reflex_limiter = read_str(L"limiter", "driver", L"reflex");
   c.world_lod_distance = read_float(L"lod_distance", 1.0f, L"world");
   c.world_lod_skip = read_str(L"lod_skip", "", L"world");
   c.world_lod_mode = read_str(L"lod_mode", "far", L"world");
@@ -127,7 +133,7 @@ bool same(const Config& a, const Config& b) {
   return a.enabled == b.enabled && a.backend == b.backend && a.preset == b.preset && a.debug == b.debug &&
          a.jitter_x == b.jitter_x && a.jitter_y == b.jitter_y && a.mv_x == b.mv_x && a.mv_y == b.mv_y &&
          a.render_scale == b.render_scale && a.mip_bias == b.mip_bias && a.mip_bias_offset == b.mip_bias_offset &&
-         a.latency_log == b.latency_log && a.fg_mode == b.fg_mode && a.fg_mv_scale == b.fg_mv_scale && a.fg_pacing == b.fg_pacing && a.fg_show == b.fg_show && a.fg_debug_fill == b.fg_debug_fill && a.fg_ngx_log == b.fg_ngx_log && a.fg_bb_format_dxgi == b.fg_bb_format_dxgi && a.fg_extra == b.fg_extra && a.fg_input == b.fg_input && a.fg_swap_outputs == b.fg_swap_outputs && a.fg_hudless == b.fg_hudless && a.fg_refresh_hz == b.fg_refresh_hz && a.fg_count == b.fg_count && a.fg_show_index == b.fg_show_index && a.fg_raw_output == b.fg_raw_output && a.fg_trace_cu == b.fg_trace_cu && a.fg_hide_handle64 == b.fg_hide_handle64 && a.fg12_descriptor_heap == b.fg12_descriptor_heap && a.fg_verify == b.fg_verify && a.fg_camera == b.fg_camera && a.fg_pace == b.fg_pace && a.fg_pace_relax == b.fg_pace_relax && a.fg_done_fence == b.fg_done_fence && a.fg_ts_guard == b.fg_ts_guard && a.fg_camera_unjitter == b.fg_camera_unjitter && a.fg_mv_units == b.fg_mv_units && a.fg_trace_presents == b.fg_trace_presents && a.fg_trace_shots == b.fg_trace_shots && a.fg_present_gate == b.fg_present_gate && a.fg_sync == b.fg_sync && a.fg_frame_latency == b.fg_frame_latency && a.fg_skip == b.fg_skip && a.fg_enabled == b.fg_enabled && a.fg_toggle_key == b.fg_toggle_key && a.fg_buffers == b.fg_buffers && a.fg_present_thread == b.fg_present_thread && a.fg_create_extra == b.fg_create_extra && a.reflex == b.reflex && a.reflex_fps_limit == b.reflex_fps_limit &&
+         a.latency_log == b.latency_log && a.fg_mode == b.fg_mode && a.fg_mv_scale == b.fg_mv_scale && a.fg_pacing == b.fg_pacing && a.fg_show == b.fg_show && a.fg_debug_fill == b.fg_debug_fill && a.fg_ngx_log == b.fg_ngx_log && a.fg_bb_format_dxgi == b.fg_bb_format_dxgi && a.fg_extra == b.fg_extra && a.fg_input == b.fg_input && a.fg_swap_outputs == b.fg_swap_outputs && a.fg_hudless == b.fg_hudless && a.fg_refresh_hz == b.fg_refresh_hz && a.fg_count == b.fg_count && a.fg_show_index == b.fg_show_index && a.fg_raw_output == b.fg_raw_output && a.fg_trace_cu == b.fg_trace_cu && a.fg_hide_handle64 == b.fg_hide_handle64 && a.fg12_descriptor_heap == b.fg12_descriptor_heap && a.fg_verify == b.fg_verify && a.fg_camera == b.fg_camera && a.fg_pace == b.fg_pace && a.fg_sets == b.fg_sets && a.fg_auto_cap == b.fg_auto_cap && a.fg_auto_cap_lag == b.fg_auto_cap_lag && a.fg_auto_cap_min == b.fg_auto_cap_min && a.fg_auto_cap_max == b.fg_auto_cap_max && a.fg_pace_relax == b.fg_pace_relax && a.fg_done_fence == b.fg_done_fence && a.fg_ts_guard == b.fg_ts_guard && a.fg_camera_unjitter == b.fg_camera_unjitter && a.fg_mv_units == b.fg_mv_units && a.fg_trace_presents == b.fg_trace_presents && a.fg_trace_shots == b.fg_trace_shots && a.fg_present_gate == b.fg_present_gate && a.fg_sync == b.fg_sync && a.fg_frame_latency == b.fg_frame_latency && a.fg_skip == b.fg_skip && a.fg_enabled == b.fg_enabled && a.fg_toggle_key == b.fg_toggle_key && a.fg_buffers == b.fg_buffers && a.fg_present_thread == b.fg_present_thread && a.fg_create_extra == b.fg_create_extra && a.reflex == b.reflex && a.reflex_fps_limit == b.reflex_fps_limit && a.reflex_limiter == b.reflex_limiter &&
          a.reflex_probe == b.reflex_probe && a.reflex_markers == b.reflex_markers &&
          a.reflex_marker_set == b.reflex_marker_set && a.reflex_optimize == b.reflex_optimize &&
          a.toggle_key == b.toggle_key && a.cloth_mode == b.cloth_mode && a.cloth_scale == b.cloth_scale &&
