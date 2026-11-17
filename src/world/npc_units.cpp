@@ -43,9 +43,11 @@ constexpr uint32_t kOwnerLinkHash = 0xcf078f5e;
 // Units within this distance of the player that the MetaAI has not activated yet (activation is
 // ~120 m for most) get their extras, so the new units go through the normal activation -> spawn
 // path like the others.
-constexpr float kRingOuter = 260.0f;
-constexpr unsigned kMaxExtrasPerWorld = 4000;
-constexpr unsigned kMaxCreatePerStep = 48;
+constexpr float kRingOuter = 400.0f;
+constexpr unsigned kMaxExtrasPerWorld = 60000;  // hard ceiling; [world] npc_units_max lowers it
+std::atomic<unsigned> g_max_extras{kMaxExtrasPerWorld};
+constexpr unsigned kMaxCreatePerStep = 96;
+constexpr uint32_t kMaxUnitsPerSpawner = 200;  // see augment_spawner
 
 uintptr_t g_base = 0;
 std::atomic<int> g_k{1};
@@ -126,25 +128,55 @@ uintptr_t add_unit(uintptr_t mgr, uintptr_t sp, uintptr_t entry, const float pos
   return unit;
 }
 
+// Render camera (RVA 0x49e86b8 -> +0x130 position, +0x140 unit forward), read once per step.
+constexpr uintptr_t kCameraRva = 0x49e86b8;
+constexpr float kViewRange = 110.0f;  // beyond this a new character is small and spawns at the rim
+float g_cam[6];
+bool g_cam_ok = false;
+
+void read_camera() {
+  uintptr_t c = load(g_base + kCameraRva);
+  g_cam_ok = c && readable(c + 0x130, 0x20);
+  if (!g_cam_ok) return;
+  memcpy(g_cam, reinterpret_cast<void*>(c + 0x130), 12);
+  memcpy(g_cam + 3, reinterpret_cast<void*>(c + 0x140), 12);
+}
+
+// Within kViewRange of the camera and inside a ~70 degree half-angle cone around its forward axis.
+bool in_view(float x, float y, float z) {
+  if (!g_cam_ok) return true;  // unknown: be conservative
+  float dx = x - g_cam[0], dy = y - g_cam[1], dz = z - g_cam[2];
+  float d = std::sqrt(dx * dx + dy * dy + dz * dz);
+  if (d > kViewRange) return false;
+  if (d < 1.0f) return true;
+  return (dx * g_cam[3] + dy * g_cam[4] + dz * g_cam[5]) / d > 0.34f;
+}
+
 // Extras for the units of spawner `sp` that are within the ring, not activated yet and not handled
 // before. Units are handled one by one (big spawners have 60+ units spread over a district, some of
 // them always active near the player). Returns the number of units created.
 unsigned augment_spawner(uintptr_t mgr, uintptr_t sp, int k, float px, float py, unsigned budget) {
-  constexpr uint32_t kMaxUnits = 128;
+  // Spawners grow by k-1 units per original, and a spawner can be handled over several steps
+  // (step budget, units deferred while in view), so this must hold k x the biggest spawner.
+  constexpr uint32_t kMaxUnits = 4096;
   uintptr_t arr = rd<uintptr_t>(sp + 0xa0);
   uint32_t n = rd<uint32_t>(sp + 0xa8) >> 17;
   uintptr_t ents = rd<uintptr_t>(sp + 0xc2);
   uint32_t ne = rd<uint32_t>(sp + 0xca) >> 17;
   if (!n || n > kMaxUnits || !ne || ne > 64 || !arr || !ents) return 0;
-  uintptr_t units[kMaxUnits];
+  static uintptr_t units[kMaxUnits];  // sim thread only
   memcpy(units, reinterpret_cast<void*>(arr), n * 8);  // the array grows while we add
   unsigned made = 0;
-  for (uint32_t i = 0; i < n && made < budget && g_extras < kMaxExtrasPerWorld; ++i) {
+  for (uint32_t i = 0; i < n && made < budget && g_extras < g_max_extras.load(); ++i) {
     uintptr_t u = units[i];
     if (!u || rd<uintptr_t>(u) != g_base + kUnitVtRva) continue;
-    if (rd<uintptr_t>(u + 0x1b8)) continue;  // activated: too late for this one
     float d = std::hypot(rd<float>(u + 0x10) - px, rd<float>(u + 0x14) - py);
     if (d > kRingOuter) continue;
+    // Activated units get extras too: the MetaAI activates the new unit on its own. So that no
+    // character appears in view, an activated unit near the camera and in front of it is left for
+    // later (the player turns or moves on); everything else is handled at once, so after a load or
+    // a fast travel the whole 400 m area gets its extras within seconds.
+    if (rd<uintptr_t>(u + 0x1b8) && in_view(rd<float>(u + 0x10), rd<float>(u + 0x14), rd<float>(u + 0x18))) continue;
     if (!g_done.insert(u).second) continue;   // handled before, or one of our extras
     if ((rd<uint8_t>(u + 0x5a) & 6) || (rd<uint8_t>(u + 0x90) & 0x40)) continue;  // dead / group / scripted
     uintptr_t link = rd<uintptr_t>(u + 0x38), entry = 0;
@@ -156,6 +188,10 @@ unsigned augment_spawner(uintptr_t mgr, uintptr_t sp, int k, float px, float py,
     float pos[4];
     memcpy(pos, reinterpret_cast<void*>(u + 0x10), 16);
     for (int j = 1; j < k; ++j) {
+      // A spawner with more than 255 units freezes the game a few seconds later (k=6 and k=8 both
+      // froze after ~1430 originals had their extras, at different extra counts, while k=4 with
+      // spawners of up to ~60 originals -> 240 units ran fine): keep every spawner below that.
+      if ((rd<uint32_t>(sp + 0xa8) >> 17) >= kMaxUnitsPerSpawner) break;
       float a = 2.39996f * (i * 7 + j);  // spread around the original, 1.0-2.0 m away
       float r = 1.0f + 0.25f * (j % 5);
       float q[4] = {pos[0] + r * std::cos(a), pos[1] + r * std::sin(a), pos[2], pos[3]};
@@ -190,6 +226,7 @@ void step(uintptr_t mgr) {
   uintptr_t pl = load(load(g_base + kPlayerRootRva));
   if (!readable(pl + 0x50, 12)) return;
   float px = rd<float>(pl + 0x50), py = rd<float>(pl + 0x54);
+  read_camera();
   // The manager's list of all virtual objectives ({ptr} at +0x3b8, plain u32 count at +0x3c0),
   // walked in slices so one update never reads more than a few thousand objects.
   uintptr_t list = rd<uintptr_t>(mgr + kObjListOff);
@@ -201,7 +238,7 @@ void step(uintptr_t mgr) {
   unsigned made = 0;
   const uintptr_t spvt = g_base + kSpawnerVtRva;
   uint32_t i = g_cursor;
-  for (; i < end && made < kMaxCreatePerStep && g_extras < kMaxExtrasPerWorld; ++i) {
+  for (; i < end && made < kMaxCreatePerStep && g_extras < g_max_extras.load(); ++i) {
     uintptr_t sp = rd<uintptr_t>(list + 8 * i);
     if (!sp || rd<uintptr_t>(sp) != spvt) continue;
     made += augment_spawner(mgr, sp, k, px, py, kMaxCreatePerStep - made);
@@ -283,7 +320,7 @@ void npc_units_on_present() {
   static int state = 0;  // 0 unchecked, 1 ok, 2 unsupported
   int k = static_cast<int>(std::lround(config().world_npc_units));
   if (k < 1) k = 1;
-  if (k > 4) k = 4;
+  if (k > 16) k = 16;
   if (state == 0) {
     if (k == 1) return;
     state = verify() ? 1 : 2;
@@ -297,6 +334,7 @@ void npc_units_on_present() {
   if (k == 1) return;  // the hook stays installed but idle
   g_kill_req = static_cast<int>(config().world_npc_units_kill);
   g_log_units = config().world_npc_units_log != 0.0f;
+  { float mx = config().world_npc_units_max; g_max_extras = mx > 0 ? std::min<unsigned>(static_cast<unsigned>(mx), kMaxExtrasPerWorld) : kMaxExtrasPerWorld; }
   uintptr_t world = load(load(g_base + kGameGlobalRva) + 0xc0);
   uintptr_t mgr = load(world + kMetaAIOff);
   if (!mgr) return;

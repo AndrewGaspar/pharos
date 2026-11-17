@@ -83,6 +83,7 @@ struct Config {
   float world_npc_distance = 1.0f;        // [world] npc_distance
   float world_npc_units = 1.0f;           // [world] npc_units (experiment)
   float world_npc_units_log = 0.0f;       // [world] npc_units_log (diagnostics)
+  float world_npc_units_max = 0.0f;       // [world] npc_units_max: cap on extra units per world (0 = built-in)
   float world_npc_units_kill = 0.0f;      // [world] npc_units_kill (test: raise by one to kill an extra unit)
   float world_lod_distance = 1.0f;        // [world] lod_distance
   std::string world_lod_mode = "far";      // [world] lod_mode: far (patched culling shaders, LOD range max only) | all (old: scale every range)

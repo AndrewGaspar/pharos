@@ -253,7 +253,7 @@ void npc_on_present() {
     p.max_orig = cur;
     p.max_written = 0;
   }
-  k = std::clamp(k, 0.1f, 20.0f);
+  k = std::clamp(k, 0.1f, 100.0f);
   uint32_t want = static_cast<uint32_t>(std::lround(p.max_orig * static_cast<double>(k)));
   if (k == 1.0f) want = p.max_orig;
   if (cur != want) max_spawned(s) = want;

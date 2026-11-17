@@ -21,5 +21,7 @@ for arg in "$@"; do
        awk '{s+=$1; n++; c=$2} END {if (n) printf "%.0f spawned (cap %d)", s/n, c}')
   g=$(grep 'geo:' /tmp/capsweep.$$ | sed 's/.*dispatches \([0-9]*\) groups.*/\1/' | awk '{s+=$1; n++} END {if (n) printf "%.0f", s/n}')
   echo "npc_density=$d npc_distance=$dist: $sp, in view $g groups/frame"
+  ACO_INST=$t python3 "$(dirname "$0")/bands.py" | sed 's/^/  /'
+
   rm -f /tmp/capsweep.$$
 done

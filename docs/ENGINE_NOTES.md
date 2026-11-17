@@ -483,8 +483,93 @@ Found statically (headless Ghidra) and checked against a loaded story save (t1, 
 - The game autosaves its story slot right after a story load and now and then while playing. Quit
   to title screen also saves. Saves rebuild nothing else in MetaAI as far as seen.
 - Not tested: fast travel / world change with extras (spawner destruction with added units),
-  combat around extras, visual stacking at CrowdLife stations (extras share their original's slot
-  parameter).
+  combat around extras.
+- **Stacking**: none seen. With `npc_units_log=1` (logs every extra with its original) and
+  `tools/npc-re/stack.py`: of 155 activated extra/original pairs within 120 m of the harbour market,
+  140 were more than 10 m apart and 2 within 2 m. Once activated, an extra gets its own place.
+- **What limits the total** (live `capsweep.sh` after the same hop as the A/B, 120 s per step,
+  each k in its own launch; units = units of civilian spawners per band, from `bands.py`):
+
+  | npc_density:distance | k | spawned (log) | in view | units 0-40 / 40-80 / 80-120 / 120-200 / 200-400 m |
+  |---|---|---|---|---|
+  | 3:1 | 1 | 329 | 2571 | 61 / 112 / 166 / 566 / 1553 |
+  | 3:1 | 2 | 345 | 3052 | 86 / 205 / 258 / 831 / 1929 |
+  | 8:1 | 1 | 367 | 3068 | 87 / 110 / 162 / 594 / 1517 |
+  | 8:1 | 2 | 567 | 4275 | 109 / 214 / 233 / 821 / 1947 |
+  | 8:2 | 1 | 658 | 3974 | 78 / 132 / 161 / 559 / 1527 |
+  | 8:2 | 2 | 930 | 5386 | 104 / 202 / 240 / 796 / 1972 |
+
+  (k=2 with extras for activated units beyond 60 m as well, commit 7909570; an earlier run without
+  that gave 346 / 507 / 524 / 916 spawned at 3:1 / 5:1 / 8:1 / 8:2.)
+  - With k=1 the total stops at ~365 whatever the cap: demand-limited (candidates within the
+    templates' spawn distance), as found earlier.
+  - With k=2 at `npc_density=3` the total does not move (345 vs 329) and k=2 only shifts people
+    toward the player: the cap binds through the budget pressure (spawn distance x0.9 from 0.8 x cap,
+    x0.8 from 0.9 x cap; the effective cap is maxSpawned x the Environment multiplier, which looks
+    like 0.75 here: the plateau sits at 0.8 x 600 x 0.75 = 360).
+  - From `npc_density=5` up, k=2 raises the total 1.4-1.55x (567 vs 367, 930 vs 658) and every
+    distance band has more units (1.25-1.95x). Spawned people go up in proportion to the units that
+    exist, so there is no other hidden limiter. The total stays below 2x because of coverage:
+    units within 60 m of the player that are already activated only get extras after the player
+    leaves, and only units within 260 m of where the player has been are handled.
+  - Per-band *spawned* counts are not measured yet: no reliable per-unit "spawned" field was found
+    (activation record +0x30 is always 0 in story mode; unit +0x30 is a behaviour object present
+    for far units too). In-view skinning load and the total spawned are the measures used.
+- **Bug fixed in `npc.cpp`** (also in the shipped build): the SpawningManager switches between
+  SpawnSettings objects (maxSpawned 200 and 300 in Alexandria), and `npc_on_present` re-read "the
+  original" whenever the object changed, so returning to an object it had already patched
+  multiplied again (seen: 300 -> 900 -> 9000 at npc_density=10). The distance multiplier had the
+  same pattern. Originals are now kept per object (commit dce5893).
+- **Per-band spawned measure** (`tools/npc-re/spawnbands.py`): the MetaAI manager keeps the spawn
+  records of its spawned (or spawning) objectives at +0x48 ({ptr, n << 17}, vtable 0x363be88; a
+  unit's record is its +0x1b8; +0x34 == 1 marks the pending ones). The array's size follows the
+  game's spawned count (355 vs 341; after a live cap cut 223 vs 207, and the 80-120 m band emptied
+  first). Not spawn markers: activation record +0x30 (always 0 in story), unit +0x30 / +0x108
+  (behaviour objects, present for far units too), manager +0x498 (far objectives).
+- **Scaling** (k = npc_units, `npc_density=40` so the cap never binds, npc_distance 1, 768x480
+  uncapped, FG off, fresh launch at the Alexandria spawn anchor, 120 s settle, `ab-bands.sh`;
+  spawned civilians per band, two or three samples averaged; full-coverage build 4650ca2/c7061c6):
+
+  | k | 0-40 m | 40-80 m | 80-120 m | 120-200 m | total | fps | task threads (% of a core) | GPU util |
+  |---|---|---|---|---|---|---|---|---|
+  | 1 | 59 | 114 | 173 | 15 | 361 | 91.6 | 472 | 31% |
+  | 2 | 93 | 187 | 243 | 12 | 535 | 76.6 | 689 | 39% |
+  | 4 | 150 | 277 | 322 | 15 | 763 | - | - | - |
+  | 4 (fixed) | 185 | 347 | 387 | 21 | 940 | 61.1 | 726 | 34% |
+  | 6 (fixed) | 368 | 400 | 321 | 18 | 1107 | (game paused) | | |
+  | 8 (fixed) | 465 | 410 | 497 | 21 | 1393 | (game paused) | | |
+
+  k=6 and k=8: the samples were taken while the game was paused (Ubisoft service restarts during
+  the runs: task threads 0%, GPU 0%, frozen counts), so only their counts at that moment are
+  usable and fps is missing. In view at k=4: 6805 skinning groups/frame (2.7x k=1).
+- **Hard limits** (`tools/npc-re/freezetest.sh`, 240 s per step after entering story mode):
+  - k>=6 froze the game every time, 25 s to 3 min after the load: all threads waiting (task
+    threads 0%, GPU 0%), last frame on screen, no exception logged, no crash dump. Not the Havok
+    spin. Before a per-spawner cap it froze after ~1430 originals had their extras whatever k
+    was (k=6: 7075 / 7295 extras, k=8: ~10000), while k=4 (spawners up to ~240 units) never
+    froze; the frozen game had spawners with 256-422 units. So a spawner must stay below 256
+    units (u8 somewhere): extras now stop at 200 per spawner. A cap of 250 still froze once in a
+    walker soak at k=4 (spawner at exactly 250, 4606 extras), 200 ran a 12-minute soak.
+  - With that cap: k=6 ran 240 s (6535 extras, 54 fps uncapped), k=8 froze at 7635 extras
+    (155 s), k=10 at 7453 (30 s): a second, global limit at ~7500 extras, i.e. ~16.5-17k civilian
+    units in the loaded world (16658 counted in the frozen k=10 game). Which pool it is was not
+    found (a 16384-entry table is the obvious suspect). `[world] npc_units_max` caps the extras.
+  - With the per-spawner cap, k=6 gave no more spawned people than k=4 (883 vs 940): the big
+    spawners that hold most city units are already capped.
+- **Far-field crowd systems in story mode**: the `BulkWorldComponent` is live (World+0xe0 ->
+  +0x1e8; settings at +0xd0: 8192 / 160 / 70 / 40 / 0.69 / 40.0 / 1e4; pools of 8192 and 24576;
+  counters at +0x190 / +0x208: 556 / 578 in Alexandria at k=1, 1137 / 1162 at k=6). Its count
+  tracks the spawned characters (+ animals etc.), so it looks like the representation of spawned
+  MetaAI characters (jobs `SetupMetaAISpawnedUnitBulk` / `UpdateMetaAISpawnedUnitBulk`), not a
+  separate cheap far crowd. No `FakeCrowdHerder` is reachable from the World object.
+- **Soak**: k=4, npc_density=40, per-spawner cap 200: 12-minute walker soak (30 fps cap), no hang,
+  745-870 spawned (vs ~360 at k=1), 0 failed creations, our hook 0.03-0.1 ms per update (one 11 ms
+  spike while a large batch was created).
+  (First run interrupted at k=4.) Every band rises, and spawned ~= units within 120 m (the activation
+  range is the spawn limit once the cap has headroom). Coverage at k=4 was only ~2-2.8x per band:
+  spawners that had grown past 128 units were skipped (fixed in f4209f1, snapshot up to 4096). At
+  768x480 the game is CPU-bound (GPU 31-39%): k=2 costs 16% of the frame rate, almost all in the
+  task threads (+46% CPU). Our hook is 0.04 ms per MetaAI update.
 
 ### The Havok deadlock is a vanilla engine bug
 
