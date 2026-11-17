@@ -1,6 +1,7 @@
 #include "world/npc.h"
 
 #include <windows.h>
+#include <intrin.h>
 
 #include <algorithm>
 #include <atomic>
@@ -218,6 +219,19 @@ void apply_distance(uintptr_t s, Patched& p, float k) {
   if (k != 1.0f && !g_scan_thread) g_scan_thread = CreateThread(nullptr, 0, scan_thread, nullptr, 0, nullptr);
 }
 
+// TLS slot use of the process (PEB TlsBitmapBits at +0x80: 64 slots, TlsExpansionBitmapBits at
+// +0x240: 1024). The engine's RW locks each take a TlsAlloc slot; when all 1088 are used the next
+// lock gets index -1 and deadlocks its first writer: the freeze with ~1000+ spawned characters.
+unsigned tls_used() {
+  auto* peb = reinterpret_cast<const uint8_t*>(__readgsqword(0x60));
+  unsigned used = 0;
+  for (int i = 0; i < 2; ++i) used += __builtin_popcount(*reinterpret_cast<const uint32_t*>(peb + 0x80 + 4 * i));
+  for (int i = 0; i < 32; ++i) used += __builtin_popcount(*reinterpret_cast<const uint32_t*>(peb + 0x240 + 4 * i));
+  return used;
+}
+constexpr unsigned kTlsSlots = 64 + 1024;
+unsigned g_tls_min_free = kTlsSlots;
+
 } // namespace
 
 void npc_on_present() {
@@ -275,7 +289,10 @@ void npc_on_present() {
   static ULONGLONG last_stat = 0;
   if (now - last_stat >= 10000) {
     last_stat = now;
-    ACO_LOG("npc: %u spawned, maxSpawned %u (x%.3g quality = cap %.0f)", spawned_count(g_mgr), max_spawned(s), mult, max_spawned(s) * mult);
+    unsigned tls_free = kTlsSlots - tls_used();
+    g_tls_min_free = std::min(g_tls_min_free, tls_free);
+    ACO_LOG("npc: %u spawned, maxSpawned %u (x%.3g quality = cap %.0f), TLS slots free %u (min %u)", spawned_count(g_mgr),
+            max_spawned(s), mult, max_spawned(s) * mult, tls_free, g_tls_min_free);
   }
 }
 

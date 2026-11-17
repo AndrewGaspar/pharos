@@ -31,9 +31,11 @@ run_one() {  # one launch + measurement of $k $d $dist; prints the block; return
   g=$(grep 'geo:' /tmp/abbands.$$ | sed 's/.*dispatches \([0-9]*\) groups.*/\1/' | awk '{s+=$1; n++} END {if (n) printf "%.0f", s/n}')
   sp=$(grep 'npc: [0-9]* spawned' /tmp/abbands.$$ | sed 's/.*npc: \([0-9]*\) spawned.*/\1/' | awk '{s+=$1; n++} END {if (n) printf "%.0f", s/n}')
   extra=$(grep 'npc_units: [0-9]* extra\|npc_units: cost' /tmp/abbands.$$ | tail -2 | sed 's/.*npc_units: /  /')
+  tls=$(grep -o 'TLS slots free [0-9]* (min [0-9]*)' /tmp/abbands.$$ | tail -1)
   rm -f /tmp/abbands.$$
   task=$(echo "$out" | sed -n 's/.*TaskThread# \([0-9]*\).*/\1/p')
   echo "$out"
+  echo "  ${tls:-TLS: no reading}"
   echo "  fps $fps | in view $g groups/frame | game spawned count $sp"
   [[ -n $extra ]] && echo "$extra"
   # Paused game (Ubisoft service hiccup, menu): task threads idle or no frames measured.

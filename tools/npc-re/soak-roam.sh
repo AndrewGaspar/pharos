@@ -22,7 +22,8 @@ while ((SECONDS < end)) && kill -0 $rpid 2>/dev/null; do
   ex=$(grep 'npc_units: [0-9]* extra' "$L" | tail -1 | sed 's/.*npc_units: \([0-9]*\) extra units (\([0-9]*\) units handled, \([0-9]*\) failed).*/\1 extras, \3 failed/')
   co=$(grep 'npc_units: cost' "$L" | tail -1 | sed 's/.*ours \([0-9.]*\) ms avg \/ \([0-9.]*\) ms max/ours \1 ms avg, \2 max/')
   fr=$(grep -o 'fg real [0-9.]* fps\|perf: [0-9.]* fps' "$L" | tail -1)
-  echo "$(date -u +%H:%M:%S) $(tail -1 /tmp/roamer.$$) | spawned ${sp:-?} | ${ex:-?} | ${co:-?} | ${fr:-?} | log age ${age}s"
+  tl=$(grep -o 'TLS slots free [0-9]* (min [0-9]*)' "$L" | tail -1)
+  echo "$(date -u +%H:%M:%S) $(tail -1 /tmp/roamer.$$) | spawned ${sp:-?} | ${ex:-?} | ${co:-?} | ${fr:-?} | ${tl:-TLS ?} | log age ${age}s"
   if ((age > 20)); then echo "HANG: log silent ${age}s"; hang=1; break; fi
 done
 kill $rpid 2>/dev/null; wait $rpid 2>/dev/null
