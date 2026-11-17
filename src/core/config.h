@@ -72,6 +72,8 @@ struct Config {
   bool reflex_probe = false;
   float world_npc_density = 1.0f;         // [world] npc_density
   float world_npc_distance = 1.0f;        // [world] npc_distance
+  float world_npc_units = 1.0f;           // [world] npc_units (experiment)
+  float world_npc_units_kill = 0.0f;      // [world] npc_units_kill (test: raise by one to kill an extra unit)
   float world_lod_distance = 1.0f;        // [world] lod_distance      // [reflex] probe (input thread diagnostics)
   std::string cloth_mode = "game";  // [cloth] mode: game | render | scale (see cloth/cloth.h)
   float cloth_scale = 1.0f;         // [cloth] scale (mode=scale, diagnostics)

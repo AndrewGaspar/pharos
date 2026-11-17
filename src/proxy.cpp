@@ -21,6 +21,7 @@
 #include "fg/vk_device_ext.h"
 #include "core/memtool.h"
 #include "world/npc.h"
+#include "world/npc_units.h"
 #include "world/teleport.h"
 #include "world/world.h"
 #include "core/framedump.h"
@@ -78,6 +79,7 @@ HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain* self, UINT sync, UINT flags
     memtool_poll();
     world_on_present();
     npc_on_present();
+    npc_units_on_present();
     framedump_on_present(self);
     mapstats_on_present();
     peek_on_present();
