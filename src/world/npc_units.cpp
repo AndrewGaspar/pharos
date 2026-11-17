@@ -47,6 +47,7 @@ constexpr float kRingOuter = 400.0f;
 constexpr unsigned kMaxExtrasPerWorld = 60000;  // hard ceiling; [world] npc_units_max lowers it
 std::atomic<unsigned> g_max_extras{kMaxExtrasPerWorld};
 constexpr unsigned kMaxCreatePerStep = 96;
+constexpr uint32_t kMaxUnitsPerSpawner = 250;  // see augment_spawner
 
 uintptr_t g_base = 0;
 std::atomic<int> g_k{1};
@@ -187,6 +188,10 @@ unsigned augment_spawner(uintptr_t mgr, uintptr_t sp, int k, float px, float py,
     float pos[4];
     memcpy(pos, reinterpret_cast<void*>(u + 0x10), 16);
     for (int j = 1; j < k; ++j) {
+      // A spawner with more than 255 units freezes the game a few seconds later (k=6 and k=8 both
+      // froze after ~1430 originals had their extras, at different extra counts, while k=4 with
+      // spawners of up to ~60 originals -> 240 units ran fine): keep every spawner below that.
+      if ((rd<uint32_t>(sp + 0xa8) >> 17) >= kMaxUnitsPerSpawner) break;
       float a = 2.39996f * (i * 7 + j);  // spread around the original, 1.0-2.0 m away
       float r = 1.0f + 0.25f * (j % 5);
       float q[4] = {pos[0] + r * std::cos(a), pos[1] + r * std::sin(a), pos[2], pos[3]};
