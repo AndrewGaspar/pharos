@@ -60,9 +60,8 @@ show the scene (background props, the character's arm) between the two real posi
 double images. Synthetic check (`tools/interop-test/dlssg_d3d12_test.cpp`): a square moving 16 px
 per frame is generated at x = 226 between real 220 and 236 (count 1 and 2).
 
-DLSS-G on D3D12 costs ~1.55 ms GPU per evaluation at 768x480 (count=1). `count=1` (one generated
-frame per real frame) generates on D3D12; the "last index is the real-frame call" reading from the
-Vulkan-route reverse engineering below doesn't hold here.
+DLSS-G on D3D12 costs ~1.55 ms GPU per evaluation at 768x480 (2x). (The option then called `count=1`, one
+generated frame per real frame, is now `count=2`, the multiplier; see "Multi Frame Generation" for 3x-6x.)
 
 ### D3D12 route measurements (2026-11-16)
 
@@ -391,6 +390,186 @@ the frame interval. Above `auto_cap_lag` (0.7 frames), or any `join` wait, the c
 0.55 it rises 1 %, or 4 % when below 0.35. It starts 2 s after FG starts, at 90 % of the rate then,
 and is enforced through the Reflex limiter. Expect a small sawtooth of a few fps as it probes for
 the knee; `auto_cap_min/max` bound it.
+
+### Multi Frame Generation (2026-11-17)
+
+`[fg] count` = frames presented per real frame: 2 (2x, the default) .. 6 (6x), or `auto`. Older
+inis said `count=1` for 2x (DLSS-G's own MultiFrameCount); anything below 2 still means 2x.
+
+**How raw NGX does it** (no Streamline). The FG programming guide (310.7, "Evaluating the Feature" and
+"Presenting Multiple Generated Frames") and the header agree, and the synthetic test confirms it:
+
+- One `EvaluateFeature` per generated frame. `DLSSG.MultiFrameCount` = generated frames per real
+  frame (1 = 2x, 3 = 4x, 5 = 6x), `DLSSG.MultiFrameIndex` = 1..MultiFrameCount, each call with its
+  own `OutputInterpolated`; all other parameters (inputs, camera, Reset, BackbufferFrameID) are the
+  same for the calls of one real frame. Index i is generated at t = i / (MultiFrameCount + 1)
+  between the previous and the current real frame. (The "last index is the real frame" reading of
+  the Vulkan-route reverse engineering below is wrong: every index is a generated frame.)
+- `DLSSG.MultiFrameCountMax` (capability parameter) is **5** with the SDK's nvngx_dlssg 310.9.16 on
+  the RTX 5070 Laptop: 6x needs no newer DLL. `MultiFrameCount=6` fails every Evaluate with
+  `0xbad00005` (invalid parameter). The driver profile can lower the maximum ("DRS
+  MULTI_FRAME_COUNT_LIMIT clamping max frame count" in the DLL).
+- The feature is created with a MultiFrameCount, but **an evaluation may use any count up to it,
+  changing per frame** without re-creating the feature or a Reset: created with 5, evaluated with 2
+  and 3 alternately, every index comes out where a feature created with that count puts it, and the
+  GPU cost is that of the smaller count. So the dynamic multiplier is free; the mod creates the
+  feature (and the texture sets' outputs) for the largest count it may use.
+- Separate command lists per index work (the state lives in the feature): the mod submits each index
+  on its own, with its own completion fence value and timestamps, so the present thread can show
+  index 1 while the others are still being generated (what the guide recommends).
+- **Dynamic MFG is not in the DLL.** `DLSSG.DynamicMaxFrameCount`, `DLSSG.Dynamic.ReflexDriven`,
+  `DLSSG.TargetFrameRate`, `DLSSG.RefreshRate`, `DLSSG.StreamlineMode`, VSync and FlipMetering are
+  read from the evaluate parameters into one block (nvngx_dlssg.dll `0x1800635xx`), and only used for
+  the telemetry record and the debug indicator text (`StreamlineMode` 2 = "Auto", 3 = "Dyn" / "Dyn
+  DRV" when ReflexDriven; `- %ux/%ux` = DynamicMaxFrameCount + 1; `- %.0fHz` = TargetFrameRate). They
+  are not capability parameters and `GetCurrentSettings` doesn't report them. The per-frame choice is
+  the integrator's (Streamline's pacer or the driver); the DLL only consumes MultiFrameCount. So the
+  mod has its own controller (below). `GetCurrentSettings` only reports `DLSSG.MustCallEval=1`.
+
+**GPU cost** (synthetic test, `dlssg_d3d12_test.exe <dir> <count> s 24 40 2560 2560 2560 1600`,
+2560x1600, one command list per index, GPU otherwise nearly idle):
+
+| multiplier | 2x | 3x | 4x | 5x | 6x |
+|---|---|---|---|---|---|
+| generated frames | 1 | 2 | 3 | 4 | 5 |
+| DLSS-G GPU time per real frame | 2.47 ms | 4.11 ms | 5.81 ms | 7.50 ms | 9.11 ms |
+
+The first generated frame costs ~2.5 ms, every further one ~1.6 ms (optical flow and the network's
+shared work are done once per real frame; at 512x256: 0.9 and 0.45 ms). In the synthetic
+scene the measured positions lag t by up to ~0.1 (the 2x frame sits at t ≈ 0.39, as before), but
+every index is written, in order, and identical to the same t of another count (index 3 of 5 =
+index 1 of 1 = index 2 of 3 at t = 0.5).
+
+**Design** (src/fg/fg_d3d12.cpp):
+
+- *Texture sets* (`Set`): per set the colour/depth/MV/HUD-less inputs, the real-frame copy and one
+  `OutputInterpolated` per generated index (count 2: as before, one; the `scratch` output is gone).
+  Per index the completion value, timestamp ring slot and its old end timestamp (ts_guard check).
+- *Evaluation*: one submission per index (`submit(..., after_d3d11 = i == 1)`: only the first waits
+  for the D3D11 inputs fence), ring of `2 x 5 + 4` command allocators / timestamp pairs.
+- *Present thread*: a job holds n generated frames; each is waited for (fence + timestamp check),
+  paced and presented, then the real frame. Step = real-frame interval / multiplier (2x: half an
+  interval, as before; the interval counts at most 50 ms). `pace=smooth` generalised: generated 1 is
+  held until one step after the previous real present minus `pace_relax` of how early it is, every
+  later present (generated 2.., then the real one) one step after the previous one's Present call.
+  `ready` / `arrival` / `content` likewise (content: generated k at arrive + L − dt·(m − k)/m). A job
+  superseded before it starts presents only its real frame, as before; a generated frame that isn't
+  ready within 100 ms drops it and the rest of its job's generated frames.
+- *Trace*: presents.csv gains `gi,gn` (generated index, multiplier); `tools/fg-pacing.py` reports
+  the shift ratio per index (expected gi/gn), ordering (G1..Gk of one real frame in order), and
+  works unchanged on old traces (identical 2x output).
+- *Refresh target*: `[fg] refresh_hz=0` (new default) detects the display refresh (swapchain
+  fullscreen mode, else `EnumDisplaySettings` of the swapchain's output; logged as `fg12: display
+  refresh`), passed to DLSS-G as `DLSSG.RefreshRate`; `[fg] target_hz` (0 = that refresh) is the
+  presents/s to aim for.
+- *auto_cap* generalised: cap = min(headroom cap, target / multiplier). The headroom cap is the
+  feedback described above (DLSS-G's first generated frame done within `auto_cap_lag` frames, no
+  joins); it now rises only while it is the binding cap, otherwise it climbed unchecked while the
+  refresh cap held the rate. With VRR at 165 Hz: 82.5 real fps at 2x, 55 at 3x, 41.25 at 4x.
+- *count=auto* (dynamic): every second, in `[count_min, count_max]` (default 2..4): one step up when
+  the headroom cap stays more than 10 % below target / multiplier for 2 s (within 10 % the lower
+  multiplier at the headroom cap is the better trade); one step down when the frame's own work
+  (frame interval minus the time the limiter / Reflex slept, `reflex_wait_us()`) leaves 15 % headroom
+  for target / (multiplier − 1) and DLSS-G's lag scaled to the shorter interval stays below
+  auto_cap_lag − 0.15, for 3 s. A step down undone within 6 s blocks further steps down for 10 s,
+  doubling to 60 s. Windows with a hitch (real fps below 60 % of the cap: loading, a trace being
+  written, a config change) never change the multiplier. Without auto_cap (or with an explicit `[reflex] fps_limit`) the multiplier is
+  floor(target / real fps + 0.1). The log line `fg12: auto cap ... fps, Nx (...)` reports every
+  change.
+- *Perf line*: `generated` counts generated presents; `GPU x ms/frame` is per real frame (all its
+  generated frames), followed by the time per generated frame and the effective multiplier.
+  `fg12 DLSS-G lag split` decomposes the auto-cap lag: game Present → DLSS-G starts on the GPU, its
+  GPU duration, GPU end → present thread awake (timestamps mapped with `GetClockCalibration`).
+
+**Measurements** (t2, 2560x1600, DLSS at PixelDensity 0.6 (render 1536x960), Ultra High, Reflex on,
+only this game on the GPU, constant-rate spin `tools/fg-series`; gamescope headless at 165 Hz
+(detected: `display refresh 165.00 Hz (swapchain mode, fullscreen)`); Siwa unless noted. "cap" =
+how the real rate was limited: auto = `auto_cap` (headroom + refresh target), a number = `[reflex]
+fps_limit`. Shift ratio: median (p10–p90) per generated index, expected k/N.)
+
+| config | real fps | presents/s | present interval sd | game arrival interval | shift ratio per index | outside [0,1] / out of order | VRR position residual mean / p90 px |
+|---|---|---|---|---|---|---|---|
+| 2x, auto (63 cap) | 57.9 | 116 | 0.46 ms | 17.3 ± 1.28 | 0.500 (0.489–0.527) | 1 / 0 of 118 | 4.15 / 7.64 |
+| 2x, 55 | 54.9 | 110 | 0.41 | 18.2 ± 0.93 | 0.500 (0.481–0.544) | 0 / 0 | 2.88 / 6.71 |
+| 2x, 41.25 | 41.2 | 82 | 0.39 | 24.3 ± 0.92 | 0.500 (0.475–0.526) | 0 / 0 | 3.95 / 8.72 |
+| **3x, auto** (refresh cap 55) | 54.8 | **164.4** | 0.35 | 18.2 ± 1.07 | 0.333 (0.329–0.345), 0.666 (0.656–0.676) | 2 / 0 of 156 | **1.94 / 3.65** |
+| 3x, 55 | 54.8 | 164.5 | 0.31 | 18.2 ± 0.99 | 0.333 (0.327–0.339), 0.666 (0.661–0.673) | 0 / 0 | 1.71 / 3.45 |
+| 3x, 41.25 | 41.2 | 124 | 0.34 | 24.3 ± 0.95 | 0.333 (0.319–0.347), 0.666 (0.655–0.682) | 0 / 0 | 2.50 / 6.01 |
+| **4x, auto** (refresh cap 41.25) | 41.2 | **165.1** | 0.35 | 24.3 ± 1.20 | 0.250, 0.501, 0.750 (p10–p90 ±0.015) | 0 / 0 of 174 | 3.24 / 6.99 |
+| 4x, 41.25 | 41.0 | 164.0 | 0.28 | 24.4 ± 0.95 | 0.250, 0.500, 0.750 | 1 / 0 | 2.04 / 4.63 |
+| **count=auto** | 54.8 (3x) | 164.6 | 0.31 | 18.2 ± 0.84 | 0.333, 0.666 | 0 / 0 | 1.79 / 3.79 |
+| Alexandria (DT, npc_density=3, npc_distance=2): 2x, auto | 42.8 | 86 | 1.79 | 23.4 ± 1.80 | 0.500 (0.477–0.534) | 1 / 0 | 4.24 / 8.36 |
+| Alexandria: count=auto (two traces) | 54.8 (3x) | 164.5 / 164.7 | 0.42 / 0.39 | 18.3 ± 1.20 | 0.333, 0.666 | 0 / 0 | 2.26 / 5.00, 2.92 / 6.28 |
+
+Every generated index sits at k/N with the same tight spread as 2x, nothing out of order, the
+completion check never fired (0 of all), no generated frames dropped and the game never waited for
+the present thread in the steady state. Present intervals are as even as at 2x (sd 0.3–0.35 ms; the
+transitions into a real frame are ±0.03 ms, the ones after it carry pace_relax). The position residual
+is a judder measure in px of image motion: at the same base rate 3x is below 2x (1.7 vs 2.9 px at 55,
+2.5 vs 4.0 at 41) - each present moves the image by a smaller step and the cadence stays even.
+
+5x and 6x (gamescope `-r 480`, `scripts/aco up t2 --refresh 480`; detected 480 Hz, target 480
+presents/s): every index exact (5x: 0.200 / 0.400 / 0.601 / 0.800; 6x: 0.167 / 0.333 / 0.500 / 0.666 /
+0.833, p10–p90 within ±0.02), 0 outside, 0 out of order; the base is GPU-limited at 38–45 real fps
+there (226–263 presents/s; GPU 8.3–8.6 ms per real frame at 5x, 10.1–13.2 at 6x), so 6x needs a
+faster GPU or a lower resolution to reach 480.
+
+GPU cost in game (perf line, per real frame; overlaps the game's own GPU work): 2x 2.6–2.9 ms, 3x
+4.8–5.3 ms, 4x 6.3 ms, 5x 8.3–8.6 ms, 6x 10.1–13.2 ms; 2.1–2.6 ms per generated frame.
+
+**Latency** (`tools/latency-bench`, 40 mouse-look injections, fresh launch each, same session):
+
+| config | real fps | presents/s | input → Present called | input → frame done (p10–p90) | generated / real presented after the game's Present | ≈ input → first generated / real frame presented |
+|---|---|---|---|---|---|---|
+| 2x, auto cap | 63.7 | 127 | 53.2 | 60.6 (55.0–68.5) | +10.1 / +17.9 | ~63 / ~71 |
+| 2x, 55 | 54.8 | 110 | 64.0 | 69.9 (63.9–79.3) | +10.0 / +19.1 | ~74 / ~83 |
+| 3x, 55 | 54.8 | 165 | 66.6 | 73.9 (66.7–79.5) | +11.1 / +23.2 | ~78 / ~90 |
+| 4x, 41.25 | 41.1 | 165 | 83.9 | 91.1 (82.2–102.2) | +10.4 / +28.5 | ~94 / ~112 |
+| count=auto (3x at 54.4) | 54.4 | 163 | 67.0 | 74.1 (68.4–81.9) | +10.3 / +22.5 | ~77 / ~90 |
+
+Latency is set by the base rate (the game's own pipeline is ~3 frames): at the same 55 fps base, 3x
+costs ~4 ms more to the first generated frame and ~7 ms more to the real one (held (m − 1)/m instead of
+1/2 of an interval) over 2x, but shows 165 instead of 110 frames per second. 4x at 41 fps adds ~20 ms
+over 3x at 55 because the base is slower.
+
+F9 (`tools/fg-toggle-test t2 6 fg.count=3`): six toggles, no hang or exception, 3x back after every
+re-enable (141–154 presents/s while running with the character, verify: the 2/3 frame strictly between
+its neighbours in 95 % of moving samples). Count changes in the live ini work (the outputs and the
+feature are re-created: one ~1 s hitch); count=auto never re-creates (made for count_max).
+
+**Two fixes found on the way:**
+- *The present thread could stay behind after a hitch* (seen at 4x after a live count change: 1.2 s
+  stall, then G presented 60–100 ms after the game's Present for seconds, the game blocked in join
+  and running at ~28 fps). The real-frame interval EMA came from the game's arrivals, and while the
+  game waits for the present thread its frames are exactly as long as the present thread's jobs, so
+  the pacing step never shrank: a neutral loop with no way back. The game's join waits are now taken
+  out of the interval; afterwards 4x ran clean from a fresh launch and after count changes.
+- *fg-pacing.py at 3x+*: one real frame moves the image 100–200 px in the spin, too much for one
+  phase correlation of the band: the direct R→R′ shift sometimes failed (the "inversions" in the
+  first 4x runs were that, every consecutive step was consistent). MFG runs use the sum of the
+  consecutive shifts; 2x output is unchanged.
+
+**auto_cap in partly CPU-bound scenes** (question from the NPC runs: ~55 real fps at 2x in story
+Alexandria with the GPU ~64 % busy). The lag split (`fg12 DLSS-G lag split`) shows where the "DLSS-G
+done" time goes: DLSS-G *starts* on the GPU 6–9 ms after the game's Present (the game's own frame
+still finishing on the GPU, plus our copies), runs 2.6–2.8 ms, and the present thread is awake
+0.3–0.8 ms after the GPU end (1–4 ms more only while the pipeline is overloaded). So the 0.7-frame
+target effectively keeps the game's GPU frame plus DLSS-G under ~70 % of the frame interval: the cap
+follows GPU latency, not GPU queue depth, and that is why it stops at ~64 % busy. In Alexandria (DT,
+npc_density 3) measuring from DLSS-G's GPU end (`[fg] auto_cap_lag_from=gpu`, new) let the 2x cap
+climb from 48 to 58–62 fps, but the result was worse: VRR residual 8.2 / 14.2 px and 6 ratio
+outliers against 4.2 / 8.4 and 1 (arrival sd 1.17 vs 1.80 ms). The default stays `ready`, 0.7. For a
+CPU-bound base the answer is MFG: count=auto went to 3x at 55 fps there (165 presents/s, residual
+2.3–2.9 px, 0 outliers).
+
+**Recommended for the user's 165 Hz VRR panel**: `count=auto` (count_min 2, count_max 4) with the
+defaults (`auto_cap=1`, `auto_cap_lag=0.7`, `refresh_hz=0`, `target_hz=0`, `pace=smooth`), or a
+fixed `count=3`. In both the cap is at most 165 / N, so presents stay at or below the refresh: 2x
+whenever the game holds 82.5 fps with headroom, 3x at 55 when it holds that (Siwa and dense
+Alexandria here), 4x at 41.25 below that. For a fixed base, `[reflex] fps_limit=55` with `count=3`
+was the steadiest single setting measured (sd 0.31 ms, residual 1.7 px). 5x/6x only make sense on
+360–500 Hz displays (set `count=auto` with `count_max=6`, or the count), and need a GPU that can
+afford 8–10+ ms of DLSS-G per real frame at that resolution.
 
 ## Vulkan route (`mode=on`, not working)
 

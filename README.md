@@ -43,6 +43,11 @@ Press **F9** in game (`[fg] toggle_key`) to turn DLSS Frame Generation on and of
 `[fg] mode=d3d12`, the default; `[fg] enabled` sets the state at start). Off presents each frame
 straight away like `mode=off`, so the latency difference can be felt directly.
 
+DLSS Multi Frame Generation (RTX 50): `[fg] count=2..6` sets the multiplier (frames presented per
+real frame, up to 6x with the SDK's nvngx_dlssg 310.9.16), `count=auto` picks it per second so that
+real fps x multiplier reaches the display refresh (`[fg] target_hz`, default the detected refresh;
+the real rate is capped at refresh / multiplier). See docs/FRAME_GENERATION.md, "Multi Frame Generation".
+
 ## How it works
 
 See [docs/ENGINE_NOTES.md](docs/ENGINE_NOTES.md) for the reverse-engineered frame structure.
