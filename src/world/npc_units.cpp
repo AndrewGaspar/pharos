@@ -154,13 +154,15 @@ bool in_view(float x, float y, float z) {
 // before. Units are handled one by one (big spawners have 60+ units spread over a district, some of
 // them always active near the player). Returns the number of units created.
 unsigned augment_spawner(uintptr_t mgr, uintptr_t sp, int k, float px, float py, unsigned budget) {
-  constexpr uint32_t kMaxUnits = 128;
+  // Spawners grow by k-1 units per original, and a spawner can be handled over several steps
+  // (step budget, units deferred while in view), so this must hold k x the biggest spawner.
+  constexpr uint32_t kMaxUnits = 4096;
   uintptr_t arr = rd<uintptr_t>(sp + 0xa0);
   uint32_t n = rd<uint32_t>(sp + 0xa8) >> 17;
   uintptr_t ents = rd<uintptr_t>(sp + 0xc2);
   uint32_t ne = rd<uint32_t>(sp + 0xca) >> 17;
   if (!n || n > kMaxUnits || !ne || ne > 64 || !arr || !ents) return 0;
-  uintptr_t units[kMaxUnits];
+  static uintptr_t units[kMaxUnits];  // sim thread only
   memcpy(units, reinterpret_cast<void*>(arr), n * 8);  // the array grows while we add
   unsigned made = 0;
   for (uint32_t i = 0; i < n && made < budget && g_extras < kMaxExtrasPerWorld; ++i) {
