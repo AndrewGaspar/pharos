@@ -26,6 +26,7 @@ using PFN_Sleep = nv::Status(__cdecl*)(IUnknown*);
 using PFN_GetSleepStatus = nv::Status(__cdecl*)(IUnknown*, nv::GetSleepStatusParams*);
 using PFN_SetLatencyMarker = nv::Status(__cdecl*)(IUnknown*, nv::LatencyMarkerParams*);
 
+struct Sleeper;
 struct State {
   std::mutex mutex;
   bool loaded = false, available = false;
@@ -40,16 +41,26 @@ struct State {
   std::string applied_mode;
   float applied_limit = -1.0f;
   bool applied_optimize = false;
+  std::string applied_limiter;
+  int64_t cap_next = 0;  // [reflex] limiter=cpu: when the next frame may start
   bool sleeping = false;
   // Robustness: Reflex is only armed after kArmFrames stable presents (not during startup /
-  // device probing / swapchain changes), and the sleep runs on a watchdog thread: DXVK waits on
-  // the driver's semaphore with no timeout, so a confused frame mapping would otherwise hang the
-  // game (seen once at startup). On a stall Reflex is switched off for the rest of the session.
+  // device probing / swapchain changes), and the sleep runs on a sleeper thread with a watchdog:
+  // DXVK waits on the driver's semaphore with no timeout, so a confused frame mapping could hang the
+  // game (seen once at startup). A sleep that overruns the watchdog is usually just a hitch (e.g.
+  // Frame Generation's D3D12/NGX initialisation, ~0.7 s, or loading), so the render thread carries
+  // on without sleeping until the sleeper returns, then Reflex resumes. Only a sleep that hasn't
+  // returned after kHangMs counts as a hang: the sleep mode is switched off (which can release the
+  // wait), a fresh sleeper is started and Reflex is re-armed; after kMaxHangs it stays off.
   IDXGISwapChain* swapchain = nullptr;
   uint32_t stable_frames = 0;
-  bool stalled = false;
+  bool stalled = false;  // given up for the session
   HANDLE sleep_req = nullptr, sleep_done = nullptr;
   std::atomic<bool> sleeper_busy{false};
+  std::atomic<int64_t> sleep_started{0};
+  struct Sleeper* sleeper = nullptr;  // when the sleeper's current sleep began
+  int64_t overrun_since = 0;              // render thread stopped sleeping (watchdog) at
+  uint32_t overrun_skips = 0, overruns = 0, hangs = 0;
   // perf
   double sleep_ms_sum = 0;
   uint32_t sleeps = 0;
@@ -90,27 +101,47 @@ bool load() {
 
 constexpr uint32_t kArmFrames = 240;
 
-DWORD WINAPI sleeper_main(void*) {
+constexpr int64_t kHangMs = 3000;
+constexpr uint32_t kMaxHangs = 3;
+
+// One sleeper thread at a time; after a hang a new one (with new events) replaces it and the old one
+// is left to finish (or stay blocked) on its own.
+struct Sleeper {
+  HANDLE req, done;
+  std::atomic<bool>* busy;
+};
+DWORD WINAPI sleeper_main(void* arg) {
+  Sleeper* sl = static_cast<Sleeper*>(arg);
   for (;;) {
-    WaitForSingleObject(S.sleep_req, INFINITE);
+    WaitForSingleObject(sl->req, INFINITE);
     S.sleep(S.dev);
-    S.sleeper_busy.store(false);
-    SetEvent(S.sleep_done);
+    sl->busy->store(false);
+    SetEvent(sl->done);
+    if (sl->req != S.sleep_req) return 0;  // replaced after a hang: retire
   }
 }
 
-// Runs NvAPI_D3D_Sleep on the sleeper thread; false if it didn't return within the timeout.
-bool sleep_with_watchdog(DWORD timeout_ms) {
-  if (!S.sleep_req) {
-    S.sleep_req = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    S.sleep_done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    HANDLE t = CreateThread(nullptr, 0, sleeper_main, nullptr, 0, nullptr);
-    if (t) CloseHandle(t);
-  }
-  if (S.sleeper_busy.load()) return false;  // a previous sleep never returned
-  S.sleeper_busy.store(true);
+void start_sleeper() {
+  auto* sl = new Sleeper{CreateEventW(nullptr, FALSE, FALSE, nullptr), CreateEventW(nullptr, FALSE, FALSE, nullptr),
+                         new std::atomic<bool>(false)};
+  S.sleep_req = sl->req;
+  S.sleep_done = sl->done;
+  S.sleeper = sl;
+  HANDLE t = CreateThread(nullptr, 0, sleeper_main, sl, 0, nullptr);
+  if (t) CloseHandle(t);
+}
+
+enum class SleepResult { ok, overrun, still_busy };
+
+// Runs NvAPI_D3D_Sleep on the sleeper thread and waits up to timeout_ms for it.
+SleepResult sleep_with_watchdog(DWORD timeout_ms) {
+  if (!S.sleeper) start_sleeper();
+  if (S.sleeper->busy->load()) return SleepResult::still_busy;  // the previous sleep hasn't returned
+  S.sleeper->busy->store(true);
+  S.sleep_started.store(now_us());
+  ResetEvent(S.sleep_done);  // a sleep that overran signalled it after we stopped waiting: stale
   SetEvent(S.sleep_req);
-  return WaitForSingleObject(S.sleep_done, timeout_ms) == WAIT_OBJECT_0;
+  return WaitForSingleObject(S.sleep_done, timeout_ms) == WAIT_OBJECT_0 ? SleepResult::ok : SleepResult::overrun;
 }
 
 // (Re)applies the sleep mode when the config or the device changed.
@@ -118,8 +149,9 @@ void apply_mode() {
   const Config& cfg = config();
   if (S.stalled) return;
   if (S.applied_dev == S.dev && S.applied_mode == cfg.reflex && S.applied_limit == cfg.reflex_fps_limit &&
-      S.applied_optimize == cfg.reflex_optimize)
+      S.applied_optimize == cfg.reflex_optimize && S.applied_limiter == cfg.reflex_limiter)
     return;
+  S.applied_limiter = cfg.reflex_limiter;
   S.applied_optimize = cfg.reflex_optimize;
   S.applied_dev = S.dev;
   S.applied_mode = cfg.reflex;
@@ -128,7 +160,8 @@ void apply_mode() {
   p.version = nv::kSetSleepModeVer;
   p.bLowLatencyMode = cfg.reflex == "on" || cfg.reflex == "boost";
   p.bLowLatencyBoost = cfg.reflex == "boost";
-  p.minimumIntervalUs = cfg.reflex_fps_limit > 0 ? static_cast<nv::NvU32>(1e6 / cfg.reflex_fps_limit) : 0;
+  p.minimumIntervalUs = cfg.reflex_fps_limit > 0 && cfg.reflex_limiter != "cpu"
+                            ? static_cast<nv::NvU32>(1e6 / cfg.reflex_fps_limit) : 0;
   p.bUseMarkersToOptimize = cfg.reflex_optimize;
   nv::Status st = S.set_sleep_mode(S.dev, &p);
   S.sleeping = st == 0 && p.bLowLatencyMode;
@@ -309,8 +342,30 @@ void reflex_on_present_begin(IDXGISwapChain* sc) {
 // the render queue. Frames are delimited for the driver with markers, one app frame per Present
 // (SIMULATION_START right after the sleep ... PRESENT_END). Without markers DXVK has to make the
 // sleep wait for its CS thread to finish the previous frame, which costs throughput when CPU-bound.
+// [reflex] limiter=cpu: our own frame cap on the render thread (independent of the driver's Reflex
+// limiter, and of whether Reflex is on). Frame starts are kept on a fixed grid of 1/fps_limit; if the
+// game falls behind by more than a frame the grid restarts from now (no catch-up bursts).
+void cpu_limit() {
+  const Config& cfg = config();
+  if (cfg.reflex_limiter != "cpu" || cfg.reflex_fps_limit <= 0) {
+    S.cap_next = 0;
+    return;
+  }
+  int64_t interval = static_cast<int64_t>(1e6 / cfg.reflex_fps_limit);
+  int64_t now = now_us();
+  if (!S.cap_next || now - S.cap_next > interval) S.cap_next = now;
+  for (;;) {
+    int64_t left = S.cap_next - now_us();
+    if (left <= 0) break;
+    if (left > 1500) Sleep(static_cast<DWORD>((left - 1000) / 1000));
+    else YieldProcessor();
+  }
+  S.cap_next += interval;
+}
+
 void reflex_on_present_end() {
   std::lock_guard lock(S.mutex);
+  cpu_limit();
   if (!S.available || !S.sleeping || S.stalled || S.stable_frames < kArmFrames) return;
   if (S.frame_begun) marker(nv::PRESENT_END);
   ++S.frame_id;
@@ -318,15 +373,39 @@ void reflex_on_present_end() {
   // Generous: a legitimate sleep is at most about one frame (or one fps_limit interval).
   float limit = config().reflex_fps_limit;
   DWORD timeout = 500 + (limit > 0 ? static_cast<DWORD>(2000.0f / limit) : 0);
-  if (!sleep_with_watchdog(timeout)) {
-    S.stalled = true;
-    S.sleeping = false;
-    nv::SetSleepModeParams off{};
-    off.version = nv::kSetSleepModeVer;
-    nv::Status st = S.set_sleep_mode(S.dev, &off);
-    ACO_LOG("reflex: sleep did not return within %lu ms; Reflex disabled for this session (SetSleepMode off -> %d)",
-            timeout, st);
+  SleepResult r = sleep_with_watchdog(timeout);
+  if (r != SleepResult::ok) {
+    if (r == SleepResult::overrun) {
+      S.overrun_since = t0;
+      S.overrun_skips = 0;
+      ++S.overruns;
+      ACO_LOG("reflex: sleep did not return within %lu ms (hitch?); not sleeping until it does", timeout);
+    } else {
+      ++S.overrun_skips;
+      int64_t waited = (now_us() - S.sleep_started.load()) / 1000;
+      if (waited > kHangMs) {
+        // A real hang: switch the sleep mode off (may release the driver's wait), replace the sleeper
+        // and re-arm (apply_mode re-applies the mode on the next present) - or give up.
+        ++S.hangs;
+        nv::SetSleepModeParams off{};
+        off.version = nv::kSetSleepModeVer;
+        nv::Status st = S.set_sleep_mode(S.dev, &off);
+        S.sleeping = false;
+        S.applied_dev = nullptr;
+        S.stalled = S.hangs >= kMaxHangs;
+        start_sleeper();
+        ACO_LOG("reflex: sleep hung for %lld ms (hang %u of %u; SetSleepMode off -> %d); %s", static_cast<long long>(waited),
+                S.hangs, kMaxHangs, st, S.stalled ? "Reflex disabled for this session" : "re-arming with a new sleeper");
+      }
+    }
+    marker(nv::SIMULATION_START);  // the frame goes on without a sleep
+    S.frame_begun = true;
     return;
+  }
+  if (S.overrun_since) {
+    ACO_LOG("reflex: sleeping again (the overrun sleep returned; %u frames went without a sleep, %.0f ms)",
+            S.overrun_skips, (t0 - S.overrun_since) / 1000.0);
+    S.overrun_since = 0;
   }
   int64_t t1 = now_us();
   marker(nv::SIMULATION_START);
@@ -335,7 +414,8 @@ void reflex_on_present_end() {
   ++S.sleeps;
   if (t1 - S.last_report >= 2000000) {
     if (S.last_report)
-      ACO_LOG("perf: reflex sleep avg %.2f ms over %u frames", S.sleep_ms_sum / S.sleeps, S.sleeps);
+      ACO_LOG("perf: reflex sleep avg %.2f ms over %u frames (overruns %u, hangs %u)", S.sleep_ms_sum / S.sleeps,
+              S.sleeps, S.overruns, S.hangs);
     S.last_report = t1;
     S.sleep_ms_sum = 0;
     S.sleeps = 0;

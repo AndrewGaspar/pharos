@@ -75,6 +75,7 @@ struct Config {
   std::string toggle_key = "F10";  // [upscaler] toggle_key: F1..F24 or none (DLSS <-> game TAA)
   std::string reflex = "on";     // [reflex] mode
   float reflex_fps_limit = 0.0f;  // [reflex] fps_limit
+  std::string reflex_limiter = "driver";  // [reflex] limiter: driver (Reflex minimumInterval) | cpu (our own wait)
   bool reflex_markers = true;     // [reflex] markers
   std::string reflex_marker_set = "minimal";  // [reflex] marker_set: minimal | full (experiments)
   bool reflex_optimize = false;   // [reflex] optimize: bUseMarkersToOptimize
