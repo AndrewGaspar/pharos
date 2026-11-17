@@ -1,42 +1,59 @@
-# spawnbands.py [--dump] : spawned characters by distance band from the player, from the spawning
-# sources' candidate lists (SpawningManager = [World+0x13c0]+0x38; sources at +0x18 {ptr, n << 17};
-# each source's candidates at +0xb8 {ptr, n << 17}, 0x18-byte entries with the candidate at +0x10).
-# A candidate is spawned when its +0x30 object is set and that object's byte +0x33 == 0 (the
-# game's check, RVA 0x1258fb0); its position is taken from that object (entity, +0x50).
-import math, struct, sys, collections
+# spawnbands.py : spawned MetaAI characters per distance band from the player, plus civilian units
+# per band. The MetaAI manager (World+0x1688) keeps the spawn records of its spawned (or spawning)
+# objectives in the array at +0x48 ({ptr, n << 17}, records with vtable rva 0x363be88; a unit's
+# record is its +0x1b8). Its size follows the game's own spawned count (341 vs 342-355; after a
+# live cap cut 207 vs 223), and records with the u32 at +0x34 == 1 are the pending ones.
+# Spawned = records with +0x34 == 0; position = the unit's +0x10 (follows the character).
+# Records whose unit is not in a civilian spawner (animals, guards, ...) count as "other".
+# Walks the manager's lists only (no heap scan).
+import math, struct, collections
 from live import Live
 
 L = Live()
 W = L.q(L.q(L.base + 0x4c27f18) + 0xc0)
-SM = L.q(L.q(W + 0x13c0) + 0x38)
+M = L.q(W + 0x1688)
 pl = L.q(L.q(L.base + 0x4c23c40))
 px, py = struct.unpack('<ff', L.read(pl + 0x50, 8))
-srcs, ns = L.q(SM + 0x18), L.d(SM + 0x20) >> 17
-bands = [40, 80, 120, 200, 1e9]
+edges = [40, 80, 120, 200, 1e9]
 names = ['0-40', '40-80', '80-120', '120-200', '200+']
-tot = collections.Counter()
-per_src = []
-dump = '--dump' in sys.argv
-for si in range(ns):
-    s = L.q(srcs + 8 * si)
-    if not s: continue
-    arr, cnt = L.q(s + 0xb8), (L.d(s + 0xc0) or 0) >> 17
-    sp = 0
-    for ci in range(min(cnt, 20000)):
-        e = L.read(arr + 0x18 * ci, 0x18)
-        if not e: break
-        cand = struct.unpack_from('<Q', e, 0x10)[0]
-        ent = L.q(cand + 0x30) if cand else 0
-        if not ent or (L.read(ent + 0x33, 1) or b'\1')[0] != 0: continue
-        p = L.read(ent + 0x50, 8)
-        if not p: continue
-        x, y = struct.unpack('<ff', p)
-        d = math.hypot(x - px, y - py)
-        if dump and sp < 3: print('src %d cand %x ent %x vt %x pos %.1f %.1f d %.1f' % (si, cand, ent, (L.q(ent) or 0) - L.base, x, y, d))
-        sp += 1
-        for b, nme in zip(bands, names):
-            if d <= b:
-                tot[nme] += 1
-                break
-    per_src.append('%x:%d/%d' % ((L.q(s) or 0) - L.base, sp, cnt))
-print('spawned by band: ' + ' '.join('%s m %d' % (n, tot[n]) for n in names) + ' | total %d | sources %s' % (sum(tot.values()), ' '.join(per_src)))
+
+
+def band(x, y):
+    d = math.hypot(x - px, y - py)
+    for e, nm in zip(edges, names):
+        if d <= e: return nm
+
+
+rec_pos = {}
+units = collections.Counter()
+lst, nn = L.q(M + 0x3b8), L.d(M + 0x3c0)
+b = L.read(lst, nn * 8) or b''
+SV = L.base + 0x377d218
+for i in range(len(b) // 8):
+    s = struct.unpack_from('<Q', b, 8 * i)[0]
+    h = L.read(s, 0xd0) if s else None
+    if not h or struct.unpack_from('<Q', h, 0)[0] != SV: continue
+    a, c = struct.unpack_from('<QI', h, 0xa0)
+    c >>= 17
+    if not a or c > 4096: continue
+    for u in struct.unpack('<%dQ' % c, L.read(a, 8 * c) or b'\0' * 8 * c):
+        uh = L.read(u, 0x1c0) if u else None
+        if not uh: continue
+        x, y = struct.unpack_from('<ff', uh, 0x10)
+        units[band(x, y)] += 1
+        r = struct.unpack_from('<Q', uh, 0x1b8)[0]
+        if r: rec_pos[r] = (x, y)
+sp = collections.Counter()
+other = pending = 0
+arr, n = L.q(M + 0x48), L.d(M + 0x50) >> 17
+for i in range(n):
+    r = L.q(arr + 8 * i)
+    if not r: continue
+    if L.d(r + 0x34) == 1:
+        pending += 1
+        continue
+    if r in rec_pos: sp[band(*rec_pos[r])] += 1
+    else: other += 1
+print('spawned civilians ' + ' '.join('%s:%d' % (nm, sp[nm]) for nm in names) +
+      ' | total %d, other MetaAI %d, pending %d' % (sum(sp.values()), other, pending))
+print('civilian units    ' + ' '.join('%s:%d' % (nm, units[nm]) for nm in names))
