@@ -49,7 +49,7 @@ constexpr unsigned kMaxExtrasPerWorld = 60000;  // hard ceiling; [world] npc_uni
 std::atomic<unsigned> g_max_extras{kMaxExtrasPerWorld};
 constexpr unsigned kMaxCreatePerStep = 96;
 std::atomic<unsigned> g_rate{kMaxCreatePerStep};  // [world] npc_units_rate (diagnostics): units per 100 ms step
-constexpr uint32_t kMaxUnitsPerSpawner = 4000;  // see augment_spawner
+constexpr uint32_t kMaxUnitsPerSpawner = 16000;  // see augment_spawner
 
 uintptr_t g_base = 0;
 std::atomic<int> g_k{1};
@@ -160,12 +160,12 @@ bool in_view(float x, float y, float z) {
 unsigned augment_spawner(uintptr_t mgr, uintptr_t sp, int k, float px, float py, unsigned budget) {
   // Spawners grow by k-1 units per original, and a spawner can be handled over several steps
   // (step budget, units deferred while in view), so this must hold k x the biggest spawner.
-  constexpr uint32_t kMaxUnits = 4096;
+  constexpr uint32_t kMaxUnits = 16384;
   uintptr_t arr = rd<uintptr_t>(sp + 0xa0);
   uint32_t n = rd<uint32_t>(sp + 0xa8) >> 17;
   uintptr_t ents = rd<uintptr_t>(sp + 0xc2);
   uint32_t ne = rd<uint32_t>(sp + 0xca) >> 17;
-  if (!n || n > kMaxUnits || !ne || ne > 64 || !arr || !ents) return 0;
+  if (!n || n > kMaxUnits || !ne || ne > 256 || !arr || !ents) return 0;
   static uintptr_t units[kMaxUnits];  // sim thread only
   memcpy(units, reinterpret_cast<void*>(arr), n * 8);  // the array grows while we add
   unsigned made = 0;
