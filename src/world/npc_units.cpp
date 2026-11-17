@@ -173,7 +173,7 @@ bool in_view(float x, float y, float z) {
 
 // The player's position from either static root (validated like world/teleport.cpp: after some
 // fast travels the first root does not lead to the entity), else the render camera's.
-std::atomic<unsigned> g_skip_player{0}, g_skip_list{0}, g_cam_pos{0};
+std::atomic<unsigned> g_skip_player{0}, g_skip_list{0}, g_cam_pos{0}, g_jumps{0};
 // What v11 (5011c6e) would have done: its single player root and single-region list check.
 std::atomic<unsigned> g_v11_player_fail{0}, g_v11_list_fail{0}, g_steps{0};
 bool player_xy(float& px, float& py) {
@@ -382,6 +382,18 @@ void step(uintptr_t mgr) {
     if (!c || c > 400000 || !readable(l, size_t(c) * 8)) ++g_v11_list_fail;
   }
   if (!player_xy(px, py)) { ++g_skip_player; return; }
+  // After a jump (fast travel, respawn, a debug teleport) the world streams whole areas out and in;
+  // leave the spawners alone for a while so we never add units to one that is being torn down.
+  {
+    static float lx = 0, ly = 0;
+    static ULONGLONG quiet_until = 0;
+    if (std::hypot(px - lx, py - ly) > 150.0f) {
+      if (lx != 0 || ly != 0) { quiet_until = now + 8000; ++g_jumps; }
+      lx = px, ly = py;
+    }
+    lx = px, ly = py;
+    if (now < quiet_until) return;
+  }
   // The manager's list of all virtual objectives ({ptr} at +0x3b8, plain u32 count at +0x3c0),
   // walked in slices so one update never reads more than a few thousand objects.
   uintptr_t list = rd<uintptr_t>(mgr + kObjListOff);
@@ -550,6 +562,7 @@ void npc_units_on_present() {
     if (uintptr_t sm = g_stat_mgr.load(); sm && sm != mgr)
       ACO_LOG("npc_units: stepping manager %p, but the world's is %p", reinterpret_cast<void*>(sm), reinterpret_cast<void*>(mgr));
     unsigned sp = g_skip_player.exchange(0), sl = g_skip_list.exchange(0), cp = g_cam_pos.exchange(0);
+    if (unsigned j = g_jumps.exchange(0)) ACO_LOG("npc_units: %u player jump(s) in 10 s: paused creating units for 8 s", j);
     unsigned vp = g_v11_player_fail.exchange(0), vl = g_v11_list_fail.exchange(0), st = g_steps.exchange(0);
     if (vp || vl) ACO_LOG("npc_units: of %u steps in 10 s, v11's checks would have failed: player root %u, objective list %u", st, vp, vl);
     if (sp || sl || cp)
