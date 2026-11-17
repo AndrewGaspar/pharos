@@ -390,6 +390,28 @@ Found statically (headless Ghidra) and checked against a loaded story save (t1, 
   0x1d5da90, 0x1d18460 for `MetaAIObjectiveSpawnerDynamic` -> 0x1d5db60). The MetaAI manager
   update (0x1daf5f0) is virtual slot 47 (+0x178) of the manager vtable 0x377e7e8 (89 slots).
 
+#### `[world] npc_units` experiment (src/world/npc_units.cpp, default off; unfinished)
+
+- Runs on the MetaAI update thread: the manager's vtable pointer (World+0x1688, vtable 0x377e7e8)
+  is swapped to a heap copy whose slot 47 calls the game's update (0x1daf5f0), then ours. That is
+  a data write; no code bytes are modified. Each unit of a `MetaAIVirtualObjectiveSpawner` (found
+  through the manager's list of all virtual objectives, +0x3b8 with a plain u32 count at +0x3c0:
+  49546 objectives, 3952 such spawners around Alexandria) that is within 260 m and not activated
+  yet (+0x1b8 == 0) gets k-1 units of the same archetype 1-2 m away. They are created with the
+  0x1dab8a0 sequence minus its two kill calls. The engine gives each one a fresh id at +0x8.
+- Measured state (t1, 768x480, story fixture, alexandria-dt-start, fixed camera): the creation
+  works with no failures and no crash over ~6 minutes (741 extras 10 s after load, 1086 after a
+  short hop away and back). Units within 40/80/120 m went from 57/141/266 to 76/223/405, all
+  activated. In-view skinning groups/frame: vanilla (k=1, npc_density=1) 2177 (sd 431); k=2,
+  npc_density=1 2330 (sd 349; within noise, the spawn cap binds); k=2 with npc_density=3 raised
+  live, about 2600-2700 (12 samples, run cut short), spawned 337-339 of 600. Not yet controlled
+  (k=1 at npc_density=3 under the same hop was not measured). Not yet done: the walker soak, and
+  the kill, autosave and reload test (`npc_units_kill` kills the nearest extra unit with the
+  engine's kill).
+- The game autosaves its story slot (3/4.save) right after a story load. A save is rebuilt from
+  scratch each time (see above), with dead units within 950 m of the player (+0x3a0 of
+  [manager+0x358]; +0x3a4 = 150 m inner bound when it applies).
+
 ### The Havok deadlock is a vanilla engine bug
 
 Same stack (TaskThread0 spinning in 0x2ffd9e4 <- 0x2e78f07 <- 0x2e16a8d <- 0x2dbf560 (Havok object
