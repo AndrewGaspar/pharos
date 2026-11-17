@@ -690,6 +690,17 @@ froze at 994 and ~1150-1220 spawned) with `pestack.py`, `jobq.py`, `jobwhy.py` (
   VRAM ~5.6 GB; 0-40 m spawned 62 / 209 / 250 (3.4x / 4.0x), in view 2539 / 6935 / 7286 groups.
 - **Soak**: k=8, npc_density 40, 30 min with `roamer.sh` (1,480 m travelled, no teleports): no
   hang, 814-1,957 spawned, 15.4k extras, 0 failed, 58-60 fps at a 60 cap, native TLS min 63.
+- **Fast travel** (the game's own, map -> Atlas -> hold right mouse on a region icon;
+  `tools/npc-re/fasttravel.sh` / `fttour.sh`), k=8: Alexandria -> Memphis -> Siwa -> Faiyum ->
+  Alexandria -> Memphis -> Siwa -> Alexandria with 2 minutes of roaming in each: no hang, 59.8 fps
+  at the 60 cap, 395-959 spawned per city, native TLS min 63, up to 146 virtual indices. It
+  showed the handled / extra sets growing without bound (52k stale entries); they are now pruned
+  to live units once a minute.
+- **Combat, kills, quit + reload** (`tools/npc-re/combat-save.sh`), k=8: fighting in the crowd (up to
+  1,776 spawned, 850 virtual TLS indices), three extras killed with the engine's kill, then quit to
+  title (3.save written) and continue, twice: both reloads clean (1,445 / 1,275 spawned), nothing
+  restored from the save (these saves don't rebuild the MetaAI dead-unit records, as found
+  earlier), no hang.
 
 ### The Havok deadlock is a vanilla engine bug
 
