@@ -702,6 +702,46 @@ froze at 994 and ~1150-1220 spawned) with `pestack.py`, `jobq.py`, `jobwhy.py` (
   restored from the save (these saves don't rebuild the MetaAI dead-unit records, as found
   earlier), no hang.
 
+#### npc_units v12: the post-fast-travel stall, unit classes, urban / rural, variety
+
+- **Stall after a world change (v11 bug).** After a Sinai -> Alexandria fast travel no extras were
+  made: `step()` returned before doing anything. Repro (t1, Alexandria -> Sinai -> Alexandria
+  with the game's own fast travel, `tools/npc-re/ft-sinai.sh`), logging what v11's checks would
+  have done: the player root was fine in every step, but v11's `readable(list, n * 8)` on the
+  MetaAI manager's objective list (49546 entries, 396 KB) failed in every step (96 of 96 per 10 s)
+  once the world had changed: the reallocated list spans two allocator reservations, and
+  `VirtualQuery` reports only the first. `readable_span` (walks the regions) fixes it; extras came
+  back right after the travel (9.3k live extras within two minutes). Within Egypt (the earlier
+  fast-travel tour) the list never moved, so that tour was not affected: its 395-959 spawned per
+  city came from where the fast-travel points are (city edges).
+- **Unit classes.** Objectives holding units (`+0xa0` arrays) and their unit classes, from the
+  manager's list in Alexandria (`tools/npc-re/objfactions.py`; class names from TypeInfo via
+  `vtname.py`): `MetaAIVirtualObjectiveSpawner` (0x377d218) holds `MetaAIVirtualObjectiveHuman`
+  (0x377eab8, ~15k), `...RideableAnimal` (0x3781720, horses/camels), `...SmallWaterVehicle`
+  (0x3786208, boats) and `...Vehicle` (0x377ca18); `...AnimalSpawner` (0x3781f20) holds
+  `...Animal` (0x377f560); `...Ambush` (0x3781cf0), `...StaticCage`, `...AnimalLocation`,
+  `...BountyHunterSpawner` (0x3784400) hold their own. npc_units only ever touched Human units of
+  plain spawners.
+- **Factions.** A Human unit's archetype (`MetaAIObjectiveHuman`, +0x38 link) links its faction
+  at +0x10 (`MetaAIFactionData`, vtable 0x3789a88). Around Alexandria: faction id 0x2dfb71a566 =
+  ~11k units in 55 archetypes (civilians); 0x45bafa6a55 = ~2.7k (also the only faction in the
+  bounty-hunter spawner: Ptolemaic soldiers / guards); 0x3b79cbd9a8 and 0x157058a1b3 (both in
+  `Ambush` objectives: bandits); animal factions (0x3fda49da1f, 0xc637..., 0xbf37...) in animal
+  spawners; 0x13e08432389 for rideable animals. **Byte +0x30 of the faction is 0 for the
+  civilian and rideable factions and 1 for every combat faction** (soldiers, bandits, wild
+  animals, 0x157058a1b7, 0x7ae9ae2e08): v12 uses it as civilian vs hostile. The faction's
+  float4 at +0x20 differs per human faction (a UI colour?).
+- **Urban vs rural.** The measure is the number of original civilian-spawner Human units within
+  ~150 m (7 x 7 cells of 50 m, rebuilt once a minute). At the player (`tools/npc-re/urbanity.py`,
+  k=1): Alexandria spawn anchor 802 (units within 400 m: median 877), Memphis 820 (722),
+  Krokodilopolis 494 (414), Siwa's centre 352 (439), Faiyum farmland 46. Threshold 300: cities
+  and towns urban, farms and Sinai's countryside rural.
+- **Variety and spread.** Each extra now copies a random original of the same class from the
+  same spawner: its archetype entry (so the spawner's own archetype mix, weighted by use, is the
+  palette) and its place plus 1-4 m. Extras of one unit no longer start in a clump on one spot.
+  Save safety is unchanged: an extra is still (spawner, an archetype that spawner lists,
+  position), which is what the dead-unit records hold and what the loader matches.
+
 ### The Havok deadlock is a vanilla engine bug
 
 Same stack (TaskThread0 spinning in 0x2ffd9e4 <- 0x2e78f07 <- 0x2e16a8d <- 0x2dbf560 (Havok object
