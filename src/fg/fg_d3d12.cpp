@@ -1564,6 +1564,7 @@ bool fg12_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent rea
           S.verify_pending = 4;
         }
         int64_t half = cfg.fg_pacing && S.frame_interval_us > 0 ? static_cast<int64_t>(S.frame_interval_us / 2) : 0;
+        if (half > 25000) half = 25000;  // never hold a real frame more than 25 ms
         if (proxy && config().fg_present_thread == 1) {
           // Both presents (generated now, real half a frame later) on the present thread.
           enqueue(sc, real, sync, flags, half, cfg.fg_show, arrive);
@@ -1608,13 +1609,21 @@ bool fg12_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent rea
   }
   safe_release(bb);
   if (!done) return false;
-  if (!have_in) return true;
+  if (!have_in) {
+    // No Frame Generation for this frame (toggled off, menus, loading): the next FG frame's interval
+    // must not span the gap. (It did: after e.g. 30 s with FG off the EMA jumped to ~3 s, the real
+    // present then waited half of that and the game, blocked in join, ran at 2 fps for half a minute
+    // while the EMA decayed - also after every menu or loading screen.)
+    S.last_real_present = 0;
+    return true;
+  }
 
   // Real-frame interval from the game's arrivals here (with the present thread, not inflated by our
-  // own pacing wait).
+  // own pacing wait). A hitch counts at most 2.5x the current interval.
   if (S.last_real_present) {
     double dt = double(arrive - S.last_real_present);
-    S.frame_interval_us = S.frame_interval_us > 0 ? S.frame_interval_us * 0.9 + dt * 0.1 : dt;
+    if (S.frame_interval_us > 0 && dt > 2.5 * S.frame_interval_us) dt = 2.5 * S.frame_interval_us;
+    S.frame_interval_us = S.frame_interval_us > 0 ? S.frame_interval_us * 0.9 + dt * 0.1 : std::min(dt, 50000.0);
   }
   S.last_real_present = arrive;
   ++S.perf_real;
