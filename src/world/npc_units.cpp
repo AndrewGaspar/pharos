@@ -25,7 +25,7 @@ constexpr uintptr_t kMgrVtRva = 0x377e7e8;        // MetaAI manager vtable (89 s
 constexpr int kMgrVtSlots = 89;
 constexpr int kUpdateSlot = 47;                   // +0x178: per-frame update (RVA 0x1daf5f0)
 constexpr uintptr_t kUpdateRva = 0x1daf5f0;
-constexpr uintptr_t kObjListOff = 0x7b0;          // manager: objective list {ptr, n << 17}
+constexpr uintptr_t kObjListOff = 0x3b8;          // manager: all virtual objectives {ptr, u32 n}
 constexpr uintptr_t kSpawnerVtRva = 0x377d218;    // MetaAIVirtualObjectiveSpawner
 constexpr uintptr_t kUnitVtRva = 0x377eab8;       // MetaAI virtual unit (human)
 constexpr uintptr_t kNullLinkRva = 0x4871468;     // the engine's empty object link
@@ -40,12 +40,12 @@ constexpr uintptr_t kArrayAddRva = 0x136f630;     // (spawner + 0xa0, unit, 0)
 constexpr uintptr_t kRegisterRva = 0x1df55c0;     // (unit + 0x30 object, manager)
 constexpr uint32_t kOwnerLinkHash = 0xcf078f5e;
 
-// Placement: spawners whose position is within this ring around the player get their extras. The
-// inner bound keeps us to spawners the MetaAI has not activated yet (activation ~120 m), so the
-// new units go through the normal activation -> spawn path like the others.
-constexpr float kRingInner = 130.0f, kRingOuter = 260.0f;
-constexpr unsigned kMaxExtrasPerWorld = 1500;
-constexpr unsigned kMaxSpawnersPerStep = 24;
+// Units within this distance of the player that the MetaAI has not activated yet (activation is
+// ~120 m for most) get their extras, so the new units go through the normal activation -> spawn
+// path like the others.
+constexpr float kRingOuter = 260.0f;
+constexpr unsigned kMaxExtrasPerWorld = 4000;
+constexpr unsigned kMaxCreatePerStep = 48;
 
 uintptr_t g_base = 0;
 std::atomic<int> g_k{1};
@@ -58,6 +58,7 @@ uintptr_t g_cur_mgr = 0;
 std::unordered_set<uintptr_t> g_done;
 std::vector<uintptr_t> g_created;  // extras of the current manager
 unsigned g_extras = 0, g_failed = 0;
+uint32_t g_cursor = 0;
 ULONGLONG g_last_step = 0;
 std::atomic<unsigned> g_stat_extras{0}, g_stat_spawners{0}, g_list_n{0}, g_stat_failed{0};
 std::atomic<uintptr_t> g_last_unit{0};  // a recently created extra (diagnostics: activation state)
@@ -124,22 +125,31 @@ uintptr_t add_unit(uintptr_t mgr, uintptr_t sp, uintptr_t entry, const float pos
   return unit;
 }
 
-void augment_spawner(uintptr_t mgr, uintptr_t sp, int k) {
+// Extras for the units of spawner `sp` that are within the ring, not activated yet and not handled
+// before. Units are handled one by one (big spawners have 60+ units spread over a district, some of
+// them always active near the player). Returns the number of units created.
+unsigned augment_spawner(uintptr_t mgr, uintptr_t sp, int k, float px, float py, unsigned budget) {
+  constexpr uint32_t kMaxUnits = 128;
   uintptr_t arr = rd<uintptr_t>(sp + 0xa0);
   uint32_t n = rd<uint32_t>(sp + 0xa8) >> 17;
   uintptr_t ents = rd<uintptr_t>(sp + 0xc2);
   uint32_t ne = rd<uint32_t>(sp + 0xca) >> 17;
-  if (!n || n > 32 || !ne || ne > 32 || !readable(arr, n * 8) || !readable(ents, ne * 8)) return;
-  uintptr_t units[32];
-  memcpy(units, reinterpret_cast<void*>(arr), n * 8);
-  for (uint32_t i = 0; i < n && g_extras < kMaxExtrasPerWorld; ++i) {
+  if (!n || n > kMaxUnits || !ne || ne > 64 || !arr || !ents) return 0;
+  uintptr_t units[kMaxUnits];
+  memcpy(units, reinterpret_cast<void*>(arr), n * 8);  // the array grows while we add
+  unsigned made = 0;
+  for (uint32_t i = 0; i < n && made < budget && g_extras < kMaxExtrasPerWorld; ++i) {
     uintptr_t u = units[i];
-    if (!readable(u, 0x98) || rd<uintptr_t>(u) != g_base + kUnitVtRva) continue;
+    if (!u || rd<uintptr_t>(u) != g_base + kUnitVtRva) continue;
+    if (rd<uintptr_t>(u + 0x1b8)) continue;  // activated: too late for this one
+    float d = std::hypot(rd<float>(u + 0x10) - px, rd<float>(u + 0x14) - py);
+    if (d > kRingOuter) continue;
+    if (!g_done.insert(u).second) continue;   // handled before, or one of our extras
     if ((rd<uint8_t>(u + 0x5a) & 6) || (rd<uint8_t>(u + 0x90) & 0x40)) continue;  // dead / group / scripted
     uintptr_t link = rd<uintptr_t>(u + 0x38), entry = 0;
     for (uint32_t e = 0; e < ne; ++e) {
       uintptr_t c = rd<uintptr_t>(ents + 8 * e);
-      if (c && readable(c, 8) && rd<uintptr_t>(c) == link) { entry = c; break; }
+      if (c && rd<uintptr_t>(c) == link) { entry = c; break; }
     }
     if (!entry) continue;
     float pos[4];
@@ -150,60 +160,52 @@ void augment_spawner(uintptr_t mgr, uintptr_t sp, int k) {
       float q[4] = {pos[0] + r * std::cos(a), pos[1] + r * std::sin(a), pos[2], pos[3]};
       if (uintptr_t nu = add_unit(mgr, sp, entry, q)) {
         ++g_extras;
+        ++made;
         g_last_unit = nu;
         g_created.push_back(nu);
+        g_done.insert(nu);
       } else {
         ++g_failed;
       }
     }
   }
+  return made;
 }
 
 void step(uintptr_t mgr) {
   int k = g_k.load();
   if (k <= 1) return;
   ULONGLONG now = GetTickCount64();
-  if (now - g_last_step < 500) return;
+  if (now - g_last_step < 100) return;
   g_last_step = now;
   if (mgr != g_cur_mgr) {  // new world / manager
     g_cur_mgr = mgr;
     g_done.clear();
     g_created.clear();
     g_extras = g_failed = 0;
+    g_cursor = 0;
   }
   uintptr_t pl = load(load(g_base + kPlayerRootRva));
   if (!readable(pl + 0x50, 12)) return;
   float px = rd<float>(pl + 0x50), py = rd<float>(pl + 0x54);
+  // The manager's list of all virtual objectives ({ptr} at +0x3b8, plain u32 count at +0x3c0),
+  // walked in slices so one update never reads more than a few thousand objects.
   uintptr_t list = rd<uintptr_t>(mgr + kObjListOff);
-  uint32_t n = rd<uint32_t>(mgr + kObjListOff + 8) >> 17;
-  if (!readable(list, size_t(n) * 8)) return;
-  unsigned did = 0;
+  uint32_t n = rd<uint32_t>(mgr + kObjListOff + 8);
+  if (!n || n > 400000 || !readable(list, size_t(n) * 8)) return;
   g_list_n = n;
-  for (uint32_t i = 0; i < n && did < kMaxSpawnersPerStep && g_extras < kMaxExtrasPerWorld; ++i) {
-    uintptr_t o = rd<uintptr_t>(list + 8 * i);
-    if (!o || !readable(o, 0x1c0)) continue;
-    uintptr_t vt = rd<uintptr_t>(o), sp = 0;
-    if (vt == g_base + kSpawnerVtRva) sp = o;
-    else if (vt == g_base + kUnitVtRva) sp = link_object(rd<uintptr_t>(o + 0x60));  // unit -> owner
-    if (!sp || !readable(sp, 0xd0) || rd<uintptr_t>(sp) != g_base + kSpawnerVtRva) continue;
-    float d = std::hypot(rd<float>(o + 0x10) - px, rd<float>(o + 0x14) - py);
-    if (d > kRingOuter || g_done.count(sp)) continue;
-    // Only spawners none of whose units the MetaAI has activated yet (+0x1b8 = activation record),
-    // so the extras go through the same activation -> spawn path as the originals.
-    uintptr_t arr = rd<uintptr_t>(sp + 0xa0);
-    uint32_t nu = rd<uint32_t>(sp + 0xa8) >> 17;
-    if (!nu || nu > 32 || !readable(arr, nu * 8)) continue;
-    bool active = false;
-    for (uint32_t j = 0; j < nu && !active; ++j) {
-      uintptr_t u = rd<uintptr_t>(arr + 8 * j);
-      active = u && readable(u, 0x1c0) && rd<uintptr_t>(u + 0x1b8) != 0;
-    }
-    if (active) continue;  // too late for this one (until it is reloaded)
-    g_done.insert(sp);
-    augment_spawner(mgr, sp, k);
-    ++did;
+  if (g_cursor >= n) g_cursor = 0;
+  uint32_t end = std::min<uint32_t>(n, g_cursor + 6000);
+  unsigned made = 0;
+  const uintptr_t spvt = g_base + kSpawnerVtRva;
+  uint32_t i = g_cursor;
+  for (; i < end && made < kMaxCreatePerStep && g_extras < kMaxExtrasPerWorld; ++i) {
+    uintptr_t sp = rd<uintptr_t>(list + 8 * i);
+    if (!sp || rd<uintptr_t>(sp) != spvt) continue;
+    made += augment_spawner(mgr, sp, k, px, py, kMaxCreatePerStep - made);
   }
-  if (g_done.size() > 50000) g_done.clear();
+  g_cursor = i;  // resume where this slice stopped
+  if (g_done.size() > 200000) g_done.clear();
   g_stat_extras = g_extras;
   g_stat_failed = g_failed;
   g_stat_spawners = static_cast<unsigned>(g_done.size());
@@ -293,7 +295,7 @@ void npc_units_on_present() {
   if (now - last_stat >= 10000) {
     last_stat = now;
     uintptr_t lu = g_last_unit.load();
-    ACO_LOG("npc_units: %u extra units in %u spawners (%u failed), objective list %u, last extra %p (activation %p)",
+    ACO_LOG("npc_units: %u extra units (%u units handled, %u failed), objective list %u, last extra %p (activation %p)",
             g_stat_extras.load(), g_stat_spawners.load(), g_stat_failed.load(), g_list_n.load(),
             reinterpret_cast<void*>(lu), reinterpret_cast<void*>(lu && readable(lu + 0x1b8, 8) ? rd<uintptr_t>(lu + 0x1b8) : 0));
   }

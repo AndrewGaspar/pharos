@@ -3,8 +3,8 @@
 namespace aco {
 
 // [world] npc_units=k (experiment, default 1 = off): more MetaAI units, i.e. more people near the
-// player rather than a higher cap. Each civilian spawner (MetaAIVirtualObjectiveSpawner) that comes
-// within 260 m of the player while none of its units is activated yet gets k-1 extra units per unit:
+// player rather than a higher cap. Each unit of a civilian spawner (MetaAIVirtualObjectiveSpawner)
+// that is within 260 m of the player and not activated by the MetaAI yet gets k-1 extra units:
 // same archetype, placed 1-2 m from the original, created through the engine's own "add a unit of
 // archetype A at P to spawner S" sequence (the one the save load uses to restore dead bodies,
 // RVA 0x1dab8a0, without its kill). That runs on the MetaAI update thread: the MetaAI manager's
