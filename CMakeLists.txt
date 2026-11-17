@@ -22,6 +22,7 @@ add_library(aco_d3d11 SHARED
   src/core/dump.cpp
   src/core/memtool.cpp
   src/world/world.cpp
+  src/world/lodpatch.cpp
   src/world/npc.cpp
   src/world/teleport.cpp
   src/core/framedump.cpp

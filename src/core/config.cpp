@@ -103,6 +103,8 @@ Config load() {
   c.reflex_fps_limit = read_float(L"fps_limit", 0.0f, L"reflex");
   c.reflex_probe = read_float(L"probe", 0.0f, L"reflex") != 0.0f;
   c.world_lod_distance = read_float(L"lod_distance", 1.0f, L"world");
+  c.world_lod_skip = read_str(L"lod_skip", "", L"world");
+  c.world_lod_mode = read_str(L"lod_mode", "far", L"world");
   c.world_npc_density = read_float(L"npc_density", 1.0f, L"world");
   c.world_npc_distance = read_float(L"npc_distance", 1.0f, L"world");
   c.reflex_markers = read_float(L"markers", 1.0f, L"reflex") != 0.0f;
@@ -122,7 +124,7 @@ bool same(const Config& a, const Config& b) {
          a.reflex_probe == b.reflex_probe && a.reflex_markers == b.reflex_markers &&
          a.reflex_marker_set == b.reflex_marker_set && a.reflex_optimize == b.reflex_optimize &&
          a.toggle_key == b.toggle_key && a.cloth_mode == b.cloth_mode && a.cloth_scale == b.cloth_scale &&
-         a.world_lod_distance == b.world_lod_distance && a.world_npc_density == b.world_npc_density &&
+         a.world_lod_distance == b.world_lod_distance && a.world_lod_skip == b.world_lod_skip && a.world_lod_mode == b.world_lod_mode && a.world_npc_density == b.world_npc_density &&
          a.world_npc_distance == b.world_npc_distance;
 }
 } // namespace

@@ -133,9 +133,55 @@ the read-only data table after checking its values and the referencing instructi
   culling compute shaders (12 permutations, cbuffer `MiscCullingConsts` at b8) compute
   `d' = (dist * objScale * FOVDistanceFactor + GeometricObjectLODDistanceBias) *
   GeometricObjectLODDistanceScale` and select/cull by the mesh's LOD ranges. Game values: scale 1,
-  bias 0, FOV factor ~1.0055, MinTriangleArea 0. `[world] lod_distance` patches the scale.
+  bias 0, FOV factor ~1.0055, MinTriangleArea 0. `[world] lod_distance` extends the far end of
+  the LOD ranges (see "LOD ranges and the lod_distance gap" below).
 - Characters (NPCs) are not part of that GPU path (they stay visible when world LOD is cut).
 - Shadow cascades are set up on the CPU (shaders only see cascade matrices / fade params).
+
+### LOD ranges and the lod_distance gap (planters missing near the camera)
+
+Per entry the LOD shaders (7 of the 13 culling permutations: 16d3da0d87a4a82a, 2247ab14c6f61ec4,
+62365b83ef726f77, 8c1d007b8c1ffcfb, b38632d3a98fe938, cd4f32cb6d3c8302, f34dc216bf3ed4ae) load a range
+`R = t81[...]` with **R.y = min, R.z = max, R.w = fade-in width** (next element .x = fade-out
+width) and, with d' as above times a per-entry factor:
+
+```
+cull     if d' < max(R.y - R.w, 0)  or  d' >= R.z
+fade in  over [R.y - R.w, R.y), fade out over [R.z - fadeOut, R.z)   (dither value written to u3)
+```
+
+Entries with min > 0 are representations that exist only from a distance (lower LODs and merged
+far proxies). The near representation that replaces them is **not** governed by this test alone:
+it is only there once the CPU side has streamed/submitted it, by real distance. The old
+`lod_distance=k` (dividing GeometricObjectLODDistanceScale) moved the min end too, so a far proxy
+hid at k x its distance while its replacement still arrived at the game's distance: nothing is
+drawn in between.
+
+Reproduced in story Alexandria (street east of the DT spawn, x -600..-550, y 3572; 1280x800,
+DLSS Performance): with `lod_distance=2` the stone planter pedestal (the bowl on top is a separate
+object and stays, floating) is missing from ~60 m down to ~43 m and present again closer; at 1.5
+it is dithered (fade zone). Identical with DLSS off (game TAA), with npc_density=3 / npc_distance=2
+/ cloth=render on or off (those don't touch geometry), and fine at `lod_distance=1`.
+`docs/img/lod_distance-planter-gap.jpg`: rows lod 1 / old lod 2 / fixed lod 2, two repeats.
+
+Fix (`[world] lod_mode=far`, default): the LOD shaders are patched instead of the cbuffer. At the
+first use of the dispatch's culling shader a copy is created with one instruction inserted after
+the LOD distance (`mul X, X, cb8[35].w`): `mul R.z, R.z, l(k)` (R found as the temp read by the
+first `ge` after it; DXBC container checksum recomputed, src/world/lodpatch.cpp), bound around that
+dispatch only. Only the max of every range (incl. the final cull distance) moves out; min ends and
+fade-ins stay at the game's distances, so no representation is hidden before its replacement
+exists. k < 1 (and `lod_mode=all`) keeps the old cbuffer scaling. Verified at the same spots: the
+pedestal stays visible at every distance with `lod_distance=2` and 3. Shadows of foliage reach
+further as before (e.g. leaf shadows on near planters). No double-drawn LOD pairs were visible in
+street/vista views; if one shows up it would be an entry whose lower LOD is submitted at the same
+time (its fade-in no longer meets the extended fade-out).
+
+Other resolution-related culling constants (logged per shader by `world_on_present`):
+`VPosToUV` = (1/w, 1/h, w, h) of the **render** resolution (640x400 at 1280x800 Performance; half
+that for the HZB-sized permutations, 4096 for shadow maps). The HZB permutations (CullingFlags & 4)
+cull an instance whose projected bounds don't straddle a pixel centre at that resolution, i.e.
+objects below ~1 render pixel (2 display pixels at Performance). That is the only screen-size test
+and it only affects sub-pixel objects; it is not what hid the planters.
 
 ## Player entity, camera and teleport (`src/world/teleport.cpp`, `tools/teleport`)
 
