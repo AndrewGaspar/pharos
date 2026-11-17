@@ -58,7 +58,7 @@ struct FgInputs {
 };
 bool upscaler_fg_inputs(FgInputs* out);
 
-// Called from DllMain: applies render_scale from aco_dlss.ini to the game's ACO.ini.
+// Called from DllMain: applies render_scale from pharos.ini to the game's ACO.ini.
 void upscaler_preinit();
 
 } // namespace aco

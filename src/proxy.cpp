@@ -247,7 +247,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
     log_init();
     wchar_t exe[MAX_PATH];
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    ACO_LOG("aco-dlss loaded into %ls", exe);
+    ACO_LOG("Pharos loaded into %ls", exe);
     config_reload();
     upscaler_preinit();
     fg_preinit();

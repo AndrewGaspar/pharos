@@ -5,7 +5,7 @@
 set -uo pipefail
 t=$1 mod=$2 settle=$3 k=$4; shift 4
 W=$(cd "$(dirname "$0")/../.." && pwd)
-sed -i "s/^npc_units=.*/npc_units=$k/" "$mod/aco_dlss.ini"
+sed -i "s/^npc_units=.*/npc_units=$k/" "$mod/pharos.ini"
 if "$W/tools/npc-re/userplaying.sh"; then echo "not launching: the user is playing"; exit 2; fi
 "$W/scripts/aco" kill-game "$t" >/dev/null 2>&1
 "$W/scripts/aco" fixture "$t" story-alexandria-port >/dev/null 2>&1

@@ -9,7 +9,7 @@ set -euo pipefail
 name=$1 label=$2 dx=${3:-3} period=${4:-2}
 here=$(cd "$(dirname "$0")/.." && pwd)
 I=/home/ajg/Games/aco-dlss-instances/$name
-L=$I/out/aco_dlss.log
+L=$I/out/pharos.log
 cp "$here/tools/spin.py" "$I/out/"
 rm -rf "$I/out/fgtrace" "$I/out/fgtrace-start"
 start=$(wc -l < "$L")

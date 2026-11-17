@@ -7,7 +7,7 @@
 set -uo pipefail
 name=$1 label=$2 ms=${3:-3} secs=${4:-5}
 here=$(cd "$(dirname "$0")/.." && pwd)
-L=/home/ajg/Games/aco-dlss-instances/$name/out/aco_dlss.log
+L=/home/ajg/Games/aco-dlss-instances/$name/out/pharos.log
 trap '"$here/tools/ini-set" "$name" fg.dbg_present_wait_ms=100' EXIT
 show() {
   local d=$here/build/fgtrace/$1

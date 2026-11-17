@@ -7,7 +7,7 @@ set -uo pipefail
 t=$1 secs=${2:-60}
 here=$(cd "$(dirname "$0")" && pwd)
 I=/home/ajg/Games/aco-dlss-instances/$t
-L=$I/out/aco_dlss.log
+L=$I/out/pharos.log
 n0=$(wc -l < "$L")
 touch "$I/out/geo"
 sleep "$secs"

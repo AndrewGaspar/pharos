@@ -5,7 +5,7 @@
 
 namespace aco {
 
-// aco_dlss.ini, next to the DLL. Re-read periodically so most settings can be tuned live.
+// pharos.ini, next to the DLL. Re-read periodically so most settings can be tuned live.
 //
 // [upscaler]
 // enabled=1             ; 0 = leave the game's TAA alone
@@ -78,7 +78,7 @@ struct Config {
   bool fg12_descriptor_heap = true;  // [fg] descriptor_heap (mode=d3d12): VKD3D_CONFIG=descriptor_heap for our device
   bool fg_hide_handle64 = false;  // [fg] hide_handle64 (experiment): evaluation then fails, DLSS-G needs them    // [fg] trace_cu (debug): log NGX CUDA-kernel creation/launches  // [fg] show_index: which generated index to present          // [fg] refresh_hz (DLSSG.RefreshRate)               // [fg] hudless: pass the DLSS output as HUD-less colour
   std::vector<std::pair<std::string, unsigned int>> fg_create_extra;  // [fg] create_extra=DLSSG.Name:value,...
-  std::vector<std::pair<std::string, unsigned int>> fg_extra;  // [fg] extra=DLSSG.Name:value,...           // [fg] ngx_log: 1 = NGX log lines into aco_dlss.log, 2 = verbose   // [fg] debug_fill: pre-fill the output with magenta        // [fg] pacing: present the real frame half a frame after the generated one
+  std::vector<std::pair<std::string, unsigned int>> fg_extra;  // [fg] extra=DLSSG.Name:value,...           // [fg] ngx_log: 1 = NGX log lines into pharos.log, 2 = verbose   // [fg] debug_fill: pre-fill the output with magenta        // [fg] pacing: present the real frame half a frame after the generated one
   std::string toggle_key = "F10";  // [upscaler] toggle_key: F1..F24 or none (DLSS <-> game TAA)
   std::string reflex = "on";     // [reflex] mode
   float reflex_fps_limit = 0.0f;  // [reflex] fps_limit

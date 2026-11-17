@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # latency-bench <instance> <label> [section.key=value ...]
-# Fresh game launch with the given aco_dlss.ini overrides (e.g. reflex.mode=off upscaler.enabled=0),
+# Fresh game launch with the given pharos.ini overrides (e.g. reflex.mode=off upscaler.enabled=0),
 # enters Discovery Tour, settles, then runs tools/latency (40 mouse-look injections). Fresh launches
 # avoid carry-over between configurations (e.g. Reflex state inside DXVK). Results are copied to
 # build/latency/<label>/.
@@ -10,7 +10,7 @@ here=$(cd "$(dirname "$0")/.." && pwd)
 mod=$(mktemp -d); cp -a "$here/build/mod/." "$mod/"
 for kv in "$@"; do
   sec=${kv%%.*}; rest=${kv#*.}; key=${rest%%=*}; val=${rest#*=}
-  python3 -I - "$mod/aco_dlss.ini" "$sec" "$key" "$val" <<'PY'
+  python3 -I - "$mod/pharos.ini" "$sec" "$key" "$val" <<'PY'
 import sys
 p, sec, key, val = sys.argv[1:]
 lines = open(p).read().split("\n"); cur = None; done = False

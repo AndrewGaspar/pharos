@@ -1,13 +1,17 @@
-# aco-dlss
+# Pharos
 
-NVIDIA DLSS 4.5 Super Resolution for **Assassin's Creed Origins** (PC, v1.62), replacing the game's
-TAA. Built from source with mingw; no game code is patched (the exe is Denuvo + VMProtect protected),
-everything happens at the D3D11 API level through a `d3d11.dll` proxy.
+A from-source mod for **Assassin's Creed Origins** (PC, v1.62): NVIDIA DLSS 4.5 Super Resolution in
+place of the game's TAA, NVIDIA Reflex, DLSS Frame Generation / Multi Frame Generation, and denser
+city crowds. Named after the Lighthouse of Alexandria.
+
+Built with mingw; it loads as a `d3d11.dll` proxy. The exe is Denuvo + VMProtect protected and is
+never modified on disk: rendering changes happen at the D3D11 API level, and the world tweaks
+(crowds, LOD, cloth) adjust engine data and object vtables in memory at runtime.
 
 Status: DLSS SR (all quality modes + DLAA), NVIDIA Reflex and DLSS Frame Generation (D3D12 route via
 vkd3d-proton, F9 toggle) working; see [docs/FRAME_GENERATION.md](docs/FRAME_GENERATION.md).
 Game-data tweaks: `[world] npc_density` / `npc_distance` (bigger crowds: the engine's spawn cap
-and spawn distance), `[world] lod_distance`, `[cloth] mode=render`; see `dist/aco_dlss.ini` and
+and spawn distance), `[world] lod_distance`, `[cloth] mode=render`; see `dist/pharos.ini` and
 docs/ENGINE_NOTES.md.
 
 ## Results (RTX 5070 Laptop, 2560x1600, Discovery Tour / Siwa village, uncapped)
@@ -91,19 +95,20 @@ to the frame being recorded): the simulation thread's frame start isn't visible 
 
 ```sh
 scripts/fetch-deps     # NVIDIA DLSS SDK 310.9.16 (headers + nvngx_dlss.dll) into third_party/
-scripts/package        # CMake + mingw-w64 -> build/mod/{d3d11.dll,nvngx_dlss.dll,aco_dlss.ini}
+scripts/package        # CMake + mingw-w64 -> build/mod/{d3d11.dll,nvngx_dlss.dll,pharos.ini}
 ```
 
 ## Install
 
-Copy `build/mod/*` next to `ACOrigins.exe`. Under Proton/Wine (Lutris), the game must load the
+Copy `build/mod/*` next to `ACOrigins.exe` (settings: `pharos.ini`, log: `pharos.log`; an
+older install's `aco_dlss.ini` is still read if there is no `pharos.ini`). Under Proton/Wine (Lutris), the game must load the
 native `d3d11.dll` from its directory: add `WINEDLLOVERRIDES=d3d11=n,b` to the environment of the
 Ubisoft Connect runner (the game inherits Connect's environment). NVAPI must be enabled
 (`PROTON_ENABLE_NVAPI=1`, default in GE-Proton).
 
 Set the render resolution with the game's *Resolution Scale* option (or `render_scale` in
-`aco_dlss.ini`): 0.5 = Performance, 0.58 = Balanced, 0.667 = Quality, 1.0 = DLAA. Keep
-*Adaptive Quality* off. See `dist/aco_dlss.ini` for all options; most are reloaded live.
+`pharos.ini`): 0.5 = Performance, 0.58 = Balanced, 0.667 = Quality, 1.0 = DLAA. Keep
+*Adaptive Quality* off. See `dist/pharos.ini` for all options; most are reloaded live.
 
 ## Development workflow (headless, Linux)
 
@@ -124,7 +129,7 @@ scripts/aco shot t1 out.png      # screenshot; scripts/aco keys t1 <xdotool args
 touch ~/Games/aco-dlss-instances/t1/out/capture   # frame capture -> out/cap-NNN/
 tools/passes.py <cap-dir>        # pass-level view of a capture; tools/capsum.py for per-draw
 tools/bench t1 "label" 0.5 enabled=1 backend=dlss
-tools/abtest t1 <crop> "a=key:val" "b=key:val"     # live A/B of aco_dlss.ini settings
+tools/abtest t1 <crop> "a=key:val" "b=key:val"     # live A/B of pharos.ini settings
 ```
 
 Ubisoft login tokens are single-use with reuse detection (reusing one logs out every holder), so

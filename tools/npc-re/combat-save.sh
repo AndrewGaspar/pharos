@@ -9,8 +9,8 @@ t=$1 mod=$2
 W=$(cd "$(dirname "$0")/../.." && pwd)
 A=$W/scripts/aco
 I=/home/ajg/Games/aco-dlss-instances/$t
-L=$I/out/aco_dlss.log
-INI="$I/prefix/drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher/games/Assassin's Creed Origins/aco_dlss.ini"
+L=$I/out/pharos.log
+INI="$I/prefix/drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher/games/Assassin's Creed Origins/pharos.ini"
 SD="$I/prefix/drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher/savegames/$(cat "$I/account_id")/3539"
 alive() { (( $(date +%s) - $(stat -c %Y "$L") < 20 )); }
 status() { echo "  $(grep 'npc: [0-9]* spawned' "$L" | tail -1 | sed 's/.*npc: //' | cut -c1-140)"; }
@@ -29,8 +29,8 @@ quit_to_title() {
   echo "  quit to title: 3.save $( (( $(stat -c %Y "$SD/3.save") > m0 )) && echo written || echo 'NOT written') at $(date -u -r "$SD/3.save" +%H:%M:%S)"
 }
 "$A" fixture "$t" story-alexandria-port >/dev/null 2>&1
-grep -q '^npc_units_kill=' "$mod/aco_dlss.ini" || sed -i 's/^npc_units=.*/&\nnpc_units_kill=0/' "$mod/aco_dlss.ini"
-sed -i 's/^npc_units_kill=.*/npc_units_kill=0/' "$mod/aco_dlss.ini"
+grep -q '^npc_units_kill=' "$mod/pharos.ini" || sed -i 's/^npc_units=.*/&\nnpc_units_kill=0/' "$mod/pharos.ini"
+sed -i 's/^npc_units_kill=.*/npc_units_kill=0/' "$mod/pharos.ini"
 launch
 echo "== launched $(date -u +%H:%M:%S)"; sleep 60; status
 echo "== combat"

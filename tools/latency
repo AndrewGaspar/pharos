@@ -7,7 +7,7 @@ set -euo pipefail
 name=$1 count=${2:-40} dx=${3:-150} thr=${4:-0.05}
 here=$(cd "$(dirname "$0")/.." && pwd)
 I=/home/ajg/Games/aco-dlss-instances/$name
-ini="$I/prefix/drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher/games/Assassin's Creed Origins/aco_dlss.ini"
+ini="$I/prefix/drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher/games/Assassin's Creed Origins/pharos.ini"
 grep -q '^latency_log=' "$ini" || printf 'latency_log=0\n' >> "$ini"
 rm -f "$I/out/latency_taa.csv" "$I/out/latency_present.csv" "$I/out/inject.csv"
 sed -i 's/^latency_log=.*/latency_log=1/' "$ini"
@@ -17,5 +17,5 @@ cp "$here/tools/inject_mouse.py" "$I/out/"
 sleep 1
 sed -i 's/^latency_log=.*/latency_log=0/' "$ini"
 sleep 3
-grep "latency:" "$I/out/aco_dlss.log" | tail -3 | sed 's/^/  /'
+grep "latency:" "$I/out/pharos.log" | tail -3 | sed 's/^/  /'
 python3 "$here/tools/latency.py" "$I/out" "$thr"

@@ -8,10 +8,10 @@ set -uo pipefail
 t=$1 mod=$2; shift 2
 W=$(cd "$(dirname "$0")/../.." && pwd)
 I=/home/ajg/Games/aco-dlss-instances/$t
-L=$I/out/aco_dlss.log
+L=$I/out/pharos.log
 run_one() {
-  sed -i "s/^npc_units=.*/npc_units=$k/" "$mod/aco_dlss.ini"
-  sed -i "/^\[fg\]/,/^\[/ s/^enabled=.*/enabled=$fg/" "$mod/aco_dlss.ini"
+  sed -i "s/^npc_units=.*/npc_units=$k/" "$mod/pharos.ini"
+  sed -i "/^\[fg\]/,/^\[/ s/^enabled=.*/enabled=$fg/" "$mod/pharos.ini"
   if "$W/tools/npc-re/userplaying.sh"; then echo "not launching: the user is playing"; exit 2; fi
   "$W/scripts/aco" kill-game "$t" >/dev/null 2>&1
   "$W/scripts/aco" fixture "$t" story-alexandria-port >/dev/null 2>&1

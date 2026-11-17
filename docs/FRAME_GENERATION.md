@@ -121,7 +121,7 @@ generated strictly between its neighbours in 95 % of moving samples; images cohe
 Checking on the user's display path (Hyprland 165 Hz, MangoHud, not gamescope): run
 `tools/interop-test/present_rate.exe 2560 1600 5` with the same Proton to get the raw present
 ceiling, then play with `[fg] mode=d3d12` and read `perf: fg12 present thread steps` in
-aco_dlss.log — a generated/real `Present` above ~1 ms means the display path throttles presents;
+pharos.log — a generated/real `Present` above ~1 ms means the display path throttles presents;
 MangoHud counts both presents (expect ~2x the game rate up to the refresh rate).
 
 ### Live toggle (F9, `[fg] toggle_key`, initial state `[fg] enabled`)
@@ -378,7 +378,7 @@ So the cap trades ~12 real fps (78 → 66) for an even game cadence, no blocking
 same or slightly lower latency to the screen (the queue it removes is worth more than the longer
 frame).
 
-**Recommended defaults** (now in `dist/aco_dlss.ini`): `[reflex] mode=on`, `fps_limit=0`,
+**Recommended defaults** (now in `dist/pharos.ini`): `[reflex] mode=on`, `fps_limit=0`,
 `limiter=driver` (it falls back to the CPU limiter while Reflex isn't sleeping); `[fg] auto_cap=1`,
 `auto_cap_lag=0.7`, `pace=smooth`, `sets=2`. A fixed `[reflex] fps_limit` (~85–90 % of the uncapped
 FG real rate; e.g. 64–66 at the user's ~72–78) overrides the automatic cap and is the steadiest
@@ -705,7 +705,7 @@ vkCmdPushDescriptorSetKHR` and every evaluate silently did nothing while returni
 `vkCreateDevice` and append the extension. Verified: all three of the game's devices get it and
 DLSS-G's GPU work then executes.
 
-## Debugging aids (aco_dlss.ini `[fg]`)
+## Debugging aids (pharos.ini `[fg]`)
 
 - `ngx_log=1|2`: sets `__NGX_LOG_LEVEL`, `__NGX_ENABLE_OVERRIDE_LOG_PATH`,
   `__NGX_LOG_PATH_OVERRIDE` (env vars the driver's Wine NGX core reads) at DLL load; NGX then

@@ -17,7 +17,15 @@ Config g_file;    // as last read from the file
 std::mutex g_mutex;
 bool g_loaded = false;
 
-std::wstring ini_path() { return module_dir() + L"\\aco_dlss.ini"; }
+// pharos.ini; an install that still only has the pre-rename aco_dlss.ini keeps working.
+std::wstring ini_path() {
+  std::wstring p = module_dir() + L"\\pharos.ini";
+  if (GetFileAttributesW(p.c_str()) == INVALID_FILE_ATTRIBUTES) {
+    std::wstring old = module_dir() + L"\\aco_dlss.ini";
+    if (GetFileAttributesW(old.c_str()) != INVALID_FILE_ATTRIBUTES) return old;
+  }
+  return p;
+}
 
 std::string read_str(const wchar_t* key, const char* def, const wchar_t* section = L"upscaler") {
   wchar_t buf[256];

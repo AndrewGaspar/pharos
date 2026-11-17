@@ -2,13 +2,13 @@
 # gpu-exclusive <instance> <command...>
 # Runs a measurement with the GPU (nearly) to itself: takes a lock (so measurements from parallel
 # workstreams queue up instead of overlapping), throttles every other running instance's game to
-# 5 fps through its live aco_dlss.ini (Reflex fps_limit), runs the command, and restores the other
+# 5 fps through its live pharos.ini (Reflex fps_limit), runs the command, and restores the other
 # instances' settings afterwards (also on failure/interrupt). Freezing containers (podman pause)
 # was tried first and leaves the paused games hung after resuming.
 set -euo pipefail
 name=$1; shift
 root=/home/ajg/Games/aco-dlss-instances
-rel="prefix/drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher/games/Assassin's Creed Origins/aco_dlss.ini"
+rel="prefix/drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher/games/Assassin's Creed Origins/pharos.ini"
 exec 9>"$root/.gpu-exclusive.lock"
 flock 9
 saved=()

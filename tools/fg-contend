@@ -9,7 +9,7 @@
 set -uo pipefail
 fg=$1 load=$2 label=$3 secs=${4:-60}
 here=$(cd "$(dirname "$0")/.." && pwd)
-L=/home/ajg/Games/aco-dlss-instances/$fg/out/aco_dlss.log
+L=/home/ajg/Games/aco-dlss-instances/$fg/out/pharos.log
 trap '"$here/tools/ini-set" "$load" reflex.fps_limit=5' EXIT
 summary() {
   local d=$here/build/fgtrace/$1

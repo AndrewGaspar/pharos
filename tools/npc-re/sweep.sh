@@ -8,8 +8,8 @@ t=$1 settle=$2; shift 2
 here=$(cd "$(dirname "$0")" && pwd)
 W=$here/../..
 I=/home/ajg/Games/aco-dlss-instances/$t
-INI="$I/prefix/drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher/games/Assassin's Creed Origins/aco_dlss.ini"
-L=$I/out/aco_dlss.log
+INI="$I/prefix/drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher/games/Assassin's Creed Origins/pharos.ini"
+L=$I/out/pharos.log
 S=${SHOTS:-/tmp/claude-1000/-home-ajg-code-ac-dlss/249d0810-7bc6-42cc-9509-5599a9b80e14/scratchpad/npc/sweep}
 mkdir -p "$S"
 pid=$("$here/gamepid.sh" "$t") || exit 1

@@ -4,7 +4,7 @@
 set -uo pipefail
 t=$1 stay=$2; shift 2
 W=$(cd "$(dirname "$0")/../.." && pwd)
-L=/home/ajg/Games/aco-dlss-instances/$t/out/aco_dlss.log
+L=/home/ajg/Games/aco-dlss-instances/$t/out/pharos.log
 for city in "$@"; do
   "$W/tools/npc-re/fasttravel.sh" "$t" "$city" || { echo "stopping: fast travel failed"; exit 1; }
   timeout $((stay + 60)) "$W/tools/npc-re/roamer.sh" "$t" $(( (stay + 59) / 60 )) > /dev/null 2>&1
