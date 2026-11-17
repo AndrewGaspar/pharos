@@ -57,6 +57,7 @@ UpdateFn g_orig_update = nullptr;
 uintptr_t g_cur_mgr = 0;
 std::unordered_set<uintptr_t> g_done;
 std::vector<uintptr_t> g_created;  // extras of the current manager
+std::atomic<bool> g_log_units{false};  // [world] npc_units_log (diagnostics): log each extra and its original
 unsigned g_extras = 0, g_failed = 0;
 uint32_t g_cursor = 0;
 ULONGLONG g_last_step = 0;
@@ -163,6 +164,7 @@ unsigned augment_spawner(uintptr_t mgr, uintptr_t sp, int k, float px, float py,
         ++made;
         g_last_unit = nu;
         g_created.push_back(nu);
+        if (g_log_units) ACO_LOG("npc_units: extra %p of %p (spawner %p)", reinterpret_cast<void*>(nu), reinterpret_cast<void*>(u), reinterpret_cast<void*>(sp));
         g_done.insert(nu);
       } else {
         ++g_failed;
@@ -294,6 +296,7 @@ void npc_units_on_present() {
   }
   if (k == 1) return;  // the hook stays installed but idle
   g_kill_req = static_cast<int>(config().world_npc_units_kill);
+  g_log_units = config().world_npc_units_log != 0.0f;
   uintptr_t world = load(load(g_base + kGameGlobalRva) + 0xc0);
   uintptr_t mgr = load(world + kMetaAIOff);
   if (!mgr) return;
