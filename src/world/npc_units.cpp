@@ -126,6 +126,30 @@ uintptr_t add_unit(uintptr_t mgr, uintptr_t sp, uintptr_t entry, const float pos
   return unit;
 }
 
+// Render camera (RVA 0x49e86b8 -> +0x130 position, +0x140 unit forward), read once per step.
+constexpr uintptr_t kCameraRva = 0x49e86b8;
+constexpr float kViewRange = 110.0f;  // beyond this a new character is small and spawns at the rim
+float g_cam[6];
+bool g_cam_ok = false;
+
+void read_camera() {
+  uintptr_t c = load(g_base + kCameraRva);
+  g_cam_ok = c && readable(c + 0x130, 0x20);
+  if (!g_cam_ok) return;
+  memcpy(g_cam, reinterpret_cast<void*>(c + 0x130), 12);
+  memcpy(g_cam + 3, reinterpret_cast<void*>(c + 0x140), 12);
+}
+
+// Within kViewRange of the camera and inside a ~70 degree half-angle cone around its forward axis.
+bool in_view(float x, float y, float z) {
+  if (!g_cam_ok) return true;  // unknown: be conservative
+  float dx = x - g_cam[0], dy = y - g_cam[1], dz = z - g_cam[2];
+  float d = std::sqrt(dx * dx + dy * dy + dz * dz);
+  if (d > kViewRange) return false;
+  if (d < 1.0f) return true;
+  return (dx * g_cam[3] + dy * g_cam[4] + dz * g_cam[5]) / d > 0.34f;
+}
+
 // Extras for the units of spawner `sp` that are within the ring, not activated yet and not handled
 // before. Units are handled one by one (big spawners have 60+ units spread over a district, some of
 // them always active near the player). Returns the number of units created.
@@ -144,9 +168,11 @@ unsigned augment_spawner(uintptr_t mgr, uintptr_t sp, int k, float px, float py,
     if (!u || rd<uintptr_t>(u) != g_base + kUnitVtRva) continue;
     float d = std::hypot(rd<float>(u + 0x10) - px, rd<float>(u + 0x14) - py);
     if (d > kRingOuter) continue;
-    // Activated units get extras too: the MetaAI activates the new unit on its own. Near the player
-    // that can make a character appear in view; it happens in the first seconds after a load or a
-    // fast travel (full pass), later the ring runs ahead of the player.
+    // Activated units get extras too: the MetaAI activates the new unit on its own. So that no
+    // character appears in view, an activated unit near the camera and in front of it is left for
+    // later (the player turns or moves on); everything else is handled at once, so after a load or
+    // a fast travel the whole 400 m area gets its extras within seconds.
+    if (rd<uintptr_t>(u + 0x1b8) && in_view(rd<float>(u + 0x10), rd<float>(u + 0x14), rd<float>(u + 0x18))) continue;
     if (!g_done.insert(u).second) continue;   // handled before, or one of our extras
     if ((rd<uint8_t>(u + 0x5a) & 6) || (rd<uint8_t>(u + 0x90) & 0x40)) continue;  // dead / group / scripted
     uintptr_t link = rd<uintptr_t>(u + 0x38), entry = 0;
@@ -192,6 +218,7 @@ void step(uintptr_t mgr) {
   uintptr_t pl = load(load(g_base + kPlayerRootRva));
   if (!readable(pl + 0x50, 12)) return;
   float px = rd<float>(pl + 0x50), py = rd<float>(pl + 0x54);
+  read_camera();
   // The manager's list of all virtual objectives ({ptr} at +0x3b8, plain u32 count at +0x3c0),
   // walked in slices so one update never reads more than a few thousand objects.
   uintptr_t list = rd<uintptr_t>(mgr + kObjListOff);
