@@ -21,6 +21,8 @@ namespace {
 // v1.62 RVAs (docs/ENGINE_NOTES.md, "What the MetaAI save stores about units").
 constexpr uintptr_t kGameGlobalRva = 0x4c27f18;   // [rva] -> game; +0xc0 = World
 constexpr uintptr_t kPlayerRootRva = 0x4c23c40;   // [[rva]] = player entity, position at +0x50
+constexpr uintptr_t kPlayerRoot2Rva = 0x4c5d788;  // [[rva] + 0x78] = player entity (second root, world/teleport.cpp)
+constexpr uintptr_t kEntityVtRva = 0x365e460;     // Entity vtable
 constexpr uintptr_t kMetaAIOff = 0x1688;          // World + 0x1688 = MetaAI manager
 constexpr uintptr_t kMgrVtRva = 0x377e7e8;        // MetaAI manager vtable (89 slots)
 constexpr int kMgrVtSlots = 89;
@@ -66,7 +68,8 @@ unsigned g_extras = 0, g_failed = 0;
 uint32_t g_cursor = 0;
 ULONGLONG g_last_step = 0;
 std::atomic<unsigned> g_stat_extras{0}, g_stat_spawners{0}, g_list_n{0}, g_stat_failed{0};
-std::atomic<uintptr_t> g_last_unit{0};  // a recently created extra (diagnostics: activation state)
+std::atomic<uintptr_t> g_last_unit{0};
+std::atomic<uintptr_t> g_stat_mgr{0};  // manager the sim thread is stepping (diagnostics)  // a recently created extra (diagnostics: activation state)
 
 template <class T> T rd(uintptr_t a) { T v; memcpy(&v, reinterpret_cast<void*>(a), sizeof(T)); return v; }
 
@@ -77,6 +80,18 @@ bool readable(uintptr_t p, size_t n) {
   return p + n <= reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
 }
 uintptr_t load(uintptr_t a) { return readable(a, 8) ? rd<uintptr_t>(a) : 0; }
+// [p, p + n) committed and readable, possibly over several regions (big engine arrays can straddle
+// two reservations of its allocator; readable() alone then rejects them).
+bool readable_span(uintptr_t p, size_t n) {
+  const uintptr_t end = p + n;
+  while (p < end) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!p || !VirtualQuery(reinterpret_cast<void*>(p), &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT) return false;
+    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
+    p = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+  }
+  return true;
+}
 
 // Object behind a link record {object, flags/refcount, id}: the object when the flag bit is set.
 uintptr_t link_object(uintptr_t link) {
@@ -154,6 +169,25 @@ bool in_view(float x, float y, float z) {
   return (dx * g_cam[3] + dy * g_cam[4] + dz * g_cam[5]) / d > 0.34f;
 }
 
+// The player's position from either static root (validated like world/teleport.cpp: after some
+// fast travels the first root does not lead to the entity), else the render camera's.
+std::atomic<unsigned> g_skip_player{0}, g_skip_list{0}, g_cam_pos{0};
+bool player_xy(float& px, float& py) {
+  for (uintptr_t e : {load(load(g_base + kPlayerRootRva)), load(load(g_base + kPlayerRoot2Rva) + 0x78)}) {
+    if (!readable(e, 0x60) || rd<uintptr_t>(e) != g_base + kEntityVtRva) continue;
+    float x = rd<float>(e + 0x50), y = rd<float>(e + 0x54);
+    if (!std::isfinite(x) || !std::isfinite(y) || std::fabs(x) > 1e5f || std::fabs(y) > 1e5f) continue;
+    px = x, py = y;
+    return true;
+  }
+  if (g_cam_ok) {
+    px = g_cam[0], py = g_cam[1];
+    ++g_cam_pos;
+    return true;
+  }
+  return false;
+}
+
 // Extras for the units of spawner `sp` that are within the ring, not activated yet and not handled
 // before. Units are handled one by one (big spawners have 60+ units spread over a district, some of
 // them always active near the player). Returns the number of units created.
@@ -219,7 +253,7 @@ ULONGLONG g_last_prune = 0;
 void prune(uintptr_t mgr) {
   uintptr_t list = rd<uintptr_t>(mgr + kObjListOff);
   uint32_t n = rd<uint32_t>(mgr + kObjListOff + 8);
-  if (!n || n > 400000 || !readable(list, size_t(n) * 8)) return;
+  if (!n || n > 400000 || !readable_span(list, size_t(n) * 8)) return;
   std::unordered_set<uintptr_t> live;
   live.reserve(g_done.size() + 1024);
   const uintptr_t spvt = g_base + kSpawnerVtRva;
@@ -247,20 +281,22 @@ void step(uintptr_t mgr) {
   g_last_step = now;
   if (mgr != g_cur_mgr) {  // new world / manager
     g_cur_mgr = mgr;
+    g_stat_mgr = mgr;
+    g_stat_extras = g_stat_failed = g_stat_spawners = 0;
+    g_list_n = 0;
     g_done.clear();
     g_created.clear();
     g_extras = g_failed = 0;
     g_cursor = 0;
   }
-  uintptr_t pl = load(load(g_base + kPlayerRootRva));
-  if (!readable(pl + 0x50, 12)) return;
-  float px = rd<float>(pl + 0x50), py = rd<float>(pl + 0x54);
   read_camera();
+  float px, py;
+  if (!player_xy(px, py)) { ++g_skip_player; return; }
   // The manager's list of all virtual objectives ({ptr} at +0x3b8, plain u32 count at +0x3c0),
   // walked in slices so one update never reads more than a few thousand objects.
   uintptr_t list = rd<uintptr_t>(mgr + kObjListOff);
   uint32_t n = rd<uint32_t>(mgr + kObjListOff + 8);
-  if (!n || n > 400000 || !readable(list, size_t(n) * 8)) return;
+  if (!n || n > 400000 || !readable_span(list, size_t(n) * 8)) { ++g_skip_list; g_list_n = n; return; }
   g_list_n = n;
   if (g_cursor >= n) g_cursor = 0;
   uint32_t end = std::min<uint32_t>(n, g_cursor + 6000);
@@ -417,6 +453,11 @@ void npc_units_on_present() {
     LARGE_INTEGER f;
     QueryPerformanceFrequency(&f);
     uint64_t calls = g_calls.exchange(0), to = g_t_orig.exchange(0), tu = g_t_ours.exchange(0), tm = g_t_ours_max.exchange(0);
+    if (uintptr_t sm = g_stat_mgr.load(); sm && sm != mgr)
+      ACO_LOG("npc_units: stepping manager %p, but the world's is %p", reinterpret_cast<void*>(sm), reinterpret_cast<void*>(mgr));
+    unsigned sp = g_skip_player.exchange(0), sl = g_skip_list.exchange(0), cp = g_cam_pos.exchange(0);
+    if (sp || sl || cp)
+      ACO_LOG("npc_units: steps skipped in 10 s: %u no player position, %u objective list unreadable; %u used the camera position", sp, sl, cp);
     if (calls)
       ACO_LOG("npc_units: cost: %llu MetaAI updates in 10 s, game update %.3f ms avg, ours %.3f ms avg / %.3f ms max",
               (unsigned long long)calls, 1e3 * to / f.QuadPart / calls, 1e3 * tu / f.QuadPart / calls, 1e3 * tm / f.QuadPart);
