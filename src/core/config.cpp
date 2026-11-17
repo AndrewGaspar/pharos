@@ -109,6 +109,7 @@ Config load() {
   c.world_npc_distance = read_float(L"npc_distance", 1.0f, L"world");
   c.world_npc_units = read_float(L"npc_units", 1.0f, L"world");
   c.world_npc_units_kill = read_float(L"npc_units_kill", 0.0f, L"world");
+  c.world_npc_units_log = read_float(L"npc_units_log", 0.0f, L"world");
   c.reflex_markers = read_float(L"markers", 1.0f, L"reflex") != 0.0f;
   c.reflex_marker_set = read_str(L"marker_set", "minimal", L"reflex");
   c.toggle_key = read_str(L"toggle_key", "F10");
@@ -128,7 +129,8 @@ bool same(const Config& a, const Config& b) {
          a.toggle_key == b.toggle_key && a.cloth_mode == b.cloth_mode && a.cloth_scale == b.cloth_scale &&
          a.world_lod_distance == b.world_lod_distance && a.world_lod_skip == b.world_lod_skip && a.world_lod_mode == b.world_lod_mode && a.world_npc_density == b.world_npc_density &&
          a.world_npc_distance == b.world_npc_distance && a.world_npc_units == b.world_npc_units &&
-         a.world_npc_units_kill == b.world_npc_units_kill;
+         a.world_npc_units_kill == b.world_npc_units_kill &&
+         a.world_npc_units_log == b.world_npc_units_log;
 }
 } // namespace
 

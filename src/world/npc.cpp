@@ -93,9 +93,15 @@ uintptr_t find_settings() {
   return settings;
 }
 
-uintptr_t g_settings = 0;     // object we last patched
-uint32_t g_original = 0;      // its maxSpawned before we touched it
-uint32_t g_written = 0;       // what we wrote (0 = nothing)
+// The SpawningManager switches between SpawnSettings objects (e.g. 200 and 300 in Alexandria), so
+// originals are kept per object: re-reading "the original" from an object we already patched
+// compounded the factor (seen: 300 -> 900 -> 9000).
+struct Patched {
+  uint32_t max_orig = 0, max_written = 0;  // maxSpawned before us / what we wrote (0 = nothing)
+  float mul_orig = 1.0f, mul_written = 0;  // +0x70 likewise
+};
+std::unordered_map<uintptr_t, Patched> g_patched;
+uintptr_t g_settings = 0;     // object we last looked at
 float g_applied = 1.0f;
 
 uint32_t& max_spawned(uintptr_t s) { return *reinterpret_cast<uint32_t*>(s + kMaxSpawnedOff); }
@@ -193,16 +199,17 @@ DWORD WINAPI scan_thread(void*) {
   }
 }
 
-void apply_distance(uintptr_t s, float k) {
+void apply_distance(uintptr_t s, Patched& p, float k) {
   float* mul = reinterpret_cast<float*>(s + kDistanceMulOff);
-  if (s != g_dist_settings) {
-    g_dist_settings = s;
-    g_dist_original = *mul;
-  } else if (*mul != g_dist_original * g_dist_k.load()) {
-    g_dist_original = *mul;  // rewritten by the game (data reload)
+  if (p.mul_written != 0 && *mul != p.mul_written) {  // rewritten by the game (data reload)
+    p.mul_orig = *mul;
+    p.mul_written = 0;
   }
-  float want = g_dist_original * k;
+  g_dist_settings = s;
+  g_dist_original = p.mul_orig;
+  float want = p.mul_orig * k;
   if (*mul != want) *mul = want;
+  p.mul_written = want == p.mul_orig ? 0 : want;
   if (k != g_dist_k.load()) {
     ACO_LOG("npc: npc_distance=%g -> spawn distance multiplier %g (game %g)", k, want, g_dist_original);
     g_dist_k = k;
@@ -230,29 +237,32 @@ void npc_on_present() {
 
   uintptr_t s = find_settings();
   if (!s) return;  // menus / loading
-  if (s != g_settings) {  // first sight, or the world (and its data) was reloaded
-    g_settings = s;
-    g_original = max_spawned(s);
-    g_written = 0;
-    ACO_LOG("npc: SpawnSettings %p maxSpawned=%u", reinterpret_cast<void*>(s), g_original);
+  auto it = g_patched.find(s);
+  if (it == g_patched.end()) {  // first sight of this object (a world reload brings new ones)
+    if (g_patched.size() > 64) g_patched.clear();
+    Patched p;
+    p.max_orig = max_spawned(s);
+    p.mul_orig = *reinterpret_cast<float*>(s + kDistanceMulOff);
+    it = g_patched.emplace(s, p).first;
+    ACO_LOG("npc: SpawnSettings %p maxSpawned=%u", reinterpret_cast<void*>(s), p.max_orig);
   }
+  Patched& p = it->second;
+  g_settings = s;
   uint32_t cur = max_spawned(s);
-  if (g_written && cur != g_written) {  // data was rewritten under us: take it as the new original
-    g_original = cur;
-    g_written = 0;
+  if (p.max_written && cur != p.max_written) {  // data was rewritten under us: take it as the new original
+    p.max_orig = cur;
+    p.max_written = 0;
   }
   k = std::clamp(k, 0.1f, 20.0f);
-  uint32_t want = static_cast<uint32_t>(std::lround(g_original * static_cast<double>(k)));
-  if (k == 1.0f) want = g_original;
-  if (cur != want) {
-    max_spawned(s) = want;
-    g_written = want == g_original ? 0 : want;
-  }
+  uint32_t want = static_cast<uint32_t>(std::lround(p.max_orig * static_cast<double>(k)));
+  if (k == 1.0f) want = p.max_orig;
+  if (cur != want) max_spawned(s) = want;
+  p.max_written = want == p.max_orig ? 0 : want;
   if (k != g_applied) {
-    ACO_LOG("npc: npc_density=%g -> maxSpawned %u (game %u)", k, want, g_original);
+    ACO_LOG("npc: npc_density=%g -> maxSpawned %u (game %u)", k, want, p.max_orig);
     g_applied = k;
   }
-  apply_distance(s, std::clamp(kd, 0.25f, 8.0f));
+  apply_distance(s, p, std::clamp(kd, 0.25f, 8.0f));
   static ULONGLONG last_stat = 0;
   if (now - last_stat >= 10000) {
     last_stat = now;
