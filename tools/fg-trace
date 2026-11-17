@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# fg-trace <instance> <label> [dx] [period_ms]
+# Frame-pacing measurement on a running game (in world, Frame Generation as configured): spins the
+# camera at a constant rate (tools/spin.py: dx px of mouse-look every period_ms, default 3 px / 2 ms),
+# triggers the mod's present trace (touch out/fgtrace-start: per-present timestamps + image bands) once
+# the spin is steady, and analyses it with tools/fg-pacing.py. Results: build/fgtrace/<label>/.
+# Every wait has a deadline.
+set -euo pipefail
+name=$1 label=$2 dx=${3:-3} period=${4:-2}
+here=$(cd "$(dirname "$0")/.." && pwd)
+I=/home/ajg/Games/aco-dlss-instances/$name
+L=$I/out/aco_dlss.log
+cp "$here/tools/spin.py" "$I/out/"
+rm -rf "$I/out/fgtrace" "$I/out/fgtrace-start"
+start=$(wc -l < "$L")
+"$here/scripts/aco" exec "$name" python3 /out/spin.py 20 "$dx" "$period" &
+spin=$!
+sleep 2
+touch "$I/out/fgtrace-start"
+end=$((SECONDS + 90))
+until tail -n +"$start" "$L" | grep -q "fg12: trace written" || ((SECONDS >= end)); do sleep 0.5; done
+wait "$spin" || true
+tail -n +"$start" "$L" | grep -q "fg12: trace written" || { echo "fg-trace: no trace written (FG running? see $L)" >&2; exit 1; }
+out=$here/build/fgtrace/$label
+rm -rf "$out"; mkdir -p "$out"
+cp "$I"/out/fgtrace/* "$out/"
+tail -n +"$start" "$L" | grep -E "perf: fg" | tail -4 > "$out/perf.txt" || true
+echo "##### $label"
+python3 -I "$here/tools/fg-pacing.py" "$out" --json "$out/result.json" | tee "$out/report.txt"

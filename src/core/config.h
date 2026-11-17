@@ -58,6 +58,13 @@ struct Config {
   int fg_buffers = 0;        // [fg] buffers: minimum swapchain buffer count (mode=d3d12, at creation/resize)
   std::string fg_sync = "cpu";  // [fg] sync: how D3D11 waits for DLSS-G output: cpu | gpu
   bool fg_present_gate = true;  // [fg] present_gate: render thread yields the context to the present thread
+  std::string fg_camera = "engine";  // [fg] camera: engine (the game's matrices) | identity
+  bool fg_camera_unjitter = true;     // [fg] camera_unjitter: strip TAA jitter from the projection
+  std::string fg_mv_units = "px";    // [fg] mv_units: px (MvecScale = mv_scale x render size) | uv
+  std::string fg_pace = "smooth";  // [fg] pace: ready | smooth | arrival (when the generated frame is presented)
+  float fg_pace_relax = 0.5f;     // [fg] pace_relax (pace=smooth)
+  int fg_trace_presents = 1200;  // [fg] trace_presents: presents timed per `touch <out>/fgtrace-start`
+  int fg_trace_shots = 120;      // [fg] trace_shots: of those, how many get an image band captured
   bool fg_verify = false;  // [fg] verify: log/dump (previous real, generated, current real) every 2 s
   bool fg12_descriptor_heap = true;  // [fg] descriptor_heap (mode=d3d12): VKD3D_CONFIG=descriptor_heap for our device
   bool fg_hide_handle64 = false;  // [fg] hide_handle64 (experiment): evaluation then fails, DLSS-G needs them    // [fg] trace_cu (debug): log NGX CUDA-kernel creation/launches  // [fg] show_index: which generated index to present          // [fg] refresh_hz (DLSSG.RefreshRate)               // [fg] hudless: pass the DLSS output as HUD-less colour
