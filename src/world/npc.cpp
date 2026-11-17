@@ -26,6 +26,7 @@ constexpr uintptr_t kSettingsOff = 0x10;             // SpawningManager + 0x10 -
 constexpr uintptr_t kSpawnMgrVtRva = 0x363beb0;
 constexpr uintptr_t kSpawnSettingsVtRva = 0x363cc80;
 constexpr uintptr_t kMaxSpawnedOff = 0x38;           // uint32, 200 in the shipped data
+constexpr uint32_t kMaxSafeSpawned = 800;          // see npc_on_present
 // The three readers of maxSpawned (each: call cap multiplier 0x12559c0; mov eax/ecx, [reg+0x38]).
 constexpr uintptr_t kReaderRvas[] = {0x1255a9e, 0x1268f21, 0x1259092};
 
@@ -255,6 +256,10 @@ void npc_on_present() {
   }
   k = std::clamp(k, 0.1f, 100.0f);
   uint32_t want = static_cast<uint32_t>(std::lround(p.max_orig * static_cast<double>(k)));
+  // With [world] npc_units the game froze (every thread waiting) once ~1000-1100 characters were
+  // spawned at once, while <= ~900 ran clean: keep the budget below that whatever npc_density says
+  // (the quality multiplier is at most 1.2, so 800 raw -> at most 960 spawned).
+  if (want > kMaxSafeSpawned && want > p.max_orig) want = std::max(kMaxSafeSpawned, p.max_orig);
   if (k == 1.0f) want = p.max_orig;
   if (cur != want) max_spawned(s) = want;
   p.max_written = want == p.max_orig ? 0 : want;

@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <unordered_set>
 #include <vector>
@@ -47,6 +48,7 @@ constexpr float kRingOuter = 400.0f;
 constexpr unsigned kMaxExtrasPerWorld = 60000;  // hard ceiling; [world] npc_units_max lowers it
 std::atomic<unsigned> g_max_extras{kMaxExtrasPerWorld};
 constexpr unsigned kMaxCreatePerStep = 96;
+std::atomic<unsigned> g_rate{kMaxCreatePerStep};  // [world] npc_units_rate (diagnostics): units per 100 ms step
 constexpr uint32_t kMaxUnitsPerSpawner = 200;  // see augment_spawner
 
 uintptr_t g_base = 0;
@@ -238,10 +240,10 @@ void step(uintptr_t mgr) {
   unsigned made = 0;
   const uintptr_t spvt = g_base + kSpawnerVtRva;
   uint32_t i = g_cursor;
-  for (; i < end && made < kMaxCreatePerStep && g_extras < g_max_extras.load(); ++i) {
+  for (; i < end && made < g_rate.load() && g_extras < g_max_extras.load(); ++i) {
     uintptr_t sp = rd<uintptr_t>(list + 8 * i);
     if (!sp || rd<uintptr_t>(sp) != spvt) continue;
-    made += augment_spawner(mgr, sp, k, px, py, kMaxCreatePerStep - made);
+    made += augment_spawner(mgr, sp, k, px, py, g_rate.load() - made);
   }
   g_cursor = i;  // resume where this slice stopped
   if (g_done.size() > 200000) g_done.clear();
@@ -295,6 +297,35 @@ uintptr_t update_hook(void* self, uintptr_t a, uintptr_t b, uintptr_t c) {
   return r;
 }
 
+// Diagnostics for the freezes seen with many extra units (every thread idle, no crash dump): log
+// first-chance exceptions (code, faulting RVA, thread, a few return addresses from the stack) so a
+// fault swallowed by the engine's job system becomes visible. Rate-limited; never handles anything.
+LONG CALLBACK log_exception(EXCEPTION_POINTERS* ep) {
+  static std::atomic<int> logged{0};
+  DWORD code = ep->ExceptionRecord->ExceptionCode;
+  if (code == 0x406D1388 || code == 0x40010006 || code == 0x4001000A || code == DBG_PRINTEXCEPTION_C ||
+      code == 0xE06D7363 /* C++ throw */ || code == 0x80000003 || code == 0x8001010D)
+    return EXCEPTION_CONTINUE_SEARCH;
+  if (logged.fetch_add(1) >= 40) return EXCEPTION_CONTINUE_SEARCH;
+  auto rel = [](uintptr_t v) -> uintptr_t { return v >= g_base && v < g_base + 0x5000000 ? v - g_base : v; };
+  uintptr_t pc = reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress);
+  uintptr_t av = ep->ExceptionRecord->NumberParameters >= 2 ? ep->ExceptionRecord->ExceptionInformation[1] : 0;
+  char ra[160] = {0};
+  int n = 0;
+  uintptr_t sp = ep->ContextRecord->Rsp;
+  for (int i = 0; i < 256 && n < 8; ++i) {
+    uintptr_t v;
+    if (!readable(sp + 8 * i, 8)) break;
+    memcpy(&v, reinterpret_cast<void*>(sp + 8 * i), 8);
+    if (v >= g_base + 0x1000 && v < g_base + 0x3500000)
+      n += 0, snprintf(ra + strlen(ra), sizeof(ra) - strlen(ra), " %llx", (unsigned long long)(v - g_base)), ++n;
+  }
+  ACO_LOG("npc_units: exception %08lx at %s%llx (address %llx) thread %lu, stack:%s", code,
+          pc >= g_base && pc < g_base + 0x5000000 ? "rva " : "", (unsigned long long)rel(pc), (unsigned long long)av,
+          GetCurrentThreadId(), ra);
+  return EXCEPTION_CONTINUE_SEARCH;
+}
+
 bool verify() {
   auto* base = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
   g_base = reinterpret_cast<uintptr_t>(base);
@@ -324,6 +355,7 @@ void npc_units_on_present() {
   if (state == 0) {
     if (k == 1) return;
     state = verify() ? 1 : 2;
+    if (state == 1) AddVectoredExceptionHandler(1, log_exception);
     ACO_LOG("npc_units: %s", state == 1 ? "MetaAI layout found (v1.62)" : "MetaAI layout not found; npc_units disabled");
   }
   if (state != 1) return;
@@ -334,6 +366,7 @@ void npc_units_on_present() {
   if (k == 1) return;  // the hook stays installed but idle
   g_kill_req = static_cast<int>(config().world_npc_units_kill);
   g_log_units = config().world_npc_units_log != 0.0f;
+  { float r = config().world_npc_units_rate; g_rate = r >= 1 ? std::min<unsigned>(static_cast<unsigned>(r), kMaxCreatePerStep) : kMaxCreatePerStep; }
   { float mx = config().world_npc_units_max; g_max_extras = mx > 0 ? std::min<unsigned>(static_cast<unsigned>(mx), kMaxExtrasPerWorld) : kMaxExtrasPerWorld; }
   uintptr_t world = load(load(g_base + kGameGlobalRva) + 0xc0);
   uintptr_t mgr = load(world + kMetaAIOff);
