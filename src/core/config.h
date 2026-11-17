@@ -61,8 +61,8 @@ struct Config {
   std::string fg_camera = "engine";  // [fg] camera: engine (the game's matrices) | identity
   bool fg_camera_unjitter = true;     // [fg] camera_unjitter: strip TAA jitter from the projection
   std::string fg_mv_units = "px";    // [fg] mv_units: px (MvecScale = mv_scale x render size) | uv
-  bool fg_auto_cap = false;       // [fg] auto_cap: cap the real frame rate with headroom (feedback, fg_d3d12.cpp)
-  float fg_auto_cap_lag = 0.85f;  // [fg] auto_cap_lag: target DLSS-G done time after the game's Present, in frames
+  bool fg_auto_cap = true;        // [fg] auto_cap: cap the real frame rate with headroom (feedback, fg_d3d12.cpp)
+  float fg_auto_cap_lag = 0.7f;   // [fg] auto_cap_lag: target DLSS-G done time after the game's Present, in frames
   float fg_auto_cap_min = 0, fg_auto_cap_max = 0;  // [fg] auto_cap_min / auto_cap_max (fps; 0 = 30 / 240)
   int fg_sets = 2;  // [fg] sets: texture sets in flight (2 | 3: the present thread may lag two frames)
   std::string fg_pace = "smooth";  // [fg] pace: ready | smooth | arrival (when the generated frame is presented)

@@ -78,8 +78,8 @@ Config load() {
   c.fg_camera = read_str(L"camera", "engine", L"fg");
   c.fg_camera_unjitter = read_float(L"camera_unjitter", 1.0f, L"fg") != 0.0f;
   c.fg_mv_units = read_str(L"mv_units", "px", L"fg");
-  c.fg_auto_cap = read_float(L"auto_cap", 0.0f, L"fg") != 0.0f;
-  c.fg_auto_cap_lag = read_float(L"auto_cap_lag", 0.85f, L"fg");
+  c.fg_auto_cap = read_float(L"auto_cap", 1.0f, L"fg") != 0.0f;
+  c.fg_auto_cap_lag = read_float(L"auto_cap_lag", 0.7f, L"fg");
   c.fg_auto_cap_min = read_float(L"auto_cap_min", 0.0f, L"fg");
   c.fg_auto_cap_max = read_float(L"auto_cap_max", 0.0f, L"fg");
   c.fg_sets = static_cast<int>(read_float(L"sets", 2.0f, L"fg"));

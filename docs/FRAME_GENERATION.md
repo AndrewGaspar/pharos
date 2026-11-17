@@ -311,6 +311,87 @@ Conclusions:
 - `tools/fg-trace` occasionally reported "no trace written" although the mod wrote it: `tail | grep -q`
   under `pipefail` fails when grep exits first (SIGPIPE). Fixed.
 
+### Game cadence under Frame Generation: headroom cap, Reflex watchdog (2026-11-17)
+
+User report: with FG on (VRR active, ~71 real fps, DLSS-G ~5.1 ms) camera turning felt hitchy, with
+FG off it felt great. Their traces: generated frames correct, presents evenly spaced, but the
+*game's* frame times uneven (arrival interval 14 ± 3–6 ms, p90 22, max 44 vs 9.7 ± 1.0 with FG off),
+the game waiting for the present thread on ~every frame (~5 ms), and G/R presented +24/+31 ms after
+the game's Present. Reflex had shut itself off 2 s after arming.
+
+**Why the cadence breaks.** Without headroom the GPU queue fills: DLSS-G runs on our second
+(vkd3d-proton) device, which the game's Reflex doesn't account for, so even with Reflex on the
+GPU is oversubscribed. DLSS-G for frame N then finishes ~1.7 frames after the game's Present, the
+present thread falls behind, and the game blocks in `join` (before its Reflex sleep) at irregular
+times. The simulation's frame times follow those stalls; evenly spaced presents of unevenly timed
+content look like hitching. Reflex alone doesn't fix it (measured below); a cap with headroom does.
+
+**Reflex "sleep did not return within 500 ms; Reflex disabled for this session"** came from
+hitches, not driver hangs. In the t2 log the first sleeps coincided with FG's D3D12/NGX init
+(D3D12CreateDevice 709 ms, a 582 ms frame): init starts at frame 300, Reflex arms at frame 240.
+That matches the user's "2 s after arming". The watchdog now only skips sleeps until the overrun
+sleep returns, then resumes; a sleep stuck > 3 s switches the sleep mode off, starts a new
+sleeper and re-arms (up to 3 times, then off for the session). The perf line reports
+`overruns`/`hangs`.
+
+**A second bug: FG re-enabled after a gap ran at 2 fps for ~40 s.** The real-frame interval EMA
+spanned the frames without FG (F9/ini toggle, menus, loading). After 30 s off the EMA jumped to
+~3 s, the real present waited half of that, and the game (blocked in `join`) ran at ~2 fps while
+the EMA decayed by 10 % per frame. The F9 hotkey path reset it, the ini path and menus/loading
+screens did not. Now any frame without FG breaks the chain, hitch intervals count at most 2.5x,
+and the half-interval wait is capped at 25 ms. Re-enabling is now immediate (66 fps in the first
+2 s window).
+
+Measurements: t2, 2560x1600, DLSS at the user's PixelDensity 0.6, Ultra High, Siwa, only this game
+on the GPU, constant-rate spin (`tools/fg-series`). Uncapped FG ~73–81 real fps, DLSS-G 5.1 ms,
+close to the user's.
+
+| configuration | real fps | game arrival interval mean ± sd (p90 / max) ms | game waited for present thread / 2 s | G / R presented after game's Present ms | position residual (VRR) mean / p90 px |
+|---|---|---|---|---|---|
+| **user-like**: Reflex off, no cap | 78 | 12.9 ± 3.3 (17.8 / 39.5) | 124–136 (4.6 ms avg) | 22.6 / 29.2 | 6.7 / 16.4 (p99 59) |
+| Reflex on, no cap | 81 | 13.0 ± 3.5 (18.8 / 25.9) | 106 (3.6 ms) | 20.9 / 27.4 | 8.4 / 18.0 |
+| `[fg] sets=3` (Reflex on, no cap) | 76 | 13.0 ± 6.0 (23.4 / 37.5) | 0, but 56 generated frames dropped | 20.0 / 22.0 | 26.4 / 59.0 |
+| Reflex on, fps_limit=76 (too little headroom) | 73 | 13.4 ± 1.4 | 78 (3.3 ms) | 13.1 / 19.8 | 2.0 / 3.9 |
+| **Reflex on, fps_limit=66, limiter=driver** | 66 | 15.2 ± **0.79** (15.8 / 19.7) | **0** | **9.6 / 17.2** | **2.3 / 4.7** |
+| Reflex on, fps_limit=66, limiter=cpu | 66 | 15.2 ± 0.86 | 0 | 9.9 / 17.5 | 2.5 / 5.3 |
+| Reflex on, fps_limit=60 | 60 | 16.7 ± 0.85 | 0 | 9.2 / 17.6 | 2.8 / 6.0 |
+| **`auto_cap=1`, auto_cap_lag=0.7** (new default) | 63–64 | 15.6 ± **0.86**, 16.0 ± 0.87 | 0 | 9.5 / 17.3 | 2.3 / 4.8, 3.2 / 8.1 |
+| auto_cap, lag 0.85 (Reflex on / off) | 70 | 14.5 ± 1.19 / 14.3 ± 1.38 | 0 | 10.2 / 17.4, 11.0 / 18.2 | 3.9 / 5.3, 3.0 / 6.1 |
+| FG off (Reflex on) | 107 | 9.3 ± 1.15 | – | – | 4.2 / 9.7 |
+
+(The residual is display-time judder in px of image motion during a ~5000 px/s spin; with the
+cap the FG-on image is as smooth as, or smoother than, FG off at 107 fps.)
+
+Latency (`tools/latency-bench`, 40 mouse-look injections, fresh launch each, same settings). "Frame
+done" is to the end of the real frame's GPU work; what reaches the screen also includes the R/G
+present delay above:
+
+| | real fps | input → Present called, median | input → frame done, median (p10–p90) | + R present after Present | ≈ input → real frame presented |
+|---|---|---|---|---|---|
+| user-like (Reflex off, no cap) | 77.8 | 47.5 | 62.2 (58.0–69.4) | +28.9 | ~76 |
+| Reflex on, no cap | 77.5 | 44.5 | 59.1 (52.9–66.2) | +27.5 | ~72 |
+| Reflex on, fps_limit=66 (driver) | 65.8 | 53.5 | 59.6 (53.8–64.6) | +17.3 | ~71 |
+| Reflex off, fps_limit=66 (cpu limiter) | 66.1 | 54.7 | 60.8 (52.9–65.3) | +17.5 | ~72 |
+| auto_cap (defaults) | 62.4 | 56.0 | 61.8 (55.6–68.3) | +17.8 | ~74 |
+| FG off (Reflex on) | 107.8 | 32.0 | 40.4 (37.7–44.1) | – | ~40 |
+
+So the cap trades ~12 real fps (78 → 66) for an even game cadence, no blocking, and about the
+same or slightly lower latency to the screen (the queue it removes is worth more than the longer
+frame).
+
+**Recommended defaults** (now in `dist/aco_dlss.ini`): `[reflex] mode=on`, `fps_limit=0`,
+`limiter=driver` (it falls back to the CPU limiter while Reflex isn't sleeping); `[fg] auto_cap=1`,
+`auto_cap_lag=0.7`, `pace=smooth`, `sets=2`. A fixed `[reflex] fps_limit` (~85–90 % of the uncapped
+FG real rate; e.g. 64–66 at the user's ~72–78) overrides the automatic cap and is the steadiest
+option (no sawtooth when the automatic cap probes for more). `sets=3` is worse (stale queued
+jobs get their generated frame dropped) and stays off.
+
+How `auto_cap` works: every second it compares when DLSS-G finished (after the game's Present) with
+the frame interval. Above `auto_cap_lag` (0.7 frames), or any `join` wait, the cap drops 4 %. Below
+0.55 it rises 1 %, or 4 % when below 0.35. It starts 2 s after FG starts, at 90 % of the rate then,
+and is enforced through the Reflex limiter. Expect a small sawtooth of a few fps as it probes for
+the knee; `auto_cap_min/max` bound it.
+
 ## Vulkan route (`mode=on`, not working)
 
 Everything up to the generated image works: DLSS-G is created and evaluated on DXVK's VkDevice every
