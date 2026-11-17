@@ -61,6 +61,7 @@ struct Config {
   std::string fg_camera = "engine";  // [fg] camera: engine (the game's matrices) | identity
   bool fg_camera_unjitter = true;     // [fg] camera_unjitter: strip TAA jitter from the projection
   std::string fg_mv_units = "px";    // [fg] mv_units: px (MvecScale = mv_scale x render size) | uv
+  int fg_sets = 2;  // [fg] sets: texture sets in flight (2 | 3: the present thread may lag two frames)
   std::string fg_pace = "smooth";  // [fg] pace: ready | smooth | arrival (when the generated frame is presented)
   float fg_pace_relax = 0.5f;     // [fg] pace_relax (pace=smooth)
   std::string fg_done_fence = "shared";  // [fg] done_fence: shared | private (fence the CPU waits use)

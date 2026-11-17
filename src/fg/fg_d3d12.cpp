@@ -135,6 +135,11 @@ struct State {
   Shared alt_color, alt_depth, alt_mv, alt_hudless, alt_out;
   ID3D11Texture2D* alt_real = nullptr;
   UINT64 alt_eval_v = 0;
+  // [fg] sets=3: a third set (the oldest), so the present thread may run two frames behind before the
+  // game has to wait for it (join).
+  Shared alt2_color, alt2_depth, alt2_mv, alt2_hudless, alt2_out;
+  ID3D11Texture2D* alt2_real = nullptr;
+  UINT64 alt2_eval_v = 0;
   HANDLE game_event = nullptr;  // for CPU waits on the game thread (wait_d3d12 uses fence_event)
   uint32_t tex_w = 0, tex_h = 0;
   DXGI_FORMAT tex_fmt = DXGI_FORMAT_UNKNOWN;
@@ -299,6 +304,26 @@ bool wait_on(ID3D12Fence* f, UINT64 v, HANDLE event, DWORD timeout_ms) {
 bool wait_eval(UINT64 v, HANDLE event, DWORD timeout_ms) { return wait_on(wait_fence(), v, event, timeout_ms); }
 
 void swap_sets() {
+  if (config().fg_sets >= 3) {
+    // (cur, prev, oldest) -> (oldest, cur, prev): the oldest set becomes current.
+    std::swap(S.color, S.alt2_color);
+    std::swap(S.depth, S.alt2_depth);
+    std::swap(S.mv, S.alt2_mv);
+    std::swap(S.hudless, S.alt2_hudless);
+    std::swap(S.out, S.alt2_out);
+    std::swap(S.real, S.alt2_real);
+    std::swap(S.eval_v, S.alt2_eval_v);
+    // now (oldest, prev, cur): swap the last two
+    std::swap(S.alt_color, S.alt2_color);
+    std::swap(S.alt_depth, S.alt2_depth);
+    std::swap(S.alt_mv, S.alt2_mv);
+    std::swap(S.alt_hudless, S.alt2_hudless);
+    std::swap(S.alt_out, S.alt2_out);
+    std::swap(S.alt_real, S.alt2_real);
+    std::swap(S.alt_eval_v, S.alt2_eval_v);
+    // -> (oldest, cur, prev)
+    return;
+  }
   std::swap(S.color, S.alt_color);
   std::swap(S.depth, S.alt_depth);
   std::swap(S.mv, S.alt_mv);
@@ -492,9 +517,10 @@ bool ensure_feature(uint32_t w, uint32_t h, uint32_t rw, uint32_t rh, DXGI_FORMA
 
 bool ensure_textures(const D3D11_TEXTURE2D_DESC& bb) {
   DXGI_FORMAT f = storage_format(bb.Format);
-  if (S.real && S.alt_real && S.tex_w == bb.Width && S.tex_h == bb.Height && S.tex_fmt == f) return true;
+  if (S.real && S.alt_real && S.alt2_real && S.tex_w == bb.Width && S.tex_h == bb.Height && S.tex_fmt == f) return true;
   safe_release(S.real);
   safe_release(S.alt_real);
+  safe_release(S.alt2_real);
   S.tex_w = S.tex_h = 0;
   D3D11_TEXTURE2D_DESC d{};
   d.Width = bb.Width;
@@ -505,10 +531,12 @@ bool ensure_textures(const D3D11_TEXTURE2D_DESC& bb) {
   d.SampleDesc.Count = 1;
   d.Usage = D3D11_USAGE_DEFAULT;
   d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-  if (FAILED(S.dev->CreateTexture2D(&d, nullptr, &S.real)) || FAILED(S.dev->CreateTexture2D(&d, nullptr, &S.alt_real)))
+  if (FAILED(S.dev->CreateTexture2D(&d, nullptr, &S.real)) || FAILED(S.dev->CreateTexture2D(&d, nullptr, &S.alt_real)) ||
+      FAILED(S.dev->CreateTexture2D(&d, nullptr, &S.alt2_real)))
     return false;
   if (!make_shared(S.color, bb.Width, bb.Height, f, false) || !make_shared(S.out, bb.Width, bb.Height, f, true) ||
       !make_shared(S.alt_color, bb.Width, bb.Height, f, false) || !make_shared(S.alt_out, bb.Width, bb.Height, f, true) ||
+      !make_shared(S.alt2_color, bb.Width, bb.Height, f, false) || !make_shared(S.alt2_out, bb.Width, bb.Height, f, true) ||
       !make_shared(S.outreal, bb.Width, bb.Height, f, true) || !make_shared(S.scratch, bb.Width, bb.Height, f, true))
     return false;
   S.tex_w = bb.Width;
@@ -1469,7 +1497,7 @@ bool fg12_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent rea
   int64_t arrive = now_us();
   // The previous frame's presents may still be running (they use the other texture set); the one
   // before must be done before we reuse its set.
-  if (proxy) join(cfg.fg_sync == "gpu" ? 0 : 1);
+  if (proxy) join(cfg.fg_sync == "gpu" ? 0 : cfg.fg_sets >= 3 ? 2 : 1);
 
   // NGX/D3D12 initialisation runs on its own thread; presents stay normal until it is ready.
   update_toggle();
