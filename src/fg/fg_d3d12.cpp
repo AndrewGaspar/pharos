@@ -221,11 +221,9 @@ bool make_shared(Shared& s, UINT w, UINT h, DXGI_FORMAT fmt, bool uav) {
 // The fence CPU waits use ([fg] done_fence).
 ID3D12Fence* wait_fence() { return S.priv12 && config().fg_done_fence == "private" ? S.priv12 : S.done12; }
 
+bool wait_on(ID3D12Fence* f, UINT64 v, HANDLE event, DWORD timeout_ms);
 void wait_d3d12(UINT64 v) {
-  ID3D12Fence* f = wait_fence();
-  if (f->GetCompletedValue() >= v) return;
-  f->SetEventOnCompletion(v, S.fence_event);
-  WaitForSingleObject(S.fence_event, 2000);
+  if (!wait_on(wait_fence(), v, S.fence_event, 2000)) ACO_LOG("fg12: D3D12 fence wait for %llu timed out", (unsigned long long)v);
 }
 
 // Runs `record` on our D3D12 queue after the D3D11 work submitted so far, then makes the D3D11
@@ -280,12 +278,25 @@ bool submit(F&& record, bool cpu_wait) {
 }
 
 // CPU wait for a D3D12 fence value with a caller-owned event; false on timeout.
-bool wait_eval(UINT64 v, HANDLE event, DWORD timeout_ms) {
-  ID3D12Fence* f = wait_fence();
+// The event alone is never trusted: a wait that timed out leaves its SetEventOnCompletion registered,
+// and when that fires later it would wake the *next* wait early - from then on every wait returned one
+// evaluation too soon and generated frames showed the texture's previous contents (seen on the user's
+// machine after a period of heavy GPU contention). So: clear stale signals first, and only return true
+// once the fence value itself has been reached.
+bool wait_on(ID3D12Fence* f, UINT64 v, HANDLE event, DWORD timeout_ms) {
   if (!v || f->GetCompletedValue() >= v) return true;
+  int64_t deadline = now_us() + int64_t(timeout_ms) * 1000;
+  ResetEvent(event);
   f->SetEventOnCompletion(v, event);
-  return WaitForSingleObject(event, timeout_ms) == WAIT_OBJECT_0 || f->GetCompletedValue() >= v;
+  for (;;) {
+    if (f->GetCompletedValue() >= v) return true;
+    int64_t left = deadline - now_us();
+    if (left <= 0) return false;
+    WaitForSingleObject(event, static_cast<DWORD>((left + 999) / 1000));
+  }
 }
+
+bool wait_eval(UINT64 v, HANDLE event, DWORD timeout_ms) { return wait_on(wait_fence(), v, event, timeout_ms); }
 
 void swap_sets() {
   std::swap(S.color, S.alt_color);
