@@ -79,6 +79,8 @@ struct Config {
   bool reflex_probe = false;
   float world_npc_density = 1.0f;         // [world] npc_density
   float world_npc_distance = 1.0f;        // [world] npc_distance
+  float world_npc_units = 1.0f;           // [world] npc_units (experiment)
+  float world_npc_units_kill = 0.0f;      // [world] npc_units_kill (test: raise by one to kill an extra unit)
   float world_lod_distance = 1.0f;        // [world] lod_distance
   std::string world_lod_mode = "far";      // [world] lod_mode: far (patched culling shaders, LOD range max only) | all (old: scale every range)
   std::string world_lod_skip;             // [world] lod_skip (diagnostics): culling shader hash prefixes left unpatched
