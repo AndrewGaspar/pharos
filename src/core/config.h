@@ -45,8 +45,10 @@ struct Config {
   std::string fg_input = "swapchain";  // [fg] input: swapchain | copy
   bool fg_swap_outputs = false;         // [fg] swap_outputs (debug)
   bool fg_hudless = true;
-  float fg_refresh_hz = 165.0f;
-  int fg_count = 1;       // [fg] count: DLSS-G MultiFrameCount (generated frames evaluated per real frame)
+  float fg_refresh_hz = 0.0f;   // [fg] refresh_hz: display refresh (DLSSG.RefreshRate, MFG target); 0 = detect
+  float fg_target_hz = 0.0f;    // [fg] target_hz: presents/s to aim for (cap = target / multiplier); 0 = refresh
+  int fg_count = 2;  // [fg] count: frames presented per real frame (2 = 2x .. 6 = 6x); 0 = auto (dynamic)
+  int fg_count_min = 2, fg_count_max = 4;  // [fg] count_min / count_max: range of count=auto
   int fg_show_index = 1;
   bool fg_raw_output = false;  // [fg] raw_output (debug)
   bool fg_trace_cu = false;
@@ -63,6 +65,7 @@ struct Config {
   std::string fg_mv_units = "px";    // [fg] mv_units: px (MvecScale = mv_scale x render size) | uv
   bool fg_auto_cap = true;        // [fg] auto_cap: cap the real frame rate with headroom (feedback, fg_d3d12.cpp)
   float fg_auto_cap_lag = 0.7f;   // [fg] auto_cap_lag: target DLSS-G done time after the game's Present, in frames
+  std::string fg_auto_cap_lag_from = "ready";  // [fg] auto_cap_lag_from: ready | gpu (which "done" time auto_cap_lag measures)
   float fg_auto_cap_min = 0, fg_auto_cap_max = 0;  // [fg] auto_cap_min / auto_cap_max (fps; 0 = 30 / 240)
   int fg_sets = 2;  // [fg] sets: texture sets in flight (2 | 3: the present thread may lag two frames)
   std::string fg_pace = "smooth";  // [fg] pace: ready | smooth | arrival (when the generated frame is presented)

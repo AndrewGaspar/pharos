@@ -621,7 +621,7 @@ bool ensure_feature(uint32_t w, uint32_t h, uint32_t rw, uint32_t rh, VkFormat f
   // MultiFrameCount is read at create time. In 310.9 the LAST index of a sequence is the real-frame
   // call and earlier ones are generated at t = index / (count + 1) (EndpointCoreInputs::
   // ComputeAndValidateTimeFactor, reverse-engineered), so count=1 would never generate.
-  p.set(NVSDK_NGX_DLSSG_Parameter_MultiFrameCount, static_cast<unsigned int>(config().fg_count));
+  p.set(NVSDK_NGX_DLSSG_Parameter_MultiFrameCount, static_cast<unsigned int>(config().fg_count > 2 ? config().fg_count - 1 : 1));
   for (const auto& kv : config().fg_create_extra) p.set(kv.first.c_str(), kv.second);
   // Which numbering NGX expects for the backbuffer format on Vulkan is undocumented; [fg]
   // bb_format_dxgi=1 passes the DXGI value of the backbuffer instead of the VkFormat.
@@ -778,7 +778,7 @@ bool generate(const FgInputs& in, ID3D11Texture2D* swap_bb) {
     p.set(NVSDK_NGX_DLSSG_Parameter_OutputRealSubrectWidth, S.tex_w);
     p.set(NVSDK_NGX_DLSSG_Parameter_OutputRealSubrectHeight, S.tex_h);
   }
-  const unsigned int count = static_cast<unsigned int>(config().fg_count);
+  const unsigned int count = static_cast<unsigned int>(config().fg_count > 2 ? config().fg_count - 1 : 1);  // [fg] count is the multiplier
   const unsigned int show_index = static_cast<unsigned int>(config().fg_show_index);
   NVSDK_NGX_Resource_VK scratch{};
   if (!ngx_res(S.scratch, true, &scratch)) { gen_fail("!ngx_res(S.scratch, true, &scratch)"); return false; }

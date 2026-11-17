@@ -33,13 +33,18 @@
 #include "core/log.h"
 #include "dlss/ngx.h"
 #include "dlss/upscaler.h"
+#include "reflex/reflex.h"
 
 namespace aco {
 
 namespace {
 
 constexpr unsigned long long kAppId = 0x41434f444c5353ull;  // "ACODLSS", as for DLSS-SR
-constexpr int kRing = 3;
+// Multi Frame Generation: up to 5 generated frames per real frame (6x; DLSSG.MultiFrameCountMax is 5
+// on an RTX 50 with nvngx_dlssg 310.9.16). Each generated index is its own submission (own fence
+// value and timestamps), so the ring holds two frames' worth plus feature creation.
+constexpr int kMaxGen = 5;
+constexpr int kRing = 2 * kMaxGen + 4;
 const float kIdentity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
 
 int64_t now_us() {
@@ -84,6 +89,21 @@ struct Shared {
   }
 };
 
+// One frame's DLSS-G inputs and outputs. Frames alternate between sets ([fg] sets=2, or 3), so the
+// game can copy the next frame's inputs while the present thread still shows this one.
+struct Set {
+  Shared color, depth, mv, hudless;
+  Shared out[kMaxGen];  // OutputInterpolated of generated index 1..n_gen
+  ID3D11Texture2D* real = nullptr;  // D3D11-only copy of the real frame, presented after the generated ones
+  UINT64 eval_v = 0;  // D3D12 fence value when the last evaluation using this set is done
+  unsigned n_gen = 0;  // generated frames of that evaluation
+  // Per generated index: completion value, timestamp ring slot and that slot's end timestamp before
+  // the evaluation (the completion check).
+  UINT64 gen_v[kMaxGen] = {};
+  int gen_slot[kMaxGen] = {};
+  UINT64 gen_ts_old[kMaxGen] = {};
+};
+
 struct State {
 
   ID3D11Device5* dev = nullptr;
@@ -104,8 +124,9 @@ struct State {
   // Same values as done12, but a plain (non-shared) D3D12 fence: [fg] done_fence=private makes the CPU
   // waits use it (diagnosing whether the shared fence completes before the GPU work it follows).
   ID3D12Fence* priv12 = nullptr;
-  int eval_slot = -1;      // ring slot of the last evaluation
-  UINT64 eval_ts_old = 0;  // that slot's end timestamp before the evaluation (changes once it has run)
+  int eval_slot = -1;      // ring slot of the last submission
+  UINT64 eval_ts_old = 0;  // that slot's end timestamp before the submission (changes once it has run)
+  UINT64 last_v = 0;       // completion value of the last submission
   HANDLE fence_event = nullptr;
   ID3D12CommandAllocator* alloc[kRing] = {};
   UINT64 slot_value[kRing] = {};
@@ -127,26 +148,22 @@ struct State {
   uint32_t feat_w = 0, feat_h = 0, feat_rw = 0, feat_rh = 0;
   DXGI_FORMAT feat_fmt = DXGI_FORMAT_UNKNOWN;
   unsigned feat_count = 0;
+  unsigned caps_max_gen = 1;  // DLSSG.MultiFrameCountMax (generated frames per real frame)
 
-  Shared color, depth, mv, hudless, out, outreal, scratch;
-  ID3D11Texture2D* real = nullptr;  // D3D11-only copy of the real frame for presenting after the generated one
-  UINT64 eval_v = 0;  // D3D12 fence value when the last evaluation using this set is done
-  // [fg] sync=cpu: the other texture set (frames alternate), swapped in by swap_sets().
-  Shared alt_color, alt_depth, alt_mv, alt_hudless, alt_out;
-  ID3D11Texture2D* alt_real = nullptr;
-  UINT64 alt_eval_v = 0;
-  // [fg] sets=3: a third set (the oldest), so the present thread may run two frames behind before the
-  // game has to wait for it (join).
-  Shared alt2_color, alt2_depth, alt2_mv, alt2_hudless, alt2_out;
-  ID3D11Texture2D* alt2_real = nullptr;
-  UINT64 alt2_eval_v = 0;
+  // Texture sets: cur (this frame), prev (the previous frame; [fg] sync=cpu), oldest ([fg] sets=3: the
+  // present thread may run two frames behind before the game has to wait for it). swap_sets() rotates.
+  Set sets[3];
+  Set* cur = &sets[0];
+  Set* prev = &sets[1];
+  Set* oldest = &sets[2];
+  Shared outreal;
   HANDLE game_event = nullptr;  // for CPU waits on the game thread (wait_d3d12 uses fence_event)
   uint32_t tex_w = 0, tex_h = 0;
   DXGI_FORMAT tex_fmt = DXGI_FORMAT_UNKNOWN;
 
   // [fg] verify=1: periodically read back (previous real, generated, current real) and log how the
   // generated frame differs from its neighbours; also written to out/fgverify/*.ppm.
-  ID3D11Texture2D* prev = nullptr;
+  ID3D11Texture2D* verify_prev = nullptr;
   ID3D11Texture2D* stage[3] = {};
   int64_t verify_last = 0;
   int verify_pending = -1;  // presents until the staged copies are read
@@ -163,6 +180,14 @@ struct State {
   double perf_eval_cpu_ms = 0, perf_gpu_ms = 0;
   uint32_t perf_gpu_n = 0;
 } S;
+
+// The display's refresh rate: [fg] refresh_hz, or (0) what the swapchain's mode / the display mode
+// says (detect_refresh in fg12_present). 0 = unknown.
+std::atomic<float> g_display_hz{0};
+float display_hz() {
+  float c = config().fg_refresh_hz;
+  return c > 0 ? c : g_display_hz.load();
+}
 
 // sRGB views can't be UAVs; the shared copies use the UNORM sibling (CopyResource allows it).
 DXGI_FORMAT storage_format(DXGI_FORMAT f) {
@@ -231,10 +256,11 @@ void wait_d3d12(UINT64 v) {
   if (!wait_on(wait_fence(), v, S.fence_event, 2000)) ACO_LOG("fg12: D3D12 fence wait for %llu timed out", (unsigned long long)v);
 }
 
-// Runs `record` on our D3D12 queue after the D3D11 work submitted so far, then makes the D3D11
-// context wait for it. `cpu_wait` blocks until the GPU is done (feature creation).
+// Runs `record` on our D3D12 queue after the D3D11 work submitted so far (`after_d3d11`; later
+// submissions of the same frame follow on the same queue anyway), then makes the D3D11 context wait
+// for it. `cpu_wait` blocks until the GPU is done (feature creation).
 template <typename F>
-bool submit(F&& record, bool cpu_wait) {
+bool submit(F&& record, bool cpu_wait, bool after_d3d11 = true) {
   int slot = S.ring;
   S.ring = (S.ring + 1) % kRing;
   if (wait_fence()->GetCompletedValue() < S.slot_value[slot]) {
@@ -263,17 +289,19 @@ bool submit(F&& record, bool cpu_wait) {
   S.eval_ts_old = S.ts_map ? S.ts_map[slot * 2 + 1] : 0;
 
   // D3D11 -> D3D12: everything the context has recorded so far (our input copies) first.
-  UINT64 v_in = ++S.fence_value;
-  S.imm->Signal(S.fence11, v_in);
-  S.imm->Flush();
-  S.q->Wait(S.fence12, v_in);
+  if (after_d3d11) {
+    UINT64 v_in = ++S.fence_value;
+    S.imm->Signal(S.fence11, v_in);
+    S.imm->Flush();
+    S.q->Wait(S.fence12, v_in);
+  }
   ID3D12CommandList* lists[] = {S.cl};
   S.q->ExecuteCommandLists(1, lists);
   UINT64 v_out = ++S.done_value;
   S.q->Signal(S.done12, v_out);
   if (S.priv12) S.q->Signal(S.priv12, v_out);
   S.slot_value[slot] = v_out;
-  S.eval_v = v_out;
+  S.last_v = v_out;
   // D3D12 -> D3D11. sync=gpu: later context work waits on the GPU (vkd3d-proton resolves the D3D12
   // side's wait on the shared fence on the CPU, so this stalls the D3D11 queue on a CPU round trip).
   // sync=cpu: whoever copies the output out first waits on the CPU (wait_eval).
@@ -306,31 +334,13 @@ bool wait_eval(UINT64 v, HANDLE event, DWORD timeout_ms) { return wait_on(wait_f
 void swap_sets() {
   if (config().fg_sets >= 3) {
     // (cur, prev, oldest) -> (oldest, cur, prev): the oldest set becomes current.
-    std::swap(S.color, S.alt2_color);
-    std::swap(S.depth, S.alt2_depth);
-    std::swap(S.mv, S.alt2_mv);
-    std::swap(S.hudless, S.alt2_hudless);
-    std::swap(S.out, S.alt2_out);
-    std::swap(S.real, S.alt2_real);
-    std::swap(S.eval_v, S.alt2_eval_v);
-    // now (oldest, prev, cur): swap the last two
-    std::swap(S.alt_color, S.alt2_color);
-    std::swap(S.alt_depth, S.alt2_depth);
-    std::swap(S.alt_mv, S.alt2_mv);
-    std::swap(S.alt_hudless, S.alt2_hudless);
-    std::swap(S.alt_out, S.alt2_out);
-    std::swap(S.alt_real, S.alt2_real);
-    std::swap(S.alt_eval_v, S.alt2_eval_v);
-    // -> (oldest, cur, prev)
+    Set* c = S.cur;
+    S.cur = S.oldest;
+    S.oldest = S.prev;
+    S.prev = c;
     return;
   }
-  std::swap(S.color, S.alt_color);
-  std::swap(S.depth, S.alt_depth);
-  std::swap(S.mv, S.alt_mv);
-  std::swap(S.hudless, S.alt_hudless);
-  std::swap(S.out, S.alt_out);
-  std::swap(S.real, S.alt_real);
-  std::swap(S.eval_v, S.alt_eval_v);
+  std::swap(S.cur, S.prev);
 }
 
 bool init(ID3D11Device* dev) {
@@ -459,7 +469,10 @@ bool init(ID3D11Device* dev) {
   ngx::Params caps(caps_raw);
   int avail = -1;
   if (caps) caps.get(NVSDK_NGX_Parameter_FrameGeneration_Available, &avail);
-  ACO_LOG("fg12: FrameGeneration available=%d", avail);
+  unsigned max_gen = 0;
+  if (caps) caps.get(NVSDK_NGX_DLSSG_Parameter_MultiFrameCountMax, &max_gen);
+  S.caps_max_gen = std::max(1u, std::min<unsigned>(max_gen, kMaxGen));
+  ACO_LOG("fg12: FrameGeneration available=%d, MultiFrameCountMax=%u (up to %ux)", avail, max_gen, S.caps_max_gen + 1);
   if (avail != 1) return false;
   NVSDK_NGX_Parameter* p = nullptr;
   S.alloc_params(&p);
@@ -515,13 +528,20 @@ bool ensure_feature(uint32_t w, uint32_t h, uint32_t rw, uint32_t rh, DXGI_FORMA
   return true;
 }
 
-bool ensure_textures(const D3D11_TEXTURE2D_DESC& bb) {
+// Backbuffer-sized textures of every set: the real-frame copy, the colour input and `n_out` generated
+// outputs (more are created when the multiplier grows, the surplus released when it shrinks). The
+// game thread waits for the sets' evaluations (join + set fences) before calling this with a new
+// n_out, and outputs above the new count are no longer read by any queued job.
+bool ensure_textures(const D3D11_TEXTURE2D_DESC& bb, unsigned n_out) {
   DXGI_FORMAT f = storage_format(bb.Format);
-  if (S.real && S.alt_real && S.alt2_real && S.tex_w == bb.Width && S.tex_h == bb.Height && S.tex_fmt == f) return true;
-  safe_release(S.real);
-  safe_release(S.alt_real);
-  safe_release(S.alt2_real);
-  S.tex_w = S.tex_h = 0;
+  static unsigned have_out = 0;
+  bool same = S.tex_w == bb.Width && S.tex_h == bb.Height && S.tex_fmt == f;
+  if (same && have_out == n_out) return true;
+  if (!same) {
+    for (Set& s : S.sets) safe_release(s.real);
+    S.tex_w = S.tex_h = 0;
+    have_out = 0;
+  }
   D3D11_TEXTURE2D_DESC d{};
   d.Width = bb.Width;
   d.Height = bb.Height;
@@ -531,18 +551,21 @@ bool ensure_textures(const D3D11_TEXTURE2D_DESC& bb) {
   d.SampleDesc.Count = 1;
   d.Usage = D3D11_USAGE_DEFAULT;
   d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-  if (FAILED(S.dev->CreateTexture2D(&d, nullptr, &S.real)) || FAILED(S.dev->CreateTexture2D(&d, nullptr, &S.alt_real)) ||
-      FAILED(S.dev->CreateTexture2D(&d, nullptr, &S.alt2_real)))
-    return false;
-  if (!make_shared(S.color, bb.Width, bb.Height, f, false) || !make_shared(S.out, bb.Width, bb.Height, f, true) ||
-      !make_shared(S.alt_color, bb.Width, bb.Height, f, false) || !make_shared(S.alt_out, bb.Width, bb.Height, f, true) ||
-      !make_shared(S.alt2_color, bb.Width, bb.Height, f, false) || !make_shared(S.alt2_out, bb.Width, bb.Height, f, true) ||
-      !make_shared(S.outreal, bb.Width, bb.Height, f, true) || !make_shared(S.scratch, bb.Width, bb.Height, f, true))
-    return false;
+  for (Set& s : S.sets) {
+    if (!s.real && FAILED(S.dev->CreateTexture2D(&d, nullptr, &s.real))) return false;
+    if (!make_shared(s.color, bb.Width, bb.Height, f, false)) return false;
+    for (unsigned k = 0; k < unsigned(kMaxGen); ++k) {
+      if (k >= n_out) s.out[k].release();
+      else if (!make_shared(s.out[k], bb.Width, bb.Height, f, true)) return false;
+    }
+  }
+  if (!make_shared(S.outreal, bb.Width, bb.Height, f, true)) return false;
   S.tex_w = bb.Width;
   S.tex_h = bb.Height;
   S.tex_fmt = f;
-  ACO_LOG("fg12: shared textures %ux%u format %d (backbuffer format %d)", bb.Width, bb.Height, f, bb.Format);
+  have_out = n_out;
+  ACO_LOG("fg12: shared textures %ux%u format %d (backbuffer format %d), %u generated output(s) per set", bb.Width,
+          bb.Height, f, bb.Format, n_out);
   return true;
 }
 
@@ -690,29 +713,33 @@ void gen_fail(const char* why) {
   if (n++ < 10) ACO_LOG("fg12: generate failed: %s", why);
 }
 
-bool generate(const FgInputs& in, ID3D11Texture2D* bb) {
+// Evaluates DLSS-G for the current set: n_gen generated frames (MultiFrameCount = n_gen, index 1..n_gen,
+// each its own submission so the present thread can show index 1 while the others are still being
+// generated) on a feature created for feat_gen (>= n_gen; the count may change per frame without
+// re-creating the feature, checked with tools/interop-test/dlssg_d3d12_test.cpp).
+bool generate(const FgInputs& in, ID3D11Texture2D* bb, unsigned n_gen, unsigned feat_gen) {
   const Config& cfg = config();
-  S.imm->CopyResource(S.color.t11, bb);
-  if (!copy_in(S.depth, in.depth) || !copy_in(S.mv, in.mv)) { gen_fail("inputs"); return false; }
+  Set& st = *S.cur;
+  st.n_gen = 0;
+  S.imm->CopyResource(st.color.t11, bb);
+  if (!copy_in(st.depth, in.depth) || !copy_in(st.mv, in.mv)) { gen_fail("inputs"); return false; }
   bool hudless = cfg.fg_hudless && in.hudless;
   if (hudless) {
     D3D11_TEXTURE2D_DESC hd;
     in.hudless->GetDesc(&hd);
     // Only a HUD-less image that matches the backbuffer (size and format) is meaningful to DLSS-G.
     hudless = hd.Width == S.tex_w && hd.Height == S.tex_h && storage_format(hd.Format) == S.tex_fmt &&
-              copy_in(S.hudless, in.hudless);
+              copy_in(st.hudless, in.hudless);
   }
-  const unsigned count = static_cast<unsigned>(cfg.fg_count < 1 ? 1 : cfg.fg_count);
-  const unsigned show_index = static_cast<unsigned>(cfg.fg_show_index);
-  if (!ensure_feature(S.tex_w, S.tex_h, in.render_w, in.render_h, S.tex_fmt, count)) { gen_fail("feature"); return false; }
+  if (!ensure_feature(S.tex_w, S.tex_h, in.render_w, in.render_h, S.tex_fmt, feat_gen)) { gen_fail("feature"); return false; }
 
   ngx::Params& p = S.eval_params;
   p.reset();
-  p.set(NVSDK_NGX_DLSSG_Parameter_Backbuffer, S.color.t12);
-  p.set(NVSDK_NGX_DLSSG_Parameter_Depth, S.depth.t12);
-  p.set(NVSDK_NGX_DLSSG_Parameter_MVecs, S.mv.t12);
+  p.set(NVSDK_NGX_DLSSG_Parameter_Backbuffer, st.color.t12);
+  p.set(NVSDK_NGX_DLSSG_Parameter_Depth, st.depth.t12);
+  p.set(NVSDK_NGX_DLSSG_Parameter_MVecs, st.mv.t12);
   if (hudless) {
-    p.set(NVSDK_NGX_DLSSG_Parameter_HUDLess, S.hudless.t12);
+    p.set(NVSDK_NGX_DLSSG_Parameter_HUDLess, st.hudless.t12);
     p.set(NVSDK_NGX_DLSSG_Parameter_HUDLessSubrectWidth, S.tex_w);
     p.set(NVSDK_NGX_DLSSG_Parameter_HUDLessSubrectHeight, S.tex_h);
   }
@@ -780,7 +807,7 @@ bool generate(const FgInputs& in, ID3D11Texture2D* bb) {
   p.set(NVSDK_NGX_DLSSG_Parameter_LinearizedDepth_NearFarPartition, 600.0f);
   p.set(NVSDK_NGX_DLSSG_Parameter_AutomodeOverrideReset, 0u);
   p.set(NVSDK_NGX_DLSSG_Parameter_BackbufferFrameID, ++S.backbuffer_id);
-  if (cfg.fg_refresh_hz > 0) p.set("DLSSG.RefreshRate", cfg.fg_refresh_hz);
+  if (float hz = display_hz(); hz > 0) p.set("DLSSG.RefreshRate", hz);
   p.set(NVSDK_NGX_DLSSG_Parameter_CameraNear, cam.near_z);
   p.set(NVSDK_NGX_DLSSG_Parameter_CameraFar, cam.far_z);
   p.set(NVSDK_NGX_DLSSG_Parameter_CameraFOV, cam.fov);
@@ -808,32 +835,41 @@ bool generate(const FgInputs& in, ID3D11Texture2D* bb) {
   NVSDK_NGX_Result r = NVSDK_NGX_Result_Fail;
   int64_t t0 = now_us();
   // [fg] skip (bisecting): d3d12 = no D3D12 submission/fences at all, eval = submit without DLSS-G.
-  if (cfg.fg_skip == "d3d12") return true;
+  if (cfg.fg_skip == "d3d12") {
+    st.n_gen = n_gen;
+    return true;
+  }
   const bool skip_eval = cfg.fg_skip == "eval";
-  bool ok = submit([&](ID3D12GraphicsCommandList* cl) {
-    if (skip_eval) {
-      r = NVSDK_NGX_Result_Success;
-      return true;
-    }
-    for (unsigned i = 1; i <= count; ++i) {
-      p.set(NVSDK_NGX_DLSSG_Parameter_MultiFrameCount, count);
+  bool ok = true;
+  for (unsigned i = 1; ok && i <= n_gen; ++i) {
+    ok = submit([&](ID3D12GraphicsCommandList* cl) {
+      if (skip_eval) {
+        r = NVSDK_NGX_Result_Success;
+        return true;
+      }
+      p.set(NVSDK_NGX_DLSSG_Parameter_MultiFrameCount, n_gen);
       p.set(NVSDK_NGX_DLSSG_Parameter_MultiFrameIndex, i);
-      p.set(NVSDK_NGX_DLSSG_Parameter_OutputInterpolated, i == show_index ? S.out.t12 : S.scratch.t12);
+      p.set(NVSDK_NGX_DLSSG_Parameter_OutputInterpolated, st.out[i - 1].t12);
       r = S.evaluate(cl, S.feature, p.get(), nullptr);
       if (NVSDK_NGX_FAILED(r)) {
         static int n = 0;
-        if (n++ < 5) ACO_LOG("fg12: Evaluate(index %u of %u) -> %s", i, count, ngx::result_str(r));
+        if (n++ < 5) ACO_LOG("fg12: Evaluate(index %u of %u) -> %s", i, n_gen, ngx::result_str(r));
         return false;
       }
-    }
-    return true;
-  }, false);
+      return true;
+    }, false, i == 1);
+    st.gen_v[i - 1] = S.last_v;
+    st.gen_slot[i - 1] = S.eval_slot;
+    st.gen_ts_old[i - 1] = S.eval_ts_old;
+    if (ok) st.n_gen = i;
+  }
+  st.eval_v = S.last_v;
   S.perf_eval_cpu_ms += (now_us() - t0) / 1000.0;
   static int logged = 0;
   if (logged < 3 || (!ok && logged < 20)) {
     ++logged;
-    ACO_LOG("fg12: Evaluate -> %s (reset=%d, render %ux%u, jitter %.3f,%.3f, hudless %d)", ngx::result_str(r), S.reset,
-            in.render_w, in.render_h, in.jitter_x, in.jitter_y, hudless);
+    ACO_LOG("fg12: Evaluate x%u -> %s (reset=%d, render %ux%u, jitter %.3f,%.3f, hudless %d)", n_gen, ngx::result_str(r),
+            S.reset, in.render_w, in.render_h, in.jitter_x, in.jitter_y, hudless);
   }
   S.reset = false;
   return ok;
@@ -844,15 +880,39 @@ void perf_report() {
   if (!S.perf_last) S.perf_last = now;
   double secs = (now - S.perf_last) / 1e6;
   if (secs < 2.0) return;
+  // GPU: per real frame (all of its generated frames) and per generated frame (one evaluation).
   ACO_LOG("perf: fg real %.1f fps + generated %.1f fps = %.1f presents/s (fail %u, resets %u, cpu waits %u), eval CPU "
-          "%.2f ms GPU %.3f ms/frame [d3d12]",
+          "%.2f ms GPU %.3f ms/frame (%.3f ms per generated frame, x%.2f) [d3d12]",
           S.perf_real / secs, S.perf_generated / secs, (S.perf_real + S.perf_generated) / secs, S.perf_fail,
           S.perf_resets, S.perf_cpu_waits, S.perf_real ? S.perf_eval_cpu_ms / S.perf_real : 0.0,
-          S.perf_gpu_n ? S.perf_gpu_ms / S.perf_gpu_n : 0.0);
+          S.perf_real ? S.perf_gpu_ms / S.perf_real : 0.0, S.perf_gpu_n ? S.perf_gpu_ms / S.perf_gpu_n : 0.0,
+          S.perf_real ? 1.0 + double(S.perf_generated) / S.perf_real : 0.0);
   S.perf_last = now;
   S.perf_real = S.perf_generated = S.perf_fail = S.perf_resets = S.perf_cpu_waits = 0;
   S.perf_eval_cpu_ms = S.perf_gpu_ms = 0;
   S.perf_gpu_n = 0;
+}
+
+// A GPU timestamp of our D3D12 queue in now_us() time (ID3D12CommandQueue::GetClockCalibration,
+// refreshed every second). Present thread only.
+bool gpu_to_us(UINT64 ts, int64_t* out) {
+  static UINT64 cal_gpu = 0, cal_cpu = 0;
+  static int64_t cal_at = 0;
+  static LARGE_INTEGER qf = [] {
+    LARGE_INTEGER v;
+    QueryPerformanceFrequency(&v);
+    return v;
+  }();
+  if (!S.q || S.ts_freq <= 0 || !ts) return false;
+  int64_t now = now_us();
+  if (!cal_at || now - cal_at > 1000000) {
+    UINT64 g = 0, c = 0;
+    if (FAILED(S.q->GetClockCalibration(&g, &c)) || !g || !c) return false;
+    cal_gpu = g, cal_cpu = c, cal_at = now;
+  }
+  double cpu_us = double(cal_cpu) * 1e6 / double(qf.QuadPart);
+  *out = int64_t(cpu_us + (double(int64_t(ts - cal_gpu)) * 1e6 / S.ts_freq));
+  return true;
 }
 
 void wait_until(int64_t t_us) {
@@ -865,11 +925,11 @@ void wait_until(int64_t t_us) {
 }
 
 bool verify_textures() {
-  if (S.prev && S.stage[0]) return true;
+  if (S.verify_prev && S.stage[0]) return true;
   D3D11_TEXTURE2D_DESC d{};
-  S.real->GetDesc(&d);
+  S.cur->real->GetDesc(&d);
   d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-  if (!S.prev && FAILED(S.dev->CreateTexture2D(&d, nullptr, &S.prev))) return false;
+  if (!S.verify_prev && FAILED(S.dev->CreateTexture2D(&d, nullptr, &S.verify_prev))) return false;
   d.Format = S.tex_fmt;
   d.Usage = D3D11_USAGE_STAGING;
   d.BindFlags = 0;
@@ -955,6 +1015,7 @@ struct TraceEv {
   uint64_t frame;
   char kind;  // N normal (FG off / not ready), G generated, R real
   int32_t half_us, interval_us, shot;
+  int32_t gi, gn;  // generated frame index (1..gn-1; 0 for R/N) and the job's multiplier
 };
 struct Tracer {
   std::mutex m;
@@ -974,11 +1035,11 @@ void trace_poll(ID3D11Texture2D* bb);
 
 // Before a Present: claims an event slot and copies the band of `bb` (what is about to be presented).
 int trace_begin(char kind, uint64_t frame, int64_t arrive, int64_t half_us, ID3D11Texture2D* bb,
-                ID3D11DeviceContext* ctx) {
+                ID3D11DeviceContext* ctx, int gi = 0, int gn = 1) {
   if (!T.active.load(std::memory_order_relaxed)) return -1;
   std::lock_guard<std::mutex> lk(T.m);
   if (T.complete || T.ev.size() >= T.max_ev) return -1;
-  TraceEv e{arrive, now_us(), 0, frame, kind, int32_t(half_us), int32_t(S.frame_interval_us), -1};
+  TraceEv e{arrive, now_us(), 0, frame, kind, int32_t(half_us), int32_t(S.frame_interval_us), -1, gi, gn};
   if (T.shots < T.stage.size() && bb) {
     D3D11_BOX box{0, T.y0, 0, T.w, T.y0 + T.h, 1};
     ctx->CopySubresourceRegion(T.stage[T.shots], 0, 0, 0, 0, bb, 0, &box);
@@ -1042,6 +1103,13 @@ struct Presenter {
   int64_t last_real_call = 0;  // present thread: when the last real Present was called
   std::atomic<int64_t> ready_lag_sum{0};  // [fg] auto_cap inputs
   std::atomic<uint32_t> ready_lag_n{0};
+  // Where that lag comes from (first generated frame, GPU timestamps mapped to QPC): game's Present ->
+  // DLSS-G starts on the GPU (game GPU work, input copies, vkd3d's CPU-side resolution of the shared
+  // fence wait, GPU scheduling) | its GPU duration | GPU end -> present thread awake (fence event).
+  std::atomic<int64_t> lag_start_sum{0}, lag_gpu_sum{0}, lag_wake_sum{0};
+  std::atomic<uint32_t> lag_split_n{0};
+  std::atomic<int64_t> gpu_lag_sum{0};  // game Present -> DLSS-G GPU end (auto cap with [fg] auto_cap_lag_from=gpu)
+  std::atomic<uint32_t> gpu_lag_n{0};
   uint32_t cap_join_n = 0;
 } P;
 
@@ -1052,33 +1120,59 @@ ID3D11Texture2D* real_backbuffer(IDXGISwapChain* sc) {
   return SUCCEEDED(hr) ? bb : nullptr;
 }
 
-// One frame's presents (generated, then real) for the present thread.
+// One frame's presents (its generated frames in order, then the real one) for the present thread.
 struct Job {
   IDXGISwapChain* sc = nullptr;
   PFN_RealPresent present = nullptr;
   UINT sync = 0, flags = 0;
-  int64_t half_us = 0;      // pacing: real frame this long after the generated one
+  // Pacing step: consecutive presents this far apart (real-frame interval / multiplier; with 2x half
+  // an interval). 0 = no pacing.
+  int64_t half_us = 0;
   int64_t arrive_us = 0;    // when the game's Present reached us
-  UINT64 wait_value = 0;    // the generated frame is ready when the D3D12 fence reaches this
-  ID3D11Texture2D* gen = nullptr;
+  unsigned n_gen = 0;       // generated frames (multiplier - 1)
+  // Per generated index: the frame is ready when the D3D12 fence reaches wait_value; its texture;
+  // ring slot of its evaluation (timestamp check, -1 = none) and that slot's end timestamp before it.
+  UINT64 wait_value[kMaxGen] = {};
+  ID3D11Texture2D* gen[kMaxGen] = {};
+  int ts_slot[kMaxGen] = {};
+  UINT64 ts_old[kMaxGen] = {};
   ID3D11Texture2D* real = nullptr;
   std::string show;
   bool gate = true;
   bool skip_gen = false;    // superseded before it started: present only the real frame
   uint64_t frame = 0;       // BackbufferFrameID of this job's evaluation (trace)
-  int pace = 0;             // [fg] pace: 0 ready, 1 smooth, 2 arrival
+  int pace = 0;             // [fg] pace: 0 ready, 1 smooth, 2 arrival, 3 content
   double relax = 0.5;       // [fg] pace_relax
   int64_t dt_us = 0;        // game's frame interval before this frame (pace=content)
-  int ts_slot = -1;         // ring slot of this job's evaluation (timestamp check), -1 = none
-  UINT64 ts_old = 0;        // that slot's end timestamp before the evaluation
 };
 std::deque<Job> g_jobs;  // guarded by P.m
 int g_active = 0;        // jobs being processed (0/1), guarded by P.m
+
+// Waits until generated frame k of the job is done on the GPU (fence, then the end-timestamp check).
+bool job_gen_ready(const Job& j, unsigned k, HANDLE event) {
+  if (!wait_eval(j.wait_value[k], event, 100)) return false;
+  if (j.ts_slot[k] >= 0 && S.ts_map) {
+    // The evaluation's command list ends by resolving its end timestamp into this slot: until the
+    // value changes, the GPU hasn't finished it, whatever the fence says.
+    const volatile UINT64* end = &S.ts_map[j.ts_slot[k] * 2 + 1];
+    ++P.gen_checked;
+    if (*end == j.ts_old[k]) {
+      ++P.gen_early;
+      if (config().fg_ts_guard) {
+        int64_t deadline = now_us() + 50000;
+        while (*end == j.ts_old[k] && now_us() < deadline) Sleep(0);
+        if (*end == j.ts_old[k]) ++P.gen_early_timeout;
+      }
+    }
+  }
+  return true;
+}
 
 void present_loop() {
   g_present_tid = GetCurrentThreadId();
   g_ctx_gate_exempt = 1;
   HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  int64_t lag_us = 0, lag_c = 0;  // pace=arrival / pace=content lags
   for (;;) {
     std::unique_lock<std::mutex> lk(P.m);
     P.cv.wait(lk, [] { return !g_jobs.empty(); });
@@ -1088,91 +1182,106 @@ void present_loop() {
     lk.unlock();
 
     HRESULT hr = S_OK;
-    int64_t t0 = now_us(), t1 = t0, t2 = t0;
-    bool gen_ready = !j.skip_gen && wait_eval(j.wait_value, event, 100);
-    if (!gen_ready) ++P.gen_dropped;
-    if (gen_ready && j.ts_slot >= 0 && S.ts_map) {
-      // The evaluation's command list ends by resolving its end timestamp into this slot: until the
-      // value changes, the GPU hasn't finished it, whatever the fence says.
-      const volatile UINT64* end = &S.ts_map[j.ts_slot * 2 + 1];
-      ++P.gen_checked;
-      if (*end == j.ts_old) {
-        ++P.gen_early;
-        if (config().fg_ts_guard) {
-          int64_t deadline = now_us() + 50000;
-          while (*end == j.ts_old && now_us() < deadline) Sleep(0);
-          if (*end == j.ts_old) ++P.gen_early_timeout;
+    const unsigned n = j.skip_gen ? 0 : j.n_gen;
+    const int64_t mult = int64_t(j.n_gen) + 1;
+    const int64_t step = j.half_us;
+    if (j.skip_gen) P.gen_dropped += j.n_gen;
+    // Timeline of this job: pickup .. first generated present call (t_first), copies / Presents of the
+    // generated frames, waits between them, the real frame's copy and Present.
+    int64_t t_first = 0, t_gen_ret = 0, prev_call = 0, prev_ret = 0;
+    int64_t copy_g = 0, pres_g = 0, real_target = 0;
+    unsigned shown = 0;
+    int64_t dt = 0;
+    for (unsigned k = 0; k < n; ++k) {
+      if (!job_gen_ready(j, k, event)) {
+        P.gen_dropped += n - k;  // the rest would only be later
+        break;
+      }
+      const int64_t t_ready = now_us();
+      if (k == 0) {  // auto cap: how long after the game's Present DLSS-G was done
+        P.ready_lag_sum += t_ready - j.arrive_us;
+        ++P.ready_lag_n;
+        int64_t g0 = 0, g1 = 0;
+        if (j.ts_slot[0] >= 0 && gpu_to_us(S.ts_map[j.ts_slot[0] * 2], &g0) &&
+            gpu_to_us(S.ts_map[j.ts_slot[0] * 2 + 1], &g1) && g1 >= g0 && g1 <= t_ready + 2000) {
+          P.lag_start_sum += g0 - j.arrive_us;
+          P.lag_gpu_sum += g1 - g0;
+          P.lag_wake_sum += t_ready - g1;
+          ++P.lag_split_n;
+          P.gpu_lag_sum += g1 - j.arrive_us;
+          ++P.gpu_lag_n;
         }
       }
-    }
-    t0 = now_us();
-    // Pacing of the generated present ([fg] pace). ready: as soon as DLSS-G is done. smooth: not
-    // sooner than half an interval after the previous real present, minus a share ([fg] pace_relax)
-    // of how early DLSS-G finished relative to that, so a delay never sticks. arrival: at a fixed
-    // lag after the game's Present (lag = recent maximum of DLSS-G ready - arrival), i.e. locked to
-    // the game's own frame cadence.
-    // content: both presents on the game's own timeline, a fixed lag L after it: the real frame at
-    // arrive(N) + L and the generated one (content halfway between N-1 and N) at arrive(N) + L - dt/2,
-    // with dt the *actual* interval since the previous game frame. Display time then follows content
-    // time even when the game's frame times vary (with VRR this is what makes motion smooth; an even
-    // present cadence over uneven content times makes the image speed up and slow down).
-    int64_t real_target = 0;
-    if (gen_ready) {  // auto cap: how long after the game's Present DLSS-G was done
-      P.ready_lag_sum += t0 - j.arrive_us;
-      ++P.ready_lag_n;
-    }
-    if (gen_ready && j.half_us > 0) {
-      static int64_t lag_us = 0, lag_c = 0;
-      int64_t ready_lag = t0 - j.arrive_us;
-      lag_us = ready_lag > lag_us ? ready_lag : lag_us - (lag_us - ready_lag) / 64;
-      int64_t target = 0;
-      if (j.pace == 1 && P.last_real_call)
-        target = P.last_real_call + j.half_us - int64_t(j.relax * double(P.last_real_call + j.half_us - t0));
-      else if (j.pace == 2)
-        target = j.arrive_us + lag_us;
-      if (j.pace == 3) {
-        int64_t dt = j.dt_us > 0 ? j.dt_us : 2 * j.half_us;
-        dt = dt < 3000 ? 3000 : dt > 50000 ? 50000 : dt;
-        int64_t need = ready_lag + dt / 2;  // smallest L that has the generated frame ready in time
-        lag_c = need > lag_c ? need : lag_c - (lag_c - need) / 64;
-        target = j.arrive_us + lag_c - dt / 2;
-        real_target = j.arrive_us + lag_c;
-        if (target > t0 && target - t0 < 100000) wait_until(target);
-      } else if (target > t0 && target - t0 < 2 * j.half_us) {
-        wait_until(target);
+      // Pacing ([fg] pace). The first generated frame - ready: as soon as DLSS-G is done. smooth: not
+      // sooner than one step after the previous real present, minus a share ([fg] pace_relax) of how
+      // early DLSS-G finished relative to that, so a delay never sticks. arrival: at a fixed lag after
+      // the game's Present (lag = recent maximum of DLSS-G ready - arrival), i.e. locked to the game's
+      // own frame cadence. content: every present on the game's own timeline, a fixed lag L after it:
+      // the real frame at arrive(N) + L, generated frame k (content k/mult of the way from N-1 to N) at
+      // arrive(N) + L - dt (mult - k) / mult, with dt the *actual* interval since the previous game
+      // frame. Later generated frames: one step after the previous present's call (ready: its return).
+      if (step > 0) {
+        int64_t target = 0;
+        if (j.pace == 3) {
+          if (k == 0) {
+            dt = j.dt_us > 0 ? j.dt_us : mult * step;
+            dt = dt < 3000 ? 3000 : dt > 50000 ? 50000 : dt;
+            int64_t need = (t_ready - j.arrive_us) + dt * (mult - 1) / mult;  // smallest L that has it ready in time
+            lag_c = need > lag_c ? need : lag_c - (lag_c - need) / 64;
+            real_target = j.arrive_us + lag_c;
+          }
+          target = real_target - dt * (mult - 1 - int64_t(k)) / mult;
+          if (target > t_ready && target - t_ready < 100000) wait_until(target);
+        } else {
+          if (k == 0) {
+            int64_t ready_lag = t_ready - j.arrive_us;
+            lag_us = ready_lag > lag_us ? ready_lag : lag_us - (lag_us - ready_lag) / 64;
+            if (j.pace == 1 && P.last_real_call)
+              target = P.last_real_call + step - int64_t(j.relax * double(P.last_real_call + step - t_ready));
+            else if (j.pace == 2)
+              target = j.arrive_us + lag_us;
+          } else {
+            target = (j.pace ? prev_call : prev_ret) + step;
+          }
+          if (target > t_ready && target - t_ready < 2 * step) wait_until(target);
+        }
       }
+      ID3D11Texture2D* bb = real_backbuffer(j.sc);
+      if (!bb) break;
+      int64_t c0 = now_us();
+      if (j.gate) g_ctx_gate.fetch_add(1);
+      fill(bb, true, j.show, j.gen[k], j.real);
+      int ti = trace_begin('G', j.frame, j.arrive_us, step, bb, S.imm, int(k) + 1, int(mult));
+      bb->Release();
+      int64_t c1 = now_us();
+      hr = j.present(j.sc, j.sync, j.flags);
+      trace_end(ti);
+      if (j.gate) g_ctx_gate.fetch_sub(1);
+      prev_ret = now_us();
+      prev_call = c1;
+      if (!shown) t_first = c0, t_gen_ret = prev_ret;
+      copy_g += c1 - c0;
+      pres_g += prev_ret - c1;
+      ++shown;
     }
-    t0 = t1 = t2 = now_us();
-    if (gen_ready) {
-      if (ID3D11Texture2D* bb = real_backbuffer(j.sc)) {
-        if (j.gate) g_ctx_gate.fetch_add(1);
-        fill(bb, true, j.show, j.gen, j.real);
-        int ti = trace_begin('G', j.frame, j.arrive_us, j.half_us, bb, S.imm);
-        bb->Release();
-        t1 = now_us();
-        hr = j.present(j.sc, j.sync, j.flags);
-        trace_end(ti);
-        if (j.gate) g_ctx_gate.fetch_sub(1);
-      }
-    }
-    int64_t t_gen = t2 = now_us();
-    // The real frame half an interval after the generated one: measured from when the generated
-    // Present was called (pace=smooth/arrival) - a Present that blocks must not push the real frame
-    // later (pace=ready, the original: from when it returned).
-    if (gen_ready && j.half_us > 0) {
+    const int64_t t_wait = now_us();
+    // The real frame one step after the last generated one: measured from when its Present was called
+    // (pace=smooth/arrival) - a Present that blocks must not push the real frame later (pace=ready,
+    // the original: from when it returned).
+    if (shown && step > 0) {
       if (j.pace == 3 && real_target > 0) {
         if (real_target - now_us() < 100000) wait_until(real_target);
       } else {
-        wait_until((j.pace ? t1 : t_gen) + j.half_us);
+        wait_until((j.pace ? prev_call : prev_ret) + step);
       }
     }
     int64_t t_real = now_us(), t4 = t_real;
     if (j.show == "skip_present2") {
-      // bisecting: no second present
+      // bisecting: no real present
     } else if (ID3D11Texture2D* bb = real_backbuffer(j.sc)) {
       if (j.gate) g_ctx_gate.fetch_add(1);
-      fill(bb, false, j.show, j.gen, j.real);
-      int ti = trace_begin('R', j.frame, j.arrive_us, j.half_us, bb, S.imm);
+      fill(bb, false, j.show, j.gen[0], j.real);
+      int ti = trace_begin('R', j.frame, j.arrive_us, step, bb, S.imm, 0, int(mult));
       bb->Release();
       t4 = now_us();
       P.last_real_call = t4;
@@ -1182,13 +1291,18 @@ void present_loop() {
       if (SUCCEEDED(hr)) hr = h2;
     }
     int64_t t5 = now_us();
-    P.seg_us[0] += t0 - j.arrive_us;
-    P.seg_us[1] += t1 - t0;
-    P.seg_us[2] += t2 - t1;
-    P.seg_us[3] += t_real - t2;
+    if (!shown) t_first = t_gen_ret = t_wait;
+    // Waits between presents: from the first generated present's return to the real present, minus
+    // the later generated presents' own copy/Present time.
+    int64_t between = t_real - t_gen_ret;
+    if (shown > 1) between -= (copy_g + pres_g) * int64_t(shown - 1) / int64_t(shown);
+    P.seg_us[0] += t_first - j.arrive_us;
+    P.seg_us[1] += copy_g;
+    P.seg_us[2] += pres_g;
+    P.seg_us[3] += between;
     P.seg_us[4] += t4 - t_real;
     P.seg_us[5] += t5 - t4;
-    P.delay_gen_us += t_gen - j.arrive_us;
+    P.delay_gen_us += t_gen_ret - j.arrive_us;
     P.delay_real_us += t_real - j.arrive_us;
     ++P.delay_n;
     P.hr = hr;
@@ -1198,97 +1312,224 @@ void present_loop() {
   }
 }
 
-// Waits (deadline 500 ms) until at most `outstanding` jobs are queued or running.
+// Waits (deadline 500 ms) until at most `outstanding` jobs are queued or running. Game-thread waits
+// are summed in g_join_us (taken out of the real-frame interval: they are our back-pressure, not the
+// game's cadence).
+int64_t g_join_us = 0;  // game thread
 void join(size_t outstanding = 0) {
   std::unique_lock<std::mutex> lk(P.m);
   auto ok = [outstanding] { return g_jobs.size() + size_t(g_active) <= outstanding; };
   if (ok()) return;
   int64_t t0 = now_us();
   P.cv.wait_for(lk, std::chrono::milliseconds(500), ok);
-  P.perf_join_ms += (now_us() - t0) / 1000.0;
+  int64_t waited = now_us() - t0;
+  if (GetCurrentThreadId() != g_present_tid) g_join_us += waited;
+  P.perf_join_ms += waited / 1000.0;
   ++P.perf_join_n;
   ++P.cap_join_n;
 }
 
-// [fg] auto_cap: a real-frame-rate cap with headroom, found by feedback. Without headroom the GPU
-// queue fills (DLSS-G runs on a second device the game's Reflex doesn't account for), DLSS-G
-// finishes ~2 frames after the game's Present, the present thread falls behind and the game blocks
-// on it at irregular times: uneven game frame times = uneven motion, and ~10 ms more latency. With
-// headroom DLSS-G is done well within a frame. Every second: if DLSS-G finished later than
-// auto_cap_lag of a frame interval after the game's Present on average, or the game had to wait for
-// the present thread, the cap drops 4 %; if it finished within auto_cap_lag - 0.15 and the game
-// never waited, it rises 1 % (4 % when far below the target). Starts 2 s after FG starts, at 90 %
-// of the rate then.
+// ---- Frame-rate cap and multiplier ([fg] auto_cap, count, target_hz) ------------------------------
+// auto_cap: a real-frame-rate cap with headroom, found by feedback. Without headroom the GPU queue
+// fills (DLSS-G runs on a second device the game's Reflex doesn't account for), DLSS-G finishes ~2
+// frames after the game's Present, the present thread falls behind and the game blocks on it at
+// irregular times: uneven game frame times = uneven motion, and ~10 ms more latency. With headroom
+// DLSS-G is done well within a frame. Every second: if DLSS-G (the first generated frame) finished
+// later than auto_cap_lag of a frame interval after the game's Present on average, or the game had to
+// wait for the present thread, the headroom cap drops 4 %; if it finished within auto_cap_lag - 0.15
+// and the game never waited, it rises 1 % (4 % when far below the target). Starts 2 s after FG
+// starts, at 90 % of the rate then.
+//
+// Refresh target (Multi Frame Generation): presents = real fps x multiplier should not exceed the
+// display's refresh ([fg] target_hz, default the detected refresh), so the cap is also at most
+// target / multiplier (e.g. 165 Hz: 82.5 real fps at 2x, 55 at 3x, 41.25 at 4x). With VRR that gives
+// one present per refresh at an even cadence. The headroom cap only rises while it is the binding
+// one (otherwise it would climb unchecked while the refresh cap holds the rate).
+//
+// count=auto (dynamic multiplier): the multiplier is the smallest in [count_min, count_max] at which
+// the refresh target fits under the headroom cap. One step up when the headroom cap stays below
+// target / multiplier (2 s); one step down when the frame's own work (frame interval minus the time
+// the limiter / Reflex slept) and DLSS-G's lag predict headroom for target / (multiplier - 1)
+// (3 s, 15 % margin). A step down that has to be undone within 6 s blocks further steps down for
+// 10 s, doubling up to 60 s.
 std::atomic<float> g_auto_cap{0};
-void auto_cap_update(bool fg_active) {
+std::atomic<int> g_mult{2};
+
+// Presents per second to aim for: [fg] target_hz, else the display's refresh.
+float target_hz() {
   const Config& cfg = config();
-  static int64_t last = 0, since = 0;
-  static uint32_t frames = 0;
-  int64_t now = now_us();
-  ++frames;
-  if (!cfg.fg_auto_cap || !fg_active) {
-    g_auto_cap = 0;
-    last = since = 0;
+  return cfg.fg_target_hz > 0 ? cfg.fg_target_hz : display_hz();
+}
+
+// Multiplier range: fixed count = [count, count]; auto = [count_min, count_max]; both within what
+// DLSS-G supports (MultiFrameCountMax + 1).
+void mult_range(int& lo, int& hi) {
+  const Config& cfg = config();
+  int caps = int(S.caps_max_gen) + 1;
+  if (cfg.fg_count > 0) {
+    lo = hi = std::max(2, std::min(cfg.fg_count, caps));
     return;
   }
-  if (!since) since = now;
-  if (now - since < 2000000) return;  // let FG settle (and loading end) first
-  if (!last) {
-    last = now;
-    frames = 0;
+  hi = std::max(2, std::min(cfg.fg_count_max, caps));
+  lo = std::max(2, std::min(cfg.fg_count_min, hi));
+}
+
+struct Pacer {
+  int64_t last = 0, since = 0;
+  uint32_t frames = 0;
+  uint64_t wait0 = 0;    // reflex_wait_us() at the last update
+  float head = 0;        // headroom cap
+  int mult = 0;
+  int up_n = 0, down_n = 0;
+  int64_t last_down = 0, block_until = 0, backoff = 10000000;
+} PC;
+
+void pacing_update(bool fg_active) {
+  const Config& cfg = config();
+  int64_t now = now_us();
+  ++PC.frames;
+  int lo, hi;
+  mult_range(lo, hi);
+  if (PC.mult < lo || PC.mult > hi) PC.mult = cfg.fg_count > 0 ? hi : lo;
+  g_mult = PC.mult;
+  if (!fg_active) {
+    g_auto_cap = 0;
+    PC.last = PC.since = 0;
+    PC.head = 0;
+    PC.up_n = PC.down_n = 0;
+    return;
+  }
+  if (!PC.since) PC.since = now;
+  if (now - PC.since < 2000000) return;  // let FG settle (and loading end) first
+  if (!PC.last) {
+    PC.last = now;
+    PC.frames = 0;
+    PC.wait0 = reflex_wait_us();
     P.ready_lag_sum = 0;
     P.ready_lag_n = 0;
+    P.gpu_lag_sum = 0;
+    P.gpu_lag_n = 0;
     P.cap_join_n = 0;
     return;
   }
-  if (now - last < 1000000) return;
-  double secs = (now - last) / 1e6;
-  double fps = frames / secs;
+  if (now - PC.last < 1000000) return;
+  double secs = (now - PC.last) / 1e6;
+  double fps = PC.frames / secs;
   uint32_t n = P.ready_lag_n.exchange(0);
-  double lag = n ? double(P.ready_lag_sum.exchange(0)) / n : 0;
+  double lag_ready = n ? double(P.ready_lag_sum.exchange(0)) / n : 0;
+  uint32_t gn = P.gpu_lag_n.exchange(0);
+  double lag_gpu = gn ? double(P.gpu_lag_sum.exchange(0)) / gn : 0;
+  // [fg] auto_cap_lag_from: ready = when the present thread had the first generated frame (includes
+  // waiting for the previous job and the fence wake-up), gpu = when DLSS-G finished on the GPU.
+  double lag = cfg.fg_auto_cap_lag_from == "gpu" && gn ? lag_gpu : lag_ready;
   uint32_t waits = P.cap_join_n;
   P.cap_join_n = 0;
-  frames = 0;
-  last = now;
+  uint64_t w = reflex_wait_us();
+  double slack = PC.frames ? double(w - PC.wait0) / PC.frames : 0;  // limiter / Reflex sleep per frame, us
+  PC.wait0 = w;
+  PC.frames = 0;
+  PC.last = now;
   double interval = fps > 1 ? 1e6 / fps : 0;
   double ratio = interval > 0 ? lag / interval : 0;
-  float cap = g_auto_cap.load();
-  if (cap <= 0) {
-    cap = static_cast<float>(fps * 0.9);
-  } else if (ratio > cfg.fg_auto_cap_lag || waits > fps * 0.02) {
-    cap = static_cast<float>(std::min<double>(cap, fps) * 0.96);
-  } else if (ratio < cfg.fg_auto_cap_lag - 0.35 && waits == 0) {
-    cap *= 1.04f;
-  } else if (ratio < cfg.fg_auto_cap_lag - 0.15 && waits == 0) {
-    cap *= 1.01f;
+  const float target = target_hz();
+  const float lim = cfg.reflex_fps_limit;  // an explicit limit overrides the automatic cap
+  const bool overloaded = ratio > cfg.fg_auto_cap_lag || waits > fps * 0.02;
+  const int old_mult = PC.mult;
+  float cap = 0;
+  if (cfg.fg_auto_cap && lim <= 0) {
+    auto refresh_cap = [&](int m) { return target > 0 ? target / float(m) : 1e9f; };
+    float cur_cap = g_auto_cap.load();
+    float r = refresh_cap(PC.mult);
+    if (PC.head <= 0) {
+      PC.head = static_cast<float>((cur_cap > 0 ? std::min<double>(cur_cap, fps) : fps) * 0.9);
+    } else if (overloaded) {
+      PC.head = static_cast<float>(std::min<double>(cur_cap > 0 ? cur_cap : PC.head, fps) * 0.96);
+    } else if (PC.head <= r * 1.001f && waits == 0) {  // only while the headroom cap binds
+      if (ratio < cfg.fg_auto_cap_lag - 0.35) PC.head *= 1.04f;
+      else if (ratio < cfg.fg_auto_cap_lag - 0.15) PC.head *= 1.01f;
+    }
+    // (30 fps as before, lower only where the refresh target at the highest multiplier needs it)
+    float flo = cfg.fg_auto_cap_min > 0 ? cfg.fg_auto_cap_min : std::min(30.0f, target > 0 ? target / float(hi) * 0.75f : 30.0f);
+    float fhi = cfg.fg_auto_cap_max > 0 ? cfg.fg_auto_cap_max : 240.0f;
+    PC.head = std::max(flo, std::min(fhi, PC.head));
+    // A window with a hitch (loading, a trace being written, a config change) says nothing about the
+    // steady state: no multiplier change on it.
+    const bool hitch = cur_cap > 0 && fps < 0.6 * cur_cap;
+    if (lo < hi && target > 0 && !hitch) {
+      // Up: the headroom cap can't hold target / multiplier (presents > 10 % short of the target;
+      // within that a lower multiplier at the headroom cap is the better trade: fewer generated
+      // frames, less latency).
+      if (PC.head < r * 0.9f && PC.mult < hi) {
+        if (++PC.up_n >= 2) {
+          if (now - PC.last_down < 6000000) {  // undoing a step down: back off
+            PC.block_until = now + PC.backoff;
+            PC.backoff = std::min<int64_t>(PC.backoff * 2, 60000000);
+          }
+          ++PC.mult;
+        }
+      } else {
+        PC.up_n = 0;
+      }
+      // Down: the frame's own work and DLSS-G's lag leave headroom for target / (multiplier - 1).
+      bool down = false;
+      if (PC.mult == old_mult && PC.mult > lo && !overloaded && now >= PC.block_until && interval > 0) {
+        double work = interval - slack;
+        double need = target / double(PC.mult - 1);
+        double ratio_next = ratio * PC.mult / (PC.mult - 1);
+        down = work > 0 && 1e6 / work * 0.85 >= need && ratio_next < cfg.fg_auto_cap_lag - 0.15;
+      }
+      PC.down_n = down ? PC.down_n + 1 : 0;
+      if (PC.down_n >= 3) {
+        --PC.mult;
+        PC.last_down = now;
+        PC.head = std::max(PC.head, refresh_cap(PC.mult));
+      }
+      if (PC.mult != old_mult) PC.up_n = PC.down_n = 0;
+      if (PC.last_down && now - PC.last_down > 20000000) PC.backoff = 10000000;  // a step down that held
+    }
+    cap = std::min(PC.head, refresh_cap(PC.mult));
+  } else if (lo < hi && target > 0) {
+    // Dynamic multiplier without the automatic cap: from the real rate (an explicit fps_limit, or
+    // what the game reaches), presents at or just below the target.
+    double base = lim > 0 ? lim : fps;
+    int want = base > 0 ? int(std::floor(target / base + 0.1)) : lo;
+    want = std::max(lo, std::min(hi, want));
+    PC.down_n = want != PC.mult ? PC.down_n + 1 : 0;
+    if (PC.down_n >= 3) PC.mult = want, PC.down_n = 0;
   }
-  float lo = cfg.fg_auto_cap_min > 0 ? cfg.fg_auto_cap_min : 30.0f;
-  float hi = cfg.fg_auto_cap_max > 0 ? cfg.fg_auto_cap_max : 240.0f;
-  cap = std::max(lo, std::min(hi, cap));
+  if (PC.mult < old_mult && !(cfg.fg_auto_cap && lim <= 0)) PC.last_down = now;
+  g_mult = PC.mult;
   static float logged = 0;
-  if (std::fabs(cap - logged) > 3.0f) {
-    ACO_LOG("fg12: auto cap %.1f fps (real %.1f fps, DLSS-G done %.1f ms = %.2f frames after the game's Present, game "
-            "waited %u times)", cap, fps, lag / 1000.0, ratio, waits);
+  static int logged_mult = 0;
+  if (std::fabs(cap - logged) > 3.0f || PC.mult != logged_mult) {
+    ACO_LOG("fg12: auto cap %.1f fps, %dx (real %.1f fps, DLSS-G done %.1f ms = %.2f frames after the game's Present, game "
+            "waited %u times, limiter/Reflex sleep %.1f ms/frame, headroom cap %.1f, target %.0f Hz; lag ready %.1f / GPU end %.1f ms)",
+            cap, PC.mult, fps, lag / 1000.0, ratio, waits, slack / 1000.0, PC.head, target, lag_ready / 1000.0, lag_gpu / 1000.0);
     logged = cap;
+    logged_mult = PC.mult;
   }
   g_auto_cap = cap;
 }
 
-void enqueue(IDXGISwapChain* sc, PFN_RealPresent present, UINT sync, UINT flags, int64_t half, const std::string& show,
+void enqueue(IDXGISwapChain* sc, PFN_RealPresent present, UINT sync, UINT flags, int64_t step, const std::string& show,
              int64_t arrive) {
   static std::thread thread(present_loop);
+  const Set& st = *S.cur;
   Job j;
   j.sc = sc;
   j.present = present;
   j.sync = sync;
   j.flags = flags;
-  j.half_us = half;
+  j.half_us = step;
   j.arrive_us = arrive;
-  j.wait_value = config().fg_sync == "gpu" ? 0 : S.eval_v;
-  j.gen = S.out.t11;
-  j.real = S.real;
-  j.ts_slot = S.eval_slot;
-  j.ts_old = S.eval_ts_old;
+  j.n_gen = st.n_gen;
+  for (unsigned k = 0; k < st.n_gen; ++k) {
+    j.wait_value[k] = config().fg_sync == "gpu" ? 0 : st.gen_v[k];
+    j.gen[k] = st.out[k].t11;
+    j.ts_slot[k] = st.gen_slot[k];
+    j.ts_old[k] = st.gen_ts_old[k];
+  }
+  j.real = st.real;
   j.show = config().fg_skip == "present2" ? std::string("skip_present2") : show;
   j.gate = config().fg_present_gate;
   j.frame = S.backbuffer_id;
@@ -1299,7 +1540,7 @@ void enqueue(IDXGISwapChain* sc, PFN_RealPresent present, UINT sync, UINT flags,
   prev_arrive = arrive;
   j.relax = config().fg_pace_relax;
   std::lock_guard<std::mutex> lk(P.m);
-  // A job that hasn't started yet is late: its generated frame would only delay the real ones.
+  // A job that hasn't started yet is late: its generated frames would only delay the real ones.
   for (Job& q : g_jobs) {
     q.skip_gen = true;
     q.half_us = 0;
@@ -1380,6 +1621,12 @@ void perf_join_report() {
   for (int i = 0; i < 6; ++i) s[i] = n ? P.seg_us[i].exchange(0) / 1000.0 / n : 0.0;
   ACO_LOG("perf: fg12 present thread steps (ms/job): pickup %.2f | copy %.2f, Present %.2f (generated) | wait %.2f | "
           "copy %.2f, Present %.2f (real)", s[0], s[1], s[2], s[3], s[4], s[5]);
+  uint32_t ln = P.lag_split_n.exchange(0);
+  double l0 = P.lag_start_sum.exchange(0), l1 = P.lag_gpu_sum.exchange(0), l2 = P.lag_wake_sum.exchange(0);
+  if (ln)
+    ACO_LOG("perf: fg12 DLSS-G lag split (first generated frame, ms after the game's Present): GPU start +%.2f, GPU "
+            "duration %.2f, present thread awake %.2f after the GPU end (%u frames, multiplier %dx)",
+            l0 / 1000.0 / ln, l1 / 1000.0 / ln, l2 / 1000.0 / ln, ln, g_mult.load());
   P.perf_join_ms = 0;
   P.perf_join_n = 0;
   last = now;
@@ -1428,11 +1675,11 @@ void trace_poll(ID3D11Texture2D* bb) {
   std::wstring dir = out_dir() + L"\\fgtrace";
   CreateDirectoryW(dir.c_str(), nullptr);
   if (FILE* f = _wfopen((dir + L"\\presents.csv").c_str(), L"w")) {
-    fprintf(f, "kind,frame,arrive_us,call_us,ret_us,half_us,interval_us,shot\n");
+    fprintf(f, "kind,frame,arrive_us,call_us,ret_us,half_us,interval_us,shot,gi,gn\n");
     for (const TraceEv& e : T.ev)
-      fprintf(f, "%c,%llu,%lld,%lld,%lld,%d,%d,%d\n", e.kind, static_cast<unsigned long long>(e.frame),
+      fprintf(f, "%c,%llu,%lld,%lld,%lld,%d,%d,%d,%d,%d\n", e.kind, static_cast<unsigned long long>(e.frame),
               static_cast<long long>(e.arrive), static_cast<long long>(e.call), static_cast<long long>(e.ret), e.half_us,
-              e.interval_us, e.shot);
+              e.interval_us, e.shot, e.gi, e.gn);
     fclose(f);
   }
   if (FILE* f = _wfopen((dir + L"\\bands.bin").c_str(), L"wb")) {
@@ -1540,6 +1787,48 @@ bool fg12_proxy_active() { return P.proxy == 1; }
 
 float fg12_auto_cap() { return g_auto_cap.load(); }
 
+// The display's refresh rate for [fg] refresh_hz=0 / target_hz=0: the swapchain's fullscreen mode, else
+// the current display mode of the output the swapchain is on (under Wine: the X/Xwayland mode).
+// Re-checked every 10 s (mode switches).
+static void detect_refresh(IDXGISwapChain* sc) {
+  static int64_t last = 0;
+  int64_t now = now_us();
+  if (last && now - last < 10000000) return;
+  last = now;
+  float sc_hz = 0, mode_hz = 0;
+  DXGI_SWAP_CHAIN_DESC d{};
+  BOOL fullscreen = FALSE;
+  if (SUCCEEDED(sc->GetDesc(&d)) && d.BufferDesc.RefreshRate.Denominator)
+    sc_hz = float(d.BufferDesc.RefreshRate.Numerator) / float(d.BufferDesc.RefreshRate.Denominator);
+  sc->GetFullscreenState(&fullscreen, nullptr);
+  IDXGIOutput* out = nullptr;
+  if (SUCCEEDED(sc->GetContainingOutput(&out)) && out) {
+    DXGI_OUTPUT_DESC od{};
+    MONITORINFOEXW mi{};
+    mi.cbSize = sizeof(mi);
+    DEVMODEW dm{};
+    dm.dmSize = sizeof(dm);
+    if (SUCCEEDED(out->GetDesc(&od)) && GetMonitorInfoW(od.Monitor, &mi) &&
+        EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1)
+      mode_hz = float(dm.dmDisplayFrequency);
+    out->Release();
+  }
+  if (mode_hz <= 0) {
+    DEVMODEW dm{};
+    dm.dmSize = sizeof(dm);
+    if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1)
+      mode_hz = float(dm.dmDisplayFrequency);
+  }
+  float hz = fullscreen && sc_hz > 1 ? sc_hz : mode_hz > 0 ? mode_hz : sc_hz > 1 ? sc_hz : 0;
+  if (std::fabs(hz - g_display_hz.load()) > 0.5f) {
+    ACO_LOG("fg12: display refresh %.2f Hz (swapchain mode %.2f Hz, %s; display mode %.0f Hz); [fg] refresh_hz=%.0f "
+            "target_hz=%.0f -> target %.0f presents/s", hz, sc_hz, fullscreen ? "fullscreen" : "windowed", mode_hz,
+            config().fg_refresh_hz, config().fg_target_hz, config().fg_target_hz > 0 ? config().fg_target_hz :
+            config().fg_refresh_hz > 0 ? config().fg_refresh_hz : hz);
+    g_display_hz = hz;
+  }
+}
+
 // Runtime Frame Generation on/off ([fg] toggle_key, default F9; initial state [fg] enabled). The
 // D3D12 device, NGX and the present thread stay alive while off; frames then go out like mode=off.
 bool g_fg_on = true;
@@ -1569,6 +1858,7 @@ bool fg12_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent rea
   const Config& cfg = config();
   const bool proxy = P.proxy == 1;
   int64_t arrive = now_us();
+  const int64_t join_at_arrive = g_join_us;
   // The previous frame's presents may still be running (they use the other texture set); the one
   // before must be done before we reuse its set.
   if (proxy) join(cfg.fg_sync == "gpu" ? 0 : cfg.fg_sets >= 3 ? 2 : 1);
@@ -1610,53 +1900,81 @@ bool fg12_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent rea
   if (proxy && bb) bb->AddRef();
   if (proxy && bb) trace_poll(bb);
   if (have_in && bb) {
+    detect_refresh(sc);
     if (in.frame != S.last_input_frame + 1) S.reset = true;
     S.last_input_frame = in.frame;
     D3D11_TEXTURE2D_DESC bd;
     bb->GetDesc(&bd);
-    if (ensure_textures(bd)) {
+    // Multiplier of this frame (fixed [fg] count, or the dynamic choice) and the generated frames the
+    // feature and texture sets are made for (count_max with count=auto, so the multiplier can change
+    // per frame without re-creating anything).
+    int lo, hi;
+    mult_range(lo, hi);
+    const unsigned n_gen = unsigned(std::max(lo, std::min(hi, g_mult.load())) - 1);
+    const unsigned feat_gen = unsigned(hi - 1);
+    {
+      // Textures about to be re-created or released (new size / format / count): nothing queued or
+      // on the GPU may still use them.
+      static unsigned last_feat_gen = 0;
+      if (last_feat_gen != feat_gen || S.tex_w != bd.Width || S.tex_h != bd.Height) {
+        if (proxy) join(0);
+        if (S.done12) wait_d3d12(S.done_value);
+        last_feat_gen = feat_gen;
+      }
+    }
+    if (ensure_textures(bd, feat_gen)) {
       bool verify = cfg.fg_verify && verify_textures();
       if (verify && S.verify_pending > 0 && --S.verify_pending == 0) verify_read();
       if (cfg.fg_sync != "gpu") {
         // Frames alternate between two texture sets; the one we're about to overwrite was last read
         // and written by the evaluation two frames ago (normally long done).
         swap_sets();
-        if (wait_fence()->GetCompletedValue() < S.eval_v) {
+        if (wait_fence()->GetCompletedValue() < S.cur->eval_v) {
           ++S.perf_cpu_waits;
-          wait_eval(S.eval_v, S.game_event, 200);
+          wait_eval(S.cur->eval_v, S.game_event, 200);
         }
       }
-      ID3D11Texture2D* prev_real = cfg.fg_sync != "gpu" ? S.alt_real : nullptr;  // previous real frame
-      S.imm->CopyResource(S.real, bb);
-      if (generate(in, bb)) {
-        if (verify && S.verify_pending <= 0 && now_us() - S.verify_last > 2000000) {
+      Set& st = *S.cur;
+      ID3D11Texture2D* prev_real = cfg.fg_sync != "gpu" ? S.prev->real : nullptr;  // previous real frame
+      S.imm->CopyResource(st.real, bb);
+      if (generate(in, bb, n_gen, feat_gen)) {
+        if (verify && S.verify_pending <= 0 && now_us() - S.verify_last > 2000000 && st.n_gen) {
+          // The generated frame closest to the midpoint.
+          const Shared& g = st.out[st.n_gen / 2];
           S.verify_last = now_us();
-          S.imm->CopyResource(S.stage[0], prev_real ? prev_real : S.real);
-          wait_eval(S.eval_v, S.game_event, 200);
-          S.imm->CopyResource(S.stage[1], S.out.t11);
-          S.imm->CopyResource(S.stage[2], S.real);
+          S.imm->CopyResource(S.stage[0], prev_real ? prev_real : st.real);
+          wait_eval(st.eval_v, S.game_event, 200);
+          S.imm->CopyResource(S.stage[1], g.t11);
+          S.imm->CopyResource(S.stage[2], st.real);
           S.verify_pending = 4;
         }
-        int64_t half = cfg.fg_pacing && S.frame_interval_us > 0 ? static_cast<int64_t>(S.frame_interval_us / 2) : 0;
-        if (half > 25000) half = 25000;  // never hold a real frame more than 25 ms
+        // Pacing step: presents one interval / multiplier apart (2x: half an interval). The interval
+        // counts at most 50 ms (never hold a real frame more than 25 ms at 2x).
+        const int64_t mult = int64_t(st.n_gen) + 1;
+        int64_t step = cfg.fg_pacing && S.frame_interval_us > 0
+                           ? static_cast<int64_t>(std::min(S.frame_interval_us, 50000.0) / double(mult))
+                           : 0;
         if (proxy && config().fg_present_thread == 1) {
-          // Both presents (generated now, real half a frame later) on the present thread.
-          enqueue(sc, real, sync, flags, half, cfg.fg_show, arrive);
+          // All presents (generated now, then one step apart, real last) on the present thread.
+          enqueue(sc, real, sync, flags, step, cfg.fg_show, arrive);
           *hr = P.hr;
         } else {
           if (proxy) join(0);
           ID3D11Texture2D* dst = proxy ? real_backbuffer(sc) : bb;
           if (dst) {
-            if (cfg.fg_sync != "gpu") wait_eval(S.eval_v, S.game_event, 200);
-            fill(dst, true, cfg.fg_show, S.out.t11, S.real);
-            *hr = real(sc, sync, flags);
-            if (half > 0) wait_until(now_us() + half);
-            fill(dst, false, cfg.fg_show, S.out.t11, S.real);
+            for (unsigned k = 0; k < st.n_gen; ++k) {
+              if (cfg.fg_sync != "gpu") wait_eval(st.gen_v[k], S.game_event, 200);
+              if (k && step > 0) wait_until(now_us() + step);
+              fill(dst, true, cfg.fg_show, st.out[k].t11, st.real);
+              *hr = real(sc, sync, flags);
+            }
+            if (step > 0) wait_until(now_us() + step);
+            fill(dst, false, cfg.fg_show, st.n_gen ? st.out[0].t11 : st.real, st.real);
             *hr = real(sc, sync, flags);
             if (proxy) dst->Release();
           }
         }
-        ++S.perf_generated;
+        S.perf_generated += st.n_gen;
         done = true;
       } else {
         ++S.perf_fail;
@@ -1689,19 +2007,26 @@ bool fg12_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent rea
     // present then waited half of that and the game, blocked in join, ran at 2 fps for half a minute
     // while the EMA decayed - also after every menu or loading screen.)
     S.last_real_present = 0;
-    auto_cap_update(false);
+    pacing_update(false);
     return true;
   }
 
   // Real-frame interval from the game's arrivals here (with the present thread, not inflated by our
-  // own pacing wait). A hitch counts at most 2.5x the current interval.
+  // own pacing wait), minus the time the game waited for the present thread in the previous frame
+  // (otherwise a present thread that fell behind - e.g. after a hitch - makes the game's frames as
+  // long as its jobs, the jobs stay that long, and it never catches up; seen at 4x). A hitch counts at
+  // most 2.5x the current interval.
+  static int64_t joined_prev = 0;
+  const int64_t joined = g_join_us - join_at_arrive;
   if (S.last_real_present) {
-    double dt = double(arrive - S.last_real_present);
+    double dt = double(arrive - S.last_real_present - joined_prev);
+    if (dt < 1000) dt = 1000;
     if (S.frame_interval_us > 0 && dt > 2.5 * S.frame_interval_us) dt = 2.5 * S.frame_interval_us;
     S.frame_interval_us = S.frame_interval_us > 0 ? S.frame_interval_us * 0.9 + dt * 0.1 : std::min(dt, 50000.0);
   }
   S.last_real_present = arrive;
-  auto_cap_update(true);
+  joined_prev = joined;
+  pacing_update(true);
   ++S.perf_real;
   perf_report();
   if (proxy) perf_join_report();
