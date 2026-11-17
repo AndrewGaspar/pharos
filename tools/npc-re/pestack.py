@@ -69,8 +69,12 @@ for th in inf.threads():
             c = mem(ursp + off, 0x10000)
             if not c: break
             u += c
-        cands = [v for v in struct.unpack('<%dQ' % (len(u) // 8), u[:len(u) // 8 * 8]) if sl <= v < sb and v % 8 == 0]
-        if cands: pe_rsp = min(cands)
+        uq = struct.unpack('<%dQ' % (len(u) // 8), u[:len(u) // 8 * 8])
+        cands = [(v, i) for i, v in enumerate(uq) if sl <= v < sb and v % 8 == 0]
+        if cands:
+            pe_rsp, at = min(cands)
+            if os.environ.get('FRAME'):  # the unix-stack qwords around the saved rsp (syscall frame: args)
+                print('  frame @%x: %s' % (ursp + at * 8, ' '.join('%x' % v for v in uq[max(0, at - 20):at + 8])))
     else:
         pe_rsp = ursp  # the thread is executing PE code
     lo = pe_rsp if pe_rsp else max(sl, sb - (2 << 20))
