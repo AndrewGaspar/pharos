@@ -251,7 +251,10 @@ def main():
         rr = shifts(bands, a["shot"], b["shot"])
         runs += 1
         for side in (0, 1):
-            dt = rr[side][0]
+            # 2x: the direct R->R' shift (as before). Multi Frame Generation: the sum of the run's
+            # consecutive shifts - at 3x+ one real frame moves the image by 100-200 px in a spin, more
+            # than the band's phase correlation measures reliably in one step.
+            dt = rr[side][0] if len(gens) == 1 else sum(sh[m][side] for m in range(i, j))
             if abs(dt) < 2.0 or min(sh[m][2 + side] for m in range(i, j)) < 0.05:
                 continue
             cum, prev_ratio = 0.0, -1e9

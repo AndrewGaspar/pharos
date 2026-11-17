@@ -1312,14 +1312,19 @@ void present_loop() {
   }
 }
 
-// Waits (deadline 500 ms) until at most `outstanding` jobs are queued or running.
+// Waits (deadline 500 ms) until at most `outstanding` jobs are queued or running. Game-thread waits
+// are summed in g_join_us (taken out of the real-frame interval: they are our back-pressure, not the
+// game's cadence).
+int64_t g_join_us = 0;  // game thread
 void join(size_t outstanding = 0) {
   std::unique_lock<std::mutex> lk(P.m);
   auto ok = [outstanding] { return g_jobs.size() + size_t(g_active) <= outstanding; };
   if (ok()) return;
   int64_t t0 = now_us();
   P.cv.wait_for(lk, std::chrono::milliseconds(500), ok);
-  P.perf_join_ms += (now_us() - t0) / 1000.0;
+  int64_t waited = now_us() - t0;
+  if (GetCurrentThreadId() != g_present_tid) g_join_us += waited;
+  P.perf_join_ms += waited / 1000.0;
   ++P.perf_join_n;
   ++P.cap_join_n;
 }
@@ -1447,9 +1452,14 @@ void pacing_update(bool fg_active) {
     float flo = cfg.fg_auto_cap_min > 0 ? cfg.fg_auto_cap_min : std::min(30.0f, target > 0 ? target / float(hi) * 0.75f : 30.0f);
     float fhi = cfg.fg_auto_cap_max > 0 ? cfg.fg_auto_cap_max : 240.0f;
     PC.head = std::max(flo, std::min(fhi, PC.head));
-    if (lo < hi && target > 0) {
-      // Up: the headroom cap can't hold target / multiplier.
-      if (PC.head < r * 0.97f && PC.mult < hi) {
+    // A window with a hitch (loading, a trace being written, a config change) says nothing about the
+    // steady state: no multiplier change on it.
+    const bool hitch = cur_cap > 0 && fps < 0.6 * cur_cap;
+    if (lo < hi && target > 0 && !hitch) {
+      // Up: the headroom cap can't hold target / multiplier (presents > 10 % short of the target;
+      // within that a lower multiplier at the headroom cap is the better trade: fewer generated
+      // frames, less latency).
+      if (PC.head < r * 0.9f && PC.mult < hi) {
         if (++PC.up_n >= 2) {
           if (now - PC.last_down < 6000000) {  // undoing a step down: back off
             PC.block_until = now + PC.backoff;
@@ -1848,6 +1858,7 @@ bool fg12_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent rea
   const Config& cfg = config();
   const bool proxy = P.proxy == 1;
   int64_t arrive = now_us();
+  const int64_t join_at_arrive = g_join_us;
   // The previous frame's presents may still be running (they use the other texture set); the one
   // before must be done before we reuse its set.
   if (proxy) join(cfg.fg_sync == "gpu" ? 0 : cfg.fg_sets >= 3 ? 2 : 1);
@@ -2001,13 +2012,20 @@ bool fg12_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent rea
   }
 
   // Real-frame interval from the game's arrivals here (with the present thread, not inflated by our
-  // own pacing wait). A hitch counts at most 2.5x the current interval.
+  // own pacing wait), minus the time the game waited for the present thread in the previous frame
+  // (otherwise a present thread that fell behind - e.g. after a hitch - makes the game's frames as
+  // long as its jobs, the jobs stay that long, and it never catches up; seen at 4x). A hitch counts at
+  // most 2.5x the current interval.
+  static int64_t joined_prev = 0;
+  const int64_t joined = g_join_us - join_at_arrive;
   if (S.last_real_present) {
-    double dt = double(arrive - S.last_real_present);
+    double dt = double(arrive - S.last_real_present - joined_prev);
+    if (dt < 1000) dt = 1000;
     if (S.frame_interval_us > 0 && dt > 2.5 * S.frame_interval_us) dt = 2.5 * S.frame_interval_us;
     S.frame_interval_us = S.frame_interval_us > 0 ? S.frame_interval_us * 0.9 + dt * 0.1 : std::min(dt, 50000.0);
   }
   S.last_real_present = arrive;
+  joined_prev = joined;
   pacing_update(true);
   ++S.perf_real;
   perf_report();
