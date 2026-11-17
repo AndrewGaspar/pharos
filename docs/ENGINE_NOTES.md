@@ -542,6 +542,25 @@ Found statically (headless Ghidra) and checked against a loaded story save (t1, 
   k=6 and k=8: the samples were taken while the game was paused (Ubisoft service restarts during
   the runs: task threads 0%, GPU 0%, frozen counts), so only their counts at that moment are
   usable and fps is missing. In view at k=4: 6805 skinning groups/frame (2.7x k=1).
+- **Hard limits** (`tools/npc-re/freezetest.sh`, 240 s per step after entering story mode):
+  - k>=6 froze the game every time, 25 s to 3 min after the load: all threads waiting (task
+    threads 0%, GPU 0%), last frame on screen, no exception logged, no crash dump. Not the Havok
+    spin. Before a per-spawner cap it froze after ~1430 originals had their extras whatever k
+    was (k=6: 7075 / 7295 extras, k=8: ~10000), while k=4 (spawners up to ~240 units) never
+    froze; the frozen game had spawners with 256-422 units. So a spawner must stay below 256
+    units (u8 somewhere): extras now stop at 250 per spawner (commit after 093ccb6).
+  - With that cap: k=6 ran 240 s (6535 extras, 54 fps uncapped), k=8 froze at 7635 extras
+    (155 s), k=10 at 7453 (30 s): a second, global limit at ~7500 extras, i.e. ~16.5-17k civilian
+    units in the loaded world (16658 counted in the frozen k=10 game). Which pool it is was not
+    found (a 16384-entry table is the obvious suspect). `[world] npc_units_max` caps the extras.
+  - With the per-spawner cap, k=6 gave no more spawned people than k=4 (883 vs 940): the big
+    spawners that hold most city units are already capped.
+- **Far-field crowd systems in story mode**: the `BulkWorldComponent` is live (World+0xe0 ->
+  +0x1e8; settings at +0xd0: 8192 / 160 / 70 / 40 / 0.69 / 40.0 / 1e4; pools of 8192 and 24576;
+  counters at +0x190 / +0x208: 556 / 578 in Alexandria at k=1, 1137 / 1162 at k=6). Its count
+  tracks the spawned characters (+ animals etc.), so it looks like the representation of spawned
+  MetaAI characters (jobs `SetupMetaAISpawnedUnitBulk` / `UpdateMetaAISpawnedUnitBulk`), not a
+  separate cheap far crowd. No `FakeCrowdHerder` is reachable from the World object.
   (First run interrupted at k=4.) Every band rises, and spawned ~= units within 120 m (the activation
   range is the spawn limit once the cap has headroom). Coverage at k=4 was only ~2-2.8x per band:
   spawners that had grown past 128 units were skipped (fixed in f4209f1, snapshot up to 4096). At
