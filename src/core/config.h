@@ -91,6 +91,9 @@ struct Config {
   float world_npc_distance = 1.0f;        // [world] npc_distance
   float world_npc_spawn_ceiling = 800.0f; // [world] npc_spawn_ceiling: most characters spawned at once (effective cap)
   float world_npc_units = 1.0f;           // [world] npc_units (experiment)
+  float world_npc_units_rural = 2.0f;     // [world] npc_units_rural: civilians away from towns
+  float world_npc_units_hostile = 1.0f;   // [world] npc_units_hostile: soldiers, bandits (1 = vanilla)
+  float world_npc_urban_threshold = 300.0f; // [world] npc_urban_threshold: original units within ~150 m that make a place urban
   float world_npc_units_log = 0.0f;       // [world] npc_units_log (diagnostics)
   float world_npc_units_rate = 0.0f;      // [world] npc_units_rate (diagnostics): extra units created per 100 ms (0 = 96)
   float world_npc_units_max = 0.0f;       // [world] npc_units_max: cap on extra units per world (0 = built-in)

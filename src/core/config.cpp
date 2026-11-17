@@ -129,6 +129,9 @@ Config load() {
   c.world_npc_units = read_float(L"npc_units", 1.0f, L"world");
   c.world_npc_units_kill = read_float(L"npc_units_kill", 0.0f, L"world");
   c.world_npc_units_log = read_float(L"npc_units_log", 0.0f, L"world");
+  c.world_npc_units_rural = read_float(L"npc_units_rural", 2.0f, L"world");
+  c.world_npc_units_hostile = read_float(L"npc_units_hostile", 1.0f, L"world");
+  c.world_npc_urban_threshold = read_float(L"npc_urban_threshold", 300.0f, L"world");
   c.world_npc_units_max = read_float(L"npc_units_max", 0.0f, L"world");
   c.world_npc_units_rate = read_float(L"npc_units_rate", 0.0f, L"world");
   c.world_tls_extend = read_float(L"tls_extend", 1.0f, L"world");
@@ -152,7 +155,8 @@ bool same(const Config& a, const Config& b) {
          a.world_lod_distance == b.world_lod_distance && a.world_lod_skip == b.world_lod_skip && a.world_lod_mode == b.world_lod_mode && a.world_npc_density == b.world_npc_density &&
          a.world_npc_distance == b.world_npc_distance && a.world_npc_spawn_ceiling == b.world_npc_spawn_ceiling && a.world_npc_units == b.world_npc_units &&
          a.world_npc_units_kill == b.world_npc_units_kill &&
-         a.world_npc_units_log == b.world_npc_units_log && a.world_npc_units_max == b.world_npc_units_max &&
+         a.world_npc_units_log == b.world_npc_units_log && a.world_npc_units_rural == b.world_npc_units_rural &&
+         a.world_npc_units_hostile == b.world_npc_units_hostile && a.world_npc_urban_threshold == b.world_npc_urban_threshold && a.world_npc_units_max == b.world_npc_units_max &&
          a.world_npc_units_rate == b.world_npc_units_rate && a.world_tls_extend == b.world_tls_extend;
 }
 } // namespace
