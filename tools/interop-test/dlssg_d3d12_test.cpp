@@ -3,6 +3,7 @@
 // pixels; motion vectors describe the move. After evaluating frame A then frame B, the generated frame
 // should show the square halfway (if it is untouched/copied, generation doesn't work).
 //   WINEDLLOVERRIDES="d3d11,dxgi,d3d12,d3d12core,nvapi64=n" wine dlssg_d3d12_test.exe <dir with nvngx_dlssg.dll>
+//     [count] [opts r/h] [frames] [step px] [mvscale_x [mvscale_y]]
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
@@ -275,6 +276,9 @@ int main(int argc, char** argv) {
   // Frame f: textured background (static), white square at x = X0 + f*STEP moving right.
   const int frames = argc > 4 ? atoi(argv[4]) : 8;
   const UINT STEP = argc > 5 ? atoi(argv[5]) : 16;
+  // MvecScale passed to DLSS-G (the vectors are in UV units): 1 = "normalised" reading, W = pixel reading.
+  const float MVSCALE_X = argc > 6 ? float(atof(argv[6])) : 1.0f;
+  const float MVSCALE_Y = argc > 7 ? float(atof(argv[7])) : MVSCALE_X;
   auto sq_x = [&](int f) { return X0 + f * STEP; };
   std::vector<uint32_t> img(W * H);
   auto draw = [&](int f) {
@@ -344,8 +348,8 @@ int main(int argc, char** argv) {
                             NVSDK_NGX_DLSSG_Parameter_ClipToLensClip, NVSDK_NGX_DLSSG_Parameter_ClipToPrevClip,
                             NVSDK_NGX_DLSSG_Parameter_PrevClipToClip})
         p.ptr(m, ident);
-      p.f(NVSDK_NGX_DLSSG_Parameter_MvecScaleX, 1.0f);
-      p.f(NVSDK_NGX_DLSSG_Parameter_MvecScaleY, 1.0f);
+      p.f(NVSDK_NGX_DLSSG_Parameter_MvecScaleX, MVSCALE_X);
+      p.f(NVSDK_NGX_DLSSG_Parameter_MvecScaleY, MVSCALE_Y);
       p.f(NVSDK_NGX_DLSSG_Parameter_CameraUpY, 1.0f);
       p.f(NVSDK_NGX_DLSSG_Parameter_CameraRightX, 1.0f);
       p.f(NVSDK_NGX_DLSSG_Parameter_CameraFwdZ, 1.0f);

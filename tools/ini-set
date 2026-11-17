@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# ini-set <instance> section.key=value ...
+# Edits the running instance's live aco_dlss.ini (most settings are reloaded within ~1 s).
+set -euo pipefail
+name=$1; shift
+ini="/home/ajg/Games/aco-dlss-instances/$name/prefix/drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher/games/Assassin's Creed Origins/aco_dlss.ini"
+for kv in "$@"; do
+  sec=${kv%%.*}; rest=${kv#*.}; key=${rest%%=*}; val=${rest#*=}
+  python3 -I - "$ini" "$sec" "$key" "$val" <<'PY'
+import sys
+p, sec, key, val = sys.argv[1:]
+lines = open(p).read().split("\n"); cur = None; done = False
+for i, l in enumerate(lines):
+    s = l.strip()
+    if s.startswith("["): cur = s[1:-1]
+    elif cur == sec and s.split("=")[0] == key: lines[i] = f"{key}={val}"; done = True
+if not done: sys.exit(f"no {sec}.{key} in {p}")
+open(p, "w").write("\n".join(lines))
+PY
+done

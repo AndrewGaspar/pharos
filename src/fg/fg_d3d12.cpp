@@ -92,7 +92,15 @@ struct State {
   ID3D12Device* d12 = nullptr;
   ID3D12CommandQueue* q = nullptr;
   ID3D12Fence* fence12 = nullptr;
-  UINT64 fence_value = 0;
+  UINT64 fence_value = 0;  // fence11/fence12: signaled by D3D11 only (inputs copied)
+  // Signaled by D3D12 only (evaluation done). Two queues must never signal the same fence: with one
+  // shared fence for both directions, D3D11's signal for the next frame's inputs (a higher value) could
+  // land before D3D12's signal for this frame's evaluation, so "evaluation done" read as complete
+  // early (the generated frame was presented before DLSS-G had written it: stale content from two
+  // frames back), and the D3D12 signal then moved the timeline backwards.
+  ID3D12Fence* done12 = nullptr;
+  ID3D11Fence* done11 = nullptr;  // the same fence opened in D3D11 (sync=gpu / feature creation)
+  UINT64 done_value = 0;
   HANDLE fence_event = nullptr;
   ID3D12CommandAllocator* alloc[kRing] = {};
   UINT64 slot_value[kRing] = {};
@@ -206,8 +214,8 @@ bool make_shared(Shared& s, UINT w, UINT h, DXGI_FORMAT fmt, bool uav) {
 }
 
 void wait_d3d12(UINT64 v) {
-  if (S.fence12->GetCompletedValue() >= v) return;
-  S.fence12->SetEventOnCompletion(v, S.fence_event);
+  if (S.done12->GetCompletedValue() >= v) return;
+  S.done12->SetEventOnCompletion(v, S.fence_event);
   WaitForSingleObject(S.fence_event, 2000);
 }
 
@@ -217,7 +225,7 @@ template <typename F>
 bool submit(F&& record, bool cpu_wait) {
   int slot = S.ring;
   S.ring = (S.ring + 1) % kRing;
-  if (S.fence12->GetCompletedValue() < S.slot_value[slot]) {
+  if (S.done12->GetCompletedValue() < S.slot_value[slot]) {
     ++S.perf_cpu_waits;
     wait_d3d12(S.slot_value[slot]);
   }
@@ -247,23 +255,23 @@ bool submit(F&& record, bool cpu_wait) {
   S.q->Wait(S.fence12, v_in);
   ID3D12CommandList* lists[] = {S.cl};
   S.q->ExecuteCommandLists(1, lists);
-  UINT64 v_out = ++S.fence_value;
-  S.q->Signal(S.fence12, v_out);
+  UINT64 v_out = ++S.done_value;
+  S.q->Signal(S.done12, v_out);
   S.slot_value[slot] = v_out;
   S.eval_v = v_out;
   // D3D12 -> D3D11. sync=gpu: later context work waits on the GPU (vkd3d-proton resolves the D3D12
   // side's wait on the shared fence on the CPU, so this stalls the D3D11 queue on a CPU round trip).
   // sync=cpu: whoever copies the output out first waits on the CPU (wait_eval).
-  if (cpu_wait || config().fg_sync == "gpu") S.imm->Wait(S.fence11, v_out);
+  if ((cpu_wait || config().fg_sync == "gpu") && S.done11) S.imm->Wait(S.done11, v_out);
   if (cpu_wait) wait_d3d12(v_out);
   return ok;
 }
 
 // CPU wait for a D3D12 fence value with a caller-owned event; false on timeout.
 bool wait_eval(UINT64 v, HANDLE event, DWORD timeout_ms) {
-  if (!v || S.fence12->GetCompletedValue() >= v) return true;
-  S.fence12->SetEventOnCompletion(v, event);
-  return WaitForSingleObject(event, timeout_ms) == WAIT_OBJECT_0 || S.fence12->GetCompletedValue() >= v;
+  if (!v || S.done12->GetCompletedValue() >= v) return true;
+  S.done12->SetEventOnCompletion(v, event);
+  return WaitForSingleObject(event, timeout_ms) == WAIT_OBJECT_0 || S.done12->GetCompletedValue() >= v;
 }
 
 void swap_sets() {
@@ -336,6 +344,19 @@ bool init(ID3D11Device* dev) {
     ACO_LOG("fg12: shared fence -> 0x%08lx", hr);
     return false;
   }
+  // The completion fence: created by D3D12, also opened in D3D11 (only needed for GPU-side waits).
+  hr = S.d12->CreateFence(0, D3D12_FENCE_FLAG_SHARED, __uuidof(ID3D12Fence), reinterpret_cast<void**>(&S.done12));
+  if (FAILED(hr)) {
+    ACO_LOG("fg12: completion fence -> 0x%08lx", hr);
+    return false;
+  }
+  fh = nullptr;
+  if (SUCCEEDED(S.d12->CreateSharedHandle(S.done12, nullptr, GENERIC_ALL, nullptr, &fh)) && fh) {
+    if (FAILED(S.dev->OpenSharedFence(fh, __uuidof(ID3D11Fence), reinterpret_cast<void**>(&S.done11)))) S.done11 = nullptr;
+    CloseHandle(fh);
+  }
+  ACO_LOG("fg12: fences: inputs (D3D11 -> D3D12) shared, completion (D3D12) %s in D3D11",
+          S.done11 ? "also opened" : "NOT opened (sync=gpu unavailable)");
   S.fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
   S.game_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 
@@ -403,7 +424,7 @@ bool ensure_feature(uint32_t w, uint32_t h, uint32_t rw, uint32_t rh, DXGI_FORMA
       S.feat_count == count)
     return true;
   if (S.feature) {
-    wait_d3d12(S.fence_value);
+    wait_d3d12(S.done_value);
     S.release(S.feature);
     S.feature = nullptr;
   }
@@ -494,6 +515,122 @@ bool copy_in(Shared& s, ID3D11Resource* src) {
   return true;
 }
 
+// ---- Camera for DLSS-G ([fg] camera=engine) ---------------------------------------------------
+// The engine's matrices are column-vector (v' = M v); DLSS-G wants row-major for post-multiplication
+// (v' = v M), i.e. the transpose. DLSS-G wants them without TAA jitter.
+struct M4 {
+  double m[4][4] = {};
+  static M4 id() {
+    M4 r;
+    for (int i = 0; i < 4; ++i) r.m[i][i] = 1;
+    return r;
+  }
+};
+M4 mul(const M4& a, const M4& b) {
+  M4 r;
+  for (int i = 0; i < 4; ++i)
+    for (int j = 0; j < 4; ++j)
+      for (int k = 0; k < 4; ++k) r.m[i][j] += a.m[i][k] * b.m[k][j];
+  return r;
+}
+bool inverse(const M4& a, M4& out) {
+  double t[4][8];
+  for (int i = 0; i < 4; ++i)
+    for (int j = 0; j < 8; ++j) t[i][j] = j < 4 ? a.m[i][j] : (j - 4 == i ? 1 : 0);
+  for (int c = 0; c < 4; ++c) {
+    int p = c;
+    for (int r = c + 1; r < 4; ++r)
+      if (std::fabs(t[r][c]) > std::fabs(t[p][c])) p = r;
+    if (std::fabs(t[p][c]) < 1e-30) return false;
+    if (p != c)
+      for (int j = 0; j < 8; ++j) std::swap(t[p][j], t[c][j]);
+    double d = t[c][c];
+    for (int j = 0; j < 8; ++j) t[c][j] /= d;
+    for (int r = 0; r < 4; ++r)
+      if (r != c) {
+        double f = t[r][c];
+        for (int j = 0; j < 8; ++j) t[r][j] -= f * t[c][j];
+      }
+  }
+  for (int i = 0; i < 4; ++i)
+    for (int j = 0; j < 4; ++j) out.m[i][j] = t[i][j + 4];
+  return true;
+}
+void store_t(const M4& a, float out[16]) {  // transpose into DLSS-G's row-vector layout
+  for (int i = 0; i < 4; ++i)
+    for (int j = 0; j < 4; ++j) out[i * 4 + j] = float(a.m[j][i]);
+}
+
+struct CamOut {
+  bool ok = false;
+  float view_to_clip[16], clip_to_view[16], clip_to_prev[16], prev_to_clip[16];
+  float pos[3], up[3], right[3], fwd[3];
+  float near_z = 0.1f, far_z = 1e5f, fov = 1.0f, aspect = 1.6f;
+  double jit_ndc[2] = {};  // jitter found in the projection (NDC units)
+};
+
+CamOut camera_from(const FgCamera& c, const Config& cfg) {
+  CamOut o;
+  if (!c.valid) return o;
+  M4 c2v, v2w = M4::id(), pvp;
+  for (int i = 0; i < 4; ++i)
+    for (int j = 0; j < 4; ++j) {
+      c2v.m[i][j] = c.clip_to_view[i][j];
+      pvp.m[i][j] = c.prev_view_proj[i][j];
+      if (i < 3) v2w.m[i][j] = c.view_to_world[i][j];
+    }
+  M4 proj;
+  if (!inverse(c2v, proj)) return o;
+  // View space looks down -z (w = -z): a TAA jitter in the projection shows up as proj[0][2],
+  // proj[1][2] (x_ndc = ... - proj[0][2]). Remove it from the current-frame matrices.
+  M4 proj_u = proj, c2v_u = c2v, jcur = M4::id();
+  o.jit_ndc[0] = -proj.m[0][2];
+  o.jit_ndc[1] = -proj.m[1][2];
+  if (cfg.fg_camera_unjitter) {
+    proj_u.m[0][2] = proj_u.m[1][2] = 0;
+    if (!inverse(proj_u, c2v_u)) return o;
+    // jittered clip = J * unjittered clip (x_j = x_u + jit * w)
+    jcur.m[0][3] = o.jit_ndc[0];
+    jcur.m[1][3] = o.jit_ndc[1];
+  }
+  M4 c2p = mul(pvp, mul(v2w, mul(c2v, jcur)));  // unjittered current clip -> previous clip
+  M4 p2c;
+  if (!inverse(c2p, p2c)) return o;
+  store_t(proj_u, o.view_to_clip);
+  store_t(c2v_u, o.clip_to_view);
+  store_t(c2p, o.clip_to_prev);
+  store_t(p2c, o.prev_to_clip);
+  auto norm = [](float v[3]) {
+    float l = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    if (l > 0)
+      for (int i = 0; i < 3; ++i) v[i] /= l;
+  };
+  for (int i = 0; i < 3; ++i) {
+    o.right[i] = float(v2w.m[i][0]);
+    o.up[i] = float(v2w.m[i][1]);
+    o.fwd[i] = float(-v2w.m[i][2]);
+    o.pos[i] = float(v2w.m[i][3]);
+  }
+  norm(o.right);
+  norm(o.up);
+  norm(o.fwd);
+  // Near/far from the unjittered projection: view z where NDC depth is 1 (near, reversed Z) and 0.
+  auto view_z = [&](double d) {
+    double w = c2v_u.m[3][2] * d + c2v_u.m[3][3];
+    double z = c2v_u.m[2][2] * d + c2v_u.m[2][3];
+    return std::fabs(w) > 1e-30 ? -z / w : 1e30;
+  };
+  o.near_z = float(std::min(view_z(1.0), view_z(0.0)));
+  double f = std::max(view_z(1.0), view_z(0.0));
+  o.far_z = float(std::isfinite(f) && f < 1e7 ? f : 1e7);
+  if (proj_u.m[1][1] != 0 && proj_u.m[0][0] != 0) {
+    o.fov = float(2.0 * std::atan(1.0 / std::fabs(proj_u.m[1][1])));
+    o.aspect = float(std::fabs(proj_u.m[1][1] / proj_u.m[0][0]));
+  }
+  o.ok = std::isfinite(o.near_z) && o.near_z > 0;
+  return o;
+}
+
 void gen_fail(const char* why) {
   static int n = 0;
   if (n++ < 10) ACO_LOG("fg12: generate failed: %s", why);
@@ -530,28 +667,57 @@ bool generate(const FgInputs& in, ID3D11Texture2D* bb) {
     p.set(NVSDK_NGX_DLSSG_Parameter_OutputRealSubrectWidth, S.tex_w);
     p.set(NVSDK_NGX_DLSSG_Parameter_OutputRealSubrectHeight, S.tex_h);
   }
-  for (const char* m : {NVSDK_NGX_DLSSG_Parameter_CameraViewToClip, NVSDK_NGX_DLSSG_Parameter_ClipToCameraView,
-                        NVSDK_NGX_DLSSG_Parameter_ClipToLensClip, NVSDK_NGX_DLSSG_Parameter_ClipToPrevClip,
-                        NVSDK_NGX_DLSSG_Parameter_PrevClipToClip})
-    p.set(m, const_cast<void*>(static_cast<const void*>(kIdentity)));
-  // Our motion vectors are in UV units (1 = full screen) = DLSS-G's normalized space.
-  p.set(NVSDK_NGX_DLSSG_Parameter_MvecScaleX, cfg.fg_mv_scale);
-  p.set(NVSDK_NGX_DLSSG_Parameter_MvecScaleY, cfg.fg_mv_scale);
+  // Camera: the engine's matrices ([fg] camera=engine) or identity + a synthetic basis.
+  static CamOut cam;
+  cam = cfg.fg_camera == "engine" ? camera_from(in.cam, cfg) : CamOut{};
+  if (cam.ok) {
+    p.set(NVSDK_NGX_DLSSG_Parameter_CameraViewToClip, static_cast<void*>(cam.view_to_clip));
+    p.set(NVSDK_NGX_DLSSG_Parameter_ClipToCameraView, static_cast<void*>(cam.clip_to_view));
+    p.set(NVSDK_NGX_DLSSG_Parameter_ClipToPrevClip, static_cast<void*>(cam.clip_to_prev));
+    p.set(NVSDK_NGX_DLSSG_Parameter_PrevClipToClip, static_cast<void*>(cam.prev_to_clip));
+    p.set(NVSDK_NGX_DLSSG_Parameter_ClipToLensClip, const_cast<void*>(static_cast<const void*>(kIdentity)));
+  } else {
+    for (const char* m : {NVSDK_NGX_DLSSG_Parameter_CameraViewToClip, NVSDK_NGX_DLSSG_Parameter_ClipToCameraView,
+                          NVSDK_NGX_DLSSG_Parameter_ClipToLensClip, NVSDK_NGX_DLSSG_Parameter_ClipToPrevClip,
+                          NVSDK_NGX_DLSSG_Parameter_PrevClipToClip})
+      p.set(m, const_cast<void*>(static_cast<const void*>(kIdentity)));
+    // A valid (if synthetic) camera frame: an all-zero basis is "not a valid frame" for DLSS-G.
+    cam.pos[0] = cam.pos[1] = cam.pos[2] = 0;
+    cam.up[0] = 0, cam.up[1] = 1, cam.up[2] = 0;
+    cam.right[0] = 1, cam.right[1] = 0, cam.right[2] = 0;
+    cam.fwd[0] = 0, cam.fwd[1] = 0, cam.fwd[2] = 1;
+    cam.near_z = 0.1f, cam.far_z = 100000.0f, cam.fov = 1.0f, cam.aspect = float(S.tex_w) / float(S.tex_h);
+  }
+  {
+    static int64_t last = 0;
+    if (cfg.fg_camera == "engine" && now_us() - last > 10000000) {
+      last = now_us();
+      ACO_LOG("fg12: camera %s: pos %.2f %.2f %.2f fwd %.3f %.3f %.3f near %.3f far %.0f fov %.1f deg aspect %.3f; "
+              "projection jitter %.3f,%.3f px vs engine jitter %.3f,%.3f px; clip->prev diag %.4f %.4f t %.5f %.5f",
+              cam.ok ? "engine" : (in.cam.valid ? "INVALID" : "not read yet"), cam.pos[0], cam.pos[1], cam.pos[2],
+              cam.fwd[0], cam.fwd[1], cam.fwd[2], cam.near_z, cam.far_z, cam.fov * 57.2958f, cam.aspect,
+              cam.jit_ndc[0] * in.render_w / 2, -cam.jit_ndc[1] * in.render_h / 2, in.jitter_x, in.jitter_y,
+              cam.clip_to_prev[0], cam.clip_to_prev[5], cam.clip_to_prev[12], cam.clip_to_prev[13]);
+    }
+  }
+  // Our motion vectors are in UV units (1 = full screen); [fg] mv_units=px scales them to render pixels.
+  const bool mv_px = cfg.fg_mv_units == "px";
+  p.set(NVSDK_NGX_DLSSG_Parameter_MvecScaleX, cfg.fg_mv_scale * (mv_px ? float(in.render_w) : 1.0f));
+  p.set(NVSDK_NGX_DLSSG_Parameter_MvecScaleY, cfg.fg_mv_scale * (mv_px ? float(in.render_h) : 1.0f));
   p.set(NVSDK_NGX_DLSSG_Parameter_JitterOffsetX, in.jitter_x);
   p.set(NVSDK_NGX_DLSSG_Parameter_JitterOffsetY, in.jitter_y);
-  // A valid (if synthetic) camera frame: an all-zero basis is "not a valid frame" for DLSS-G.
-  p.set(NVSDK_NGX_DLSSG_Parameter_CameraPosX, 0.0f);
-  p.set(NVSDK_NGX_DLSSG_Parameter_CameraPosY, 0.0f);
-  p.set(NVSDK_NGX_DLSSG_Parameter_CameraPosZ, 0.0f);
-  p.set(NVSDK_NGX_DLSSG_Parameter_CameraUpX, 0.0f);
-  p.set(NVSDK_NGX_DLSSG_Parameter_CameraUpY, 1.0f);
-  p.set(NVSDK_NGX_DLSSG_Parameter_CameraUpZ, 0.0f);
-  p.set(NVSDK_NGX_DLSSG_Parameter_CameraRightX, 1.0f);
-  p.set(NVSDK_NGX_DLSSG_Parameter_CameraRightY, 0.0f);
-  p.set(NVSDK_NGX_DLSSG_Parameter_CameraRightZ, 0.0f);
-  p.set(NVSDK_NGX_DLSSG_Parameter_CameraFwdX, 0.0f);
-  p.set(NVSDK_NGX_DLSSG_Parameter_CameraFwdY, 0.0f);
-  p.set(NVSDK_NGX_DLSSG_Parameter_CameraFwdZ, 1.0f);
+  p.set(NVSDK_NGX_DLSSG_Parameter_CameraPosX, cam.pos[0]);
+  p.set(NVSDK_NGX_DLSSG_Parameter_CameraPosY, cam.pos[1]);
+  p.set(NVSDK_NGX_DLSSG_Parameter_CameraPosZ, cam.pos[2]);
+  p.set(NVSDK_NGX_DLSSG_Parameter_CameraUpX, cam.up[0]);
+  p.set(NVSDK_NGX_DLSSG_Parameter_CameraUpY, cam.up[1]);
+  p.set(NVSDK_NGX_DLSSG_Parameter_CameraUpZ, cam.up[2]);
+  p.set(NVSDK_NGX_DLSSG_Parameter_CameraRightX, cam.right[0]);
+  p.set(NVSDK_NGX_DLSSG_Parameter_CameraRightY, cam.right[1]);
+  p.set(NVSDK_NGX_DLSSG_Parameter_CameraRightZ, cam.right[2]);
+  p.set(NVSDK_NGX_DLSSG_Parameter_CameraFwdX, cam.fwd[0]);
+  p.set(NVSDK_NGX_DLSSG_Parameter_CameraFwdY, cam.fwd[1]);
+  p.set(NVSDK_NGX_DLSSG_Parameter_CameraFwdZ, cam.fwd[2]);
   p.set(NVSDK_NGX_DLSSG_Parameter_CameraPinholeOffsetX, 0.0f);
   p.set(NVSDK_NGX_DLSSG_Parameter_CameraPinholeOffsetY, 0.0f);
   // Invalid-MV marker: not 0 (that would mark every static pixel invalid); Streamline uses FLT_MIN.
@@ -561,10 +727,10 @@ bool generate(const FgInputs& in, ID3D11Texture2D* bb) {
   p.set(NVSDK_NGX_DLSSG_Parameter_AutomodeOverrideReset, 0u);
   p.set(NVSDK_NGX_DLSSG_Parameter_BackbufferFrameID, ++S.backbuffer_id);
   if (cfg.fg_refresh_hz > 0) p.set("DLSSG.RefreshRate", cfg.fg_refresh_hz);
-  p.set(NVSDK_NGX_DLSSG_Parameter_CameraNear, 0.1f);
-  p.set(NVSDK_NGX_DLSSG_Parameter_CameraFar, 100000.0f);
-  p.set(NVSDK_NGX_DLSSG_Parameter_CameraFOV, 1.0f);
-  p.set(NVSDK_NGX_DLSSG_Parameter_CameraAspectRatio, float(S.tex_w) / float(S.tex_h));
+  p.set(NVSDK_NGX_DLSSG_Parameter_CameraNear, cam.near_z);
+  p.set(NVSDK_NGX_DLSSG_Parameter_CameraFar, cam.far_z);
+  p.set(NVSDK_NGX_DLSSG_Parameter_CameraFOV, cam.fov);
+  p.set(NVSDK_NGX_DLSSG_Parameter_CameraAspectRatio, cam.aspect);
   p.set(NVSDK_NGX_DLSSG_Parameter_ColorBuffersHDR, 0u);
   p.set(NVSDK_NGX_DLSSG_Parameter_DepthInverted, 1u);
   p.set(NVSDK_NGX_DLSSG_Parameter_CameraMotionIncluded, 1u);
@@ -725,6 +891,57 @@ void fill(ID3D11Texture2D* dst, bool generated_slot, const std::string& show, ID
   S.imm->CopyResource(dst, src);
 }
 
+// ---- Present trace (`touch <out>/fgtrace-start`) -------------------------------------------------------
+// For frame-pacing analysis: the next [fg] trace_presents presents get timestamps (game Present
+// arrival, our Present call and its return, QPC us) and the first [fg] trace_shots of them a copy
+// of a horizontal band of exactly what was presented, in present order. Written to
+// <out>/fgtrace/{presents.csv,bands.bin} once complete; tools/fg-pacing analyses them.
+struct TraceEv {
+  int64_t arrive, call, ret;
+  uint64_t frame;
+  char kind;  // N normal (FG off / not ready), G generated, R real
+  int32_t half_us, interval_us, shot;
+};
+struct Tracer {
+  std::mutex m;
+  std::atomic<bool> active{false};
+  bool complete = false;
+  std::vector<TraceEv> ev;
+  size_t max_ev = 0;
+  std::vector<ID3D11Texture2D*> stage;
+  size_t shots = 0;
+  UINT w = 0, h = 0, y0 = 0;
+  DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
+  int64_t last_check = 0;
+} T;
+
+// Game thread: start a trace when <out>/fgtrace appears; write it out once complete.
+void trace_poll(ID3D11Texture2D* bb);
+
+// Before a Present: claims an event slot and copies the band of `bb` (what is about to be presented).
+int trace_begin(char kind, uint64_t frame, int64_t arrive, int64_t half_us, ID3D11Texture2D* bb,
+                ID3D11DeviceContext* ctx) {
+  if (!T.active.load(std::memory_order_relaxed)) return -1;
+  std::lock_guard<std::mutex> lk(T.m);
+  if (T.complete || T.ev.size() >= T.max_ev) return -1;
+  TraceEv e{arrive, now_us(), 0, frame, kind, int32_t(half_us), int32_t(S.frame_interval_us), -1};
+  if (T.shots < T.stage.size() && bb) {
+    D3D11_BOX box{0, T.y0, 0, T.w, T.y0 + T.h, 1};
+    ctx->CopySubresourceRegion(T.stage[T.shots], 0, 0, 0, 0, bb, 0, &box);
+    e.shot = int32_t(T.shots++);
+    e.call = now_us();
+  }
+  T.ev.push_back(e);
+  return int(T.ev.size() - 1);
+}
+
+void trace_end(int idx) {
+  if (idx < 0) return;
+  std::lock_guard<std::mutex> lk(T.m);
+  T.ev[size_t(idx)].ret = now_us();
+  if (T.ev.size() >= T.max_ev) T.complete = true;
+}
+
 // ---- Present thread and proxy backbuffer ([fg] present_thread=1) ---------------------------------
 // The game renders into a backbuffer of ours (GetBuffer returns it); the swapchain's own backbuffer
 // is only written right before each real Present, here or on the present thread. That lets the
@@ -765,6 +982,7 @@ struct Presenter {
   // backbuffer (includes waiting for the D3D11 context lock), the real IDXGISwapChain::Present call,
   // the pacing wait - for the generated (g) and real (r) present.
   std::atomic<int64_t> seg_us[6] = {};  // pickup, fill_g, present_g, wait, fill_r, present_r
+  int64_t last_real_call = 0;  // present thread: when the last real Present was called
 } P;
 
 ID3D11Texture2D* real_backbuffer(IDXGISwapChain* sc) {
@@ -787,6 +1005,9 @@ struct Job {
   std::string show;
   bool gate = true;
   bool skip_gen = false;    // superseded before it started: present only the real frame
+  uint64_t frame = 0;       // BackbufferFrameID of this job's evaluation (trace)
+  int pace = 0;             // [fg] pace: 0 ready, 1 smooth, 2 arrival
+  double relax = 0.5;       // [fg] pace_relax
 };
 std::deque<Job> g_jobs;  // guarded by P.m
 int g_active = 0;        // jobs being processed (0/1), guarded by P.m
@@ -808,27 +1029,52 @@ void present_loop() {
     bool gen_ready = !j.skip_gen && wait_eval(j.wait_value, event, 100);
     if (!gen_ready) ++P.gen_dropped;
     t0 = now_us();
+    // Pacing of the generated present ([fg] pace). ready: as soon as DLSS-G is done. smooth: not
+    // sooner than half an interval after the previous real present, minus a share ([fg] pace_relax)
+    // of how early DLSS-G finished relative to that, so a delay never sticks. arrival: at a fixed
+    // lag after the game's Present (lag = recent maximum of DLSS-G ready - arrival), i.e. locked to
+    // the game's own frame cadence.
+    if (gen_ready && j.half_us > 0) {
+      static int64_t lag_us = 0;
+      int64_t ready_lag = t0 - j.arrive_us;
+      lag_us = ready_lag > lag_us ? ready_lag : lag_us - (lag_us - ready_lag) / 64;
+      int64_t target = 0;
+      if (j.pace == 1 && P.last_real_call)
+        target = P.last_real_call + j.half_us - int64_t(j.relax * double(P.last_real_call + j.half_us - t0));
+      else if (j.pace == 2)
+        target = j.arrive_us + lag_us;
+      if (target > t0 && target - t0 < 2 * j.half_us) wait_until(target);
+    }
+    t0 = t1 = t2 = now_us();
     if (gen_ready) {
       if (ID3D11Texture2D* bb = real_backbuffer(j.sc)) {
         if (j.gate) g_ctx_gate.fetch_add(1);
         fill(bb, true, j.show, j.gen, j.real);
+        int ti = trace_begin('G', j.frame, j.arrive_us, j.half_us, bb, S.imm);
         bb->Release();
         t1 = now_us();
         hr = j.present(j.sc, j.sync, j.flags);
+        trace_end(ti);
         if (j.gate) g_ctx_gate.fetch_sub(1);
       }
     }
     int64_t t_gen = t2 = now_us();
-    if (gen_ready && j.half_us > 0) wait_until(t_gen + j.half_us);
+    // The real frame half an interval after the generated one: measured from when the generated
+    // Present was called (pace=smooth/arrival) - a Present that blocks must not push the real frame
+    // later (pace=ready, the original: from when it returned).
+    if (gen_ready && j.half_us > 0) wait_until((j.pace ? t1 : t_gen) + j.half_us);
     int64_t t_real = now_us(), t4 = t_real;
     if (j.show == "skip_present2") {
       // bisecting: no second present
     } else if (ID3D11Texture2D* bb = real_backbuffer(j.sc)) {
       if (j.gate) g_ctx_gate.fetch_add(1);
       fill(bb, false, j.show, j.gen, j.real);
+      int ti = trace_begin('R', j.frame, j.arrive_us, j.half_us, bb, S.imm);
       bb->Release();
       t4 = now_us();
+      P.last_real_call = t4;
       HRESULT h2 = j.present(j.sc, j.sync, j.flags);
+      trace_end(ti);
       if (j.gate) g_ctx_gate.fetch_sub(1);
       if (SUCCEEDED(hr)) hr = h2;
     }
@@ -875,6 +1121,9 @@ void enqueue(IDXGISwapChain* sc, PFN_RealPresent present, UINT sync, UINT flags,
   j.real = S.real;
   j.show = config().fg_skip == "present2" ? std::string("skip_present2") : show;
   j.gate = config().fg_present_gate;
+  j.frame = S.backbuffer_id;
+  j.pace = config().fg_pace == "smooth" ? 1 : config().fg_pace == "arrival" ? 2 : 0;
+  j.relax = config().fg_pace_relax;
   std::lock_guard<std::mutex> lk(P.m);
   // A job that hasn't started yet is late: its generated frame would only delay the real ones.
   for (Job& q : g_jobs) {
@@ -956,6 +1205,83 @@ void perf_join_report() {
   P.perf_join_ms = 0;
   P.perf_join_n = 0;
   last = now;
+}
+
+void trace_poll(ID3D11Texture2D* bb) {
+  const Config& cfg = config();
+  int64_t now = now_us();
+  if (!T.active) {
+    if (now - T.last_check < 250000) return;
+    T.last_check = now;
+    std::wstring trigger = out_dir() + L"\\fgtrace-start";
+    if (GetFileAttributesW(trigger.c_str()) == INVALID_FILE_ATTRIBUTES) return;
+    DeleteFileW(trigger.c_str());
+    D3D11_TEXTURE2D_DESC d;
+    bb->GetDesc(&d);
+    std::lock_guard<std::mutex> lk(T.m);
+    T.w = d.Width;
+    T.h = std::min<UINT>(d.Height / 16, 128);
+    T.y0 = d.Height * 9 / 32;  // above the player character in third person, below most of the sky
+    T.fmt = d.Format;
+    d.Height = T.h;
+    d.Usage = D3D11_USAGE_STAGING;
+    d.BindFlags = 0;
+    d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    d.MiscFlags = 0;
+    for (int i = 0; i < cfg.fg_trace_shots; ++i) {
+      ID3D11Texture2D* t = nullptr;
+      if (FAILED(S.dev ? S.dev->CreateTexture2D(&d, nullptr, &t) : E_FAIL)) break;
+      T.stage.push_back(t);
+    }
+    T.ev.clear();
+    T.ev.reserve(size_t(std::max(cfg.fg_trace_presents, 1)));
+    T.max_ev = size_t(std::max(cfg.fg_trace_presents, 1));
+    T.shots = 0;
+    T.complete = false;
+    T.active = true;
+    ACO_LOG("fg12: trace started (%zu presents, %zu band shots %ux%u at y=%u)", T.max_ev, T.stage.size(), T.w, T.h, T.y0);
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lk(T.m);
+    if (!T.complete) return;
+  }
+  join(0);
+  std::wstring dir = out_dir() + L"\\fgtrace";
+  CreateDirectoryW(dir.c_str(), nullptr);
+  if (FILE* f = _wfopen((dir + L"\\presents.csv").c_str(), L"w")) {
+    fprintf(f, "kind,frame,arrive_us,call_us,ret_us,half_us,interval_us,shot\n");
+    for (const TraceEv& e : T.ev)
+      fprintf(f, "%c,%llu,%lld,%lld,%lld,%d,%d,%d\n", e.kind, static_cast<unsigned long long>(e.frame),
+              static_cast<long long>(e.arrive), static_cast<long long>(e.call), static_cast<long long>(e.ret), e.half_us,
+              e.interval_us, e.shot);
+    fclose(f);
+  }
+  if (FILE* f = _wfopen((dir + L"\\bands.bin").c_str(), L"wb")) {
+    // Header: magic, width, height, count, bgra flag; then count * width * height * 4 bytes.
+    bool bgra = T.fmt == DXGI_FORMAT_B8G8R8A8_UNORM || T.fmt == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
+                T.fmt == DXGI_FORMAT_B8G8R8A8_TYPELESS;
+    uint32_t hdr[5] = {0x42474641u, T.w, T.h, uint32_t(T.shots), bgra ? 1u : 0u};
+    fwrite(hdr, sizeof(hdr), 1, f);
+    std::vector<uint8_t> row(size_t(T.w) * 4);
+    for (size_t i = 0; i < T.shots; ++i) {
+      D3D11_MAPPED_SUBRESOURCE m{};
+      if (FAILED(S.imm->Map(T.stage[i], 0, D3D11_MAP_READ, 0, &m))) {
+        std::fill(row.begin(), row.end(), 0);
+        for (UINT y = 0; y < T.h; ++y) fwrite(row.data(), 1, row.size(), f);
+        continue;
+      }
+      for (UINT y = 0; y < T.h; ++y) fwrite(static_cast<const uint8_t*>(m.pData) + size_t(y) * m.RowPitch, 1, row.size(), f);
+      S.imm->Unmap(T.stage[i], 0);
+    }
+    fclose(f);
+  }
+  ACO_LOG("fg12: trace written (%zu presents, %zu shots) to out/fgtrace", T.ev.size(), T.shots);
+  std::lock_guard<std::mutex> lk(T.m);
+  for (auto*& t : T.stage) safe_release(t);
+  T.stage.clear();
+  T.active = false;
+  T.complete = false;
 }
 
 } // namespace
@@ -1102,6 +1428,7 @@ bool fg12_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent rea
   }
   ID3D11Texture2D* bb = proxy ? P.proxy_bb : real_backbuffer(sc);
   if (proxy && bb) bb->AddRef();
+  if (proxy && bb) trace_poll(bb);
   if (have_in && bb) {
     if (in.frame != S.last_input_frame + 1) S.reset = true;
     S.last_input_frame = in.frame;
@@ -1114,7 +1441,7 @@ bool fg12_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent rea
         // Frames alternate between two texture sets; the one we're about to overwrite was last read
         // and written by the evaluation two frames ago (normally long done).
         swap_sets();
-        if (S.fence12->GetCompletedValue() < S.eval_v) {
+        if (S.done12->GetCompletedValue() < S.eval_v) {
           ++S.perf_cpu_waits;
           wait_eval(S.eval_v, S.game_event, 200);
         }
@@ -1163,11 +1490,14 @@ bool fg12_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent rea
   if (!done && proxy && bb) {
     // A normal present of the game's frame (after any queued FG presents).
     join(0);
+    int ti = -1;
     if (ID3D11Texture2D* swap_bb = real_backbuffer(sc)) {
       P.ctx->CopyResource(swap_bb, bb);
+      ti = trace_begin('N', frames, arrive, 0, swap_bb, P.ctx);
       swap_bb->Release();
     }
     *hr = real(sc, sync, flags);
+    trace_end(ti);
     done = true;
   }
   safe_release(bb);

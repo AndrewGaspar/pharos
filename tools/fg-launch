@@ -2,6 +2,7 @@
 # fg-launch <instance> [section.key=value ...]
 # Frame Generation dev loop: fresh game launch with build/mod plus ini overrides, waits until the
 # mod's Frame Generation is running (new log only), then drives the menus into Discovery Tour.
+# ACO_PROFILE=<tools/profiles name> picks the graphics profile (default ultra-high).
 set -euo pipefail
 name=$1; shift
 here=$(cd "$(dirname "$0")/.." && pwd)
@@ -23,6 +24,6 @@ PY
 done
 "$here/scripts/aco" kill-game "$name" >/dev/null 2>&1 || true
 rm -f "$I/out/aco_dlss.log" "$I"/out/nvngx*.log
-"$here/scripts/aco" game "$name" --mod "$mod" >/dev/null
+"$here/scripts/aco" game "$name" --mod "$mod" --profile "${ACO_PROFILE:-ultra-high}" >/dev/null
 rm -rf "$mod"
 "$here/scripts/aco-dt" "$name"

@@ -36,6 +36,17 @@ void upscaler_adjust_sampler(D3D11_SAMPLER_DESC* desc);
 
 // Inputs for DLSS Frame Generation, from the last DLSS job executed on the immediate context
 // (i.e. the frame about to be presented). Pointers are AddRef'd; the caller releases them.
+// The engine's camera for the frame (column-vector convention, rows as the shaders use them), read
+// from the TAA pass's constant buffers at record time: PassParams.viewToWorld (cb1[4..6]),
+// PassParams.RevProjParams.ClipXYZToViewPos (cb1[57..60]), InstanceParams.worldViewProjPrevFrame
+// (cb3[12..15]).
+struct FgCamera {
+  bool valid = false;
+  float view_to_world[3][4];
+  float clip_to_view[4][4];
+  float prev_view_proj[4][4];
+};
+
 struct FgInputs {
   ID3D11Texture2D* mv = nullptr;       // RG16F, render res, UV units, prev - cur
   ID3D11Resource* depth = nullptr;     // R32F raw reversed-Z device depth, render res
@@ -43,6 +54,7 @@ struct FgInputs {
   uint32_t render_w = 0, render_h = 0;
   float jitter_x = 0, jitter_y = 0;    // pixels
   uint64_t frame = 0;                  // upscaler frame counter at execution
+  FgCamera cam;
 };
 bool upscaler_fg_inputs(FgInputs* out);
 
