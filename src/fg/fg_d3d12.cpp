@@ -1245,7 +1245,7 @@ void perf_join_report() {
           "presented +%.2f ms, real +%.2f ms; generated frames dropped %u",
           P.perf_join_n, P.perf_join_n ? P.perf_join_ms / P.perf_join_n : 0.0, n ? dg / 1000.0 / n : 0.0,
           n ? dr / 1000.0 / n : 0.0, P.gen_dropped.exchange(0));
-  ACO_LOG("perf: fg12 completion check: %u of %u generated frames had the fence done before DLSS-G's end "
+  ACO_LOG("perf: fg12 completion check: %u of %u generated frames were about to be presented before DLSS-G's end "
           "timestamp (guard timeouts %u) [done_fence=%s ts_guard=%d]",
           P.gen_early.exchange(0), P.gen_checked.exchange(0), P.gen_early_timeout.exchange(0),
           S.priv12 && config().fg_done_fence == "private" ? "private" : "shared", config().fg_ts_guard ? 1 : 0);
