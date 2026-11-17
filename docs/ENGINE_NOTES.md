@@ -573,9 +573,8 @@ Found statically (headless Ghidra) and checked against a loaded story save (t1, 
   almost finished), not the per-spawner count alone. With maxSpawned clamped to 800 raw
   (`kMaxSafeSpawned`, npc.cpp) k=6 and k=10 ran 300 s clean (they froze within 25-265 s without
   it), but the spawn budget pressure then empties the 80-120 m band (k=10: 197 / 307 / 12 vs k=1
-  59 / 114 / 173): redistribution again. A fixed pool of about 1024 spawned characters (or their
-  animation / bulk / controller slots) is the likely limit; not located. So the across-the-board
-  gain tops out near 2.5x vanilla's ~360-400 spawned in a city.
+  59 / 114 / 173): redistribution again. The limit is the process's TLS indices: see
+  "Spawned-character limit" below (`[world] tls_extend` lifts it).
 - **GPU cost at the user's settings** (t1 2560x1600, DLSS Performance at render_scale 0.6,
   lod_distance 2, cloth render, npc_density 10, fixed camera at the Alexandria spawn anchor,
   `tools/npc-re/ab-user.sh`):
@@ -594,6 +593,79 @@ Found statically (headless Ghidra) and checked against a loaded story save (t1, 
   spawners that had grown past 128 units were skipped (fixed in f4209f1, snapshot up to 4096). At
   768x480 the game is CPU-bound (GPU 31-39%): k=2 costs 16% of the frame rate, almost all in the
   task threads (+46% CPU). Our hook is 0.04 ms per MetaAI update.
+
+### Spawned-character limit: TLS index exhaustion (the ~1000-character freeze)
+
+Found on frozen games (t3, `npc_units=6 npc_density=40` with the 800 clamp lifted, `roamer.sh`;
+froze at 994 and ~1150-1220 spawned) with `pestack.py`, `jobq.py`, `jobwhy.py` (below).
+
+- **What hangs.** The engine's frame is a job graph (scheduler RVA 0x4873e38; per-frame root jobs
+  `Engine::BeginFrame` at RVA 0x4873c18 and the engine graph at `[RVA 0x4c298b8] + 0x238`, built by
+  RVA 0x1617880). In the frozen game every queue is empty, seven task threads sleep in the worker
+  idle wait (RVA 0x8cd1a0 -> 0x675a40), and `EndEngineFrame` / `EndFrame` wait on prerequisites whose
+  only unfinished leaf is the parallel job **`KinoAfterSkeleton`** (state 2, one thread still inside).
+  That thread (TaskThread3) is the only one not idle: inside the job it is blocked in
+  `AcquireSRWLockExclusive` (engine write lock RVA 0x613a20, called from the Kino code at 0x71496a,
+  lock = `[obj + 0x30]`). The SRW lock word is `0x00020002`: **2 shared owners, 2 exclusive
+  waiters**, yet no thread references the lock on its stack. EngineWindowThread at 100% CPU is
+  normal (its message loop spins in every state).
+- **Why it is held.** Engine reader/writer lock (ctor RVA 0x60ebc0, dtor 0x60ef10): `{+0 SRWLOCK,
+  +8 int, +0xc owner thread id, +0x10 TLS index}`. The ctor stores `TlsAlloc()` at +0x10 for the
+  per-thread read-recursion count. Read lock (RVA 0x6139d0): `TlsGetValue(idx) == 0` ->
+  `AcquireSRWLockShared`, `TlsSetValue(idx, n + 1)`. Read unlock (RVA 0x617c20): `n = TlsGetValue -
+  1`; `ReleaseSRWLockShared` only when `n == 0`. When TlsAlloc fails the index is
+  `TLS_OUT_OF_INDEXES` (-1): TlsGetValue returns 0 and TlsSetValue fails, so every read lock takes the
+  SRW lock shared again and the unlock (0 - 1 = -1 != 0) never releases it. The first writer then
+  waits forever, the job never ends and neither does the frame. The frozen lock's +0x10 is
+  0xFFFFFFFF.
+- **Who takes the indices.** One lock per **Kino animation instance** (Ubisoft's animation runtime,
+  `KinoTrack`/`KinoExternalIdMap` code at RVA ~0x6b0000-0x760000): instance creation (virtual method
+  RVA 0x71a6d0, slot 122 of the vtable at 0x3582b40) -> 0x71a520 (0x280-byte object from a free
+  list) -> ctor 0x708c10 -> 0x7483e0 (0x70-byte object, lock at +0) -> 0x60ebc0. So one TLS index per
+  animated character (people, animals, mounts). The other 14 lock owners are global or rare
+  (`PhysicStats`, `SoftBodyStats`, `FXStarterComponent`, ...).
+- **The limit is the OS's.** A process has 64 TLS slots plus 1024 expansion slots (Windows and
+  Wine). In the frozen game: PEB `TlsBitmapBits` (PEB+0x80) 64/64 used, `TlsExpansionBitmapBits`
+  (PEB+0x240) 943/1024 (after spawned had dropped from its 1220 peak to 1154). The engine, DXVK,
+  NVIDIA and Wine use the first few dozen, so the first freeze lands at ~1000-1100 characters. It
+  does not depend on creation rate or spawner size, and nothing throws.
+- **No data knob.** The capacity is the process TLS table, not game data. What the game uses
+  instead: TlsAlloc/TlsGetValue/TlsSetValue/TlsFree through its private import table
+  (VMProtect-filled; the PE import directory's own IAT copies at 0xe164xxx / 0xdb92xxx are unused):
+  RVA **0x353a688 / 0x353a690 / 0x353a698 / 0x353a6a0**, holding kernel32's exports (~2100
+  TlsGetValue call sites).
+- **Fix: `[world] tls_extend=1`** (`src/core/tlsext.cpp`, default on). At the first Present it
+  checks that the game's four entries hold kernel32's exports. Swapping those entries does not
+  stick: the first try found them reverted to kernel32 after the world load (VMProtect refills
+  that table) and froze the same way. Wine's kernel32 exports are stubs (`lea rsp,[rsp]; jmp
+  [rip+x]`) that jump through kernel32's own import table to kernelbase. Those four kernel32 import
+  entries are swapped instead (`iat_hook`; a data write; no game or Wine code bytes change):
+  - Native indices (< 0x10000) take one compare and go straight on to kernelbase.
+  - TlsAlloc called from the game image (return address check) gets a virtual index (0x10000 + n,
+    up to 65536) once 64 or fewer native indices are free. Every other module only ever gets native
+    ones.
+  - Virtual values live per thread in a chunked table hung off one native slot. A generation
+    counter per index makes a freed and reused index read 0 in every thread, as on Windows.
+  - The 800 maxSpawned clamp in npc.cpp (`kMaxSafeSpawned`) applies only when tls_extend is off.
+  - The log says "tls: native TLS indices exhausted (...); handing out virtual ones" when it
+    engages, then reports native free / virtual in use every 10 s.
+- **Validation** (t3 768x480, FG off, story fixture, `npc_units=6 npc_density=40`, `roamer.sh`,
+  same setup that froze within 1.5-4.5 min three times, at 994 / ~1220 / 1250 spawned):
+  **no freeze in 9.5 minutes**.
+  - Spawned 870-1316, peak 1325; 7165 extras.
+  - Native TLS free 64-253 (the reserve held). 96-391 virtual indices in use: they follow the
+    characters as they spawn and despawn.
+  - No exceptions; 46-95 fps with t1 sharing the CPU.
+  - Not tested yet: long soaks, fast travel / world change, and where the next limit is (the
+    16.5k-units-per-world and 256-units-per-spawner freezes were seen with the old build; they may
+    or may not be the same cause).
+- Other candidates looked at and ruled out on the way: the task scheduler's queues grow
+  dynamically (Anvil arrays; 0x8c8b50); the "ATOM - Loading" thread has a fixed 1024-entry request
+  pool (RVA 0xde6050) but sat idle in its normal wait in both frozen games; the
+  `BulkWorldComponent` counters were fine at 1137 (k=6) in a run that did not freeze. The older
+  "Havok teardown" stacks of these freezes came from scanning stale stack memory (RVA 0x1316a4b is
+  an array resize, 0x2dafe30 returns a global). Use `pestack.py`, which starts at the live rsp
+  recovered from Wine's syscall frame.
 
 ### The Havok deadlock is a vanilla engine bug
 
@@ -632,3 +704,14 @@ the walker (229-353 spawned, cap 600), no hang.
   with the watchpoint armed leaves DR7 set and crashes the game on the next hit). In-process
   guard-page watching (PAGE_GUARD + single step) hangs the game under Wine and was removed.
 - `decomp.sh <rva> | @<rva inside a function>`: headless Ghidra decompile of the raw image dump.
+- Frozen-game tools (host-side reads; gdb only attaches, reads and detaches):
+  - `pestack.py` (gdb -batch -x, `WBASE`, optional `IMG`, `FRAME=1`): live PE call stack of every
+    thread. The PE rsp is recovered from Wine's syscall frame on the unix stack; scanning the whole
+    PE stack instead mixes in stale frames.
+  - `jobq.py`: engine job scheduler queues, task-thread sleep counts, and the busy jobs of the frame
+    graph with their prerequisites. `jobwhy.py <job>`: walks a job's unfinished prerequisites down
+    to the stuck leaf.
+- Static helpers on the image dump: `rel32.py` (all rel32 / `call [rip+x]` sites of many targets in
+  one pass), `callsite.py` (the call before a return address and its function), `fstart.py`,
+  `callargs.py` (immediates before each call), `ctorof.py` (TypeInfo records / tables using a
+  ctor), `rtti.py` (MSVC RTTI -> vtable).

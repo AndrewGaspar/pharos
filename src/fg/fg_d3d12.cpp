@@ -135,6 +135,11 @@ struct State {
   Shared alt_color, alt_depth, alt_mv, alt_hudless, alt_out;
   ID3D11Texture2D* alt_real = nullptr;
   UINT64 alt_eval_v = 0;
+  // [fg] sets=3: a third set (the oldest), so the present thread may run two frames behind before the
+  // game has to wait for it (join).
+  Shared alt2_color, alt2_depth, alt2_mv, alt2_hudless, alt2_out;
+  ID3D11Texture2D* alt2_real = nullptr;
+  UINT64 alt2_eval_v = 0;
   HANDLE game_event = nullptr;  // for CPU waits on the game thread (wait_d3d12 uses fence_event)
   uint32_t tex_w = 0, tex_h = 0;
   DXGI_FORMAT tex_fmt = DXGI_FORMAT_UNKNOWN;
@@ -299,6 +304,26 @@ bool wait_on(ID3D12Fence* f, UINT64 v, HANDLE event, DWORD timeout_ms) {
 bool wait_eval(UINT64 v, HANDLE event, DWORD timeout_ms) { return wait_on(wait_fence(), v, event, timeout_ms); }
 
 void swap_sets() {
+  if (config().fg_sets >= 3) {
+    // (cur, prev, oldest) -> (oldest, cur, prev): the oldest set becomes current.
+    std::swap(S.color, S.alt2_color);
+    std::swap(S.depth, S.alt2_depth);
+    std::swap(S.mv, S.alt2_mv);
+    std::swap(S.hudless, S.alt2_hudless);
+    std::swap(S.out, S.alt2_out);
+    std::swap(S.real, S.alt2_real);
+    std::swap(S.eval_v, S.alt2_eval_v);
+    // now (oldest, prev, cur): swap the last two
+    std::swap(S.alt_color, S.alt2_color);
+    std::swap(S.alt_depth, S.alt2_depth);
+    std::swap(S.alt_mv, S.alt2_mv);
+    std::swap(S.alt_hudless, S.alt2_hudless);
+    std::swap(S.alt_out, S.alt2_out);
+    std::swap(S.alt_real, S.alt2_real);
+    std::swap(S.alt_eval_v, S.alt2_eval_v);
+    // -> (oldest, cur, prev)
+    return;
+  }
   std::swap(S.color, S.alt_color);
   std::swap(S.depth, S.alt_depth);
   std::swap(S.mv, S.alt_mv);
@@ -492,9 +517,10 @@ bool ensure_feature(uint32_t w, uint32_t h, uint32_t rw, uint32_t rh, DXGI_FORMA
 
 bool ensure_textures(const D3D11_TEXTURE2D_DESC& bb) {
   DXGI_FORMAT f = storage_format(bb.Format);
-  if (S.real && S.alt_real && S.tex_w == bb.Width && S.tex_h == bb.Height && S.tex_fmt == f) return true;
+  if (S.real && S.alt_real && S.alt2_real && S.tex_w == bb.Width && S.tex_h == bb.Height && S.tex_fmt == f) return true;
   safe_release(S.real);
   safe_release(S.alt_real);
+  safe_release(S.alt2_real);
   S.tex_w = S.tex_h = 0;
   D3D11_TEXTURE2D_DESC d{};
   d.Width = bb.Width;
@@ -505,10 +531,12 @@ bool ensure_textures(const D3D11_TEXTURE2D_DESC& bb) {
   d.SampleDesc.Count = 1;
   d.Usage = D3D11_USAGE_DEFAULT;
   d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-  if (FAILED(S.dev->CreateTexture2D(&d, nullptr, &S.real)) || FAILED(S.dev->CreateTexture2D(&d, nullptr, &S.alt_real)))
+  if (FAILED(S.dev->CreateTexture2D(&d, nullptr, &S.real)) || FAILED(S.dev->CreateTexture2D(&d, nullptr, &S.alt_real)) ||
+      FAILED(S.dev->CreateTexture2D(&d, nullptr, &S.alt2_real)))
     return false;
   if (!make_shared(S.color, bb.Width, bb.Height, f, false) || !make_shared(S.out, bb.Width, bb.Height, f, true) ||
       !make_shared(S.alt_color, bb.Width, bb.Height, f, false) || !make_shared(S.alt_out, bb.Width, bb.Height, f, true) ||
+      !make_shared(S.alt2_color, bb.Width, bb.Height, f, false) || !make_shared(S.alt2_out, bb.Width, bb.Height, f, true) ||
       !make_shared(S.outreal, bb.Width, bb.Height, f, true) || !make_shared(S.scratch, bb.Width, bb.Height, f, true))
     return false;
   S.tex_w = bb.Width;
@@ -1012,6 +1040,9 @@ struct Presenter {
   // the pacing wait - for the generated (g) and real (r) present.
   std::atomic<int64_t> seg_us[6] = {};  // pickup, fill_g, present_g, wait, fill_r, present_r
   int64_t last_real_call = 0;  // present thread: when the last real Present was called
+  std::atomic<int64_t> ready_lag_sum{0};  // [fg] auto_cap inputs
+  std::atomic<uint32_t> ready_lag_n{0};
+  uint32_t cap_join_n = 0;
 } P;
 
 ID3D11Texture2D* real_backbuffer(IDXGISwapChain* sc) {
@@ -1037,6 +1068,7 @@ struct Job {
   uint64_t frame = 0;       // BackbufferFrameID of this job's evaluation (trace)
   int pace = 0;             // [fg] pace: 0 ready, 1 smooth, 2 arrival
   double relax = 0.5;       // [fg] pace_relax
+  int64_t dt_us = 0;        // game's frame interval before this frame (pace=content)
   int ts_slot = -1;         // ring slot of this job's evaluation (timestamp check), -1 = none
   UINT64 ts_old = 0;        // that slot's end timestamp before the evaluation
 };
@@ -1079,8 +1111,18 @@ void present_loop() {
     // of how early DLSS-G finished relative to that, so a delay never sticks. arrival: at a fixed
     // lag after the game's Present (lag = recent maximum of DLSS-G ready - arrival), i.e. locked to
     // the game's own frame cadence.
+    // content: both presents on the game's own timeline, a fixed lag L after it: the real frame at
+    // arrive(N) + L and the generated one (content halfway between N-1 and N) at arrive(N) + L - dt/2,
+    // with dt the *actual* interval since the previous game frame. Display time then follows content
+    // time even when the game's frame times vary (with VRR this is what makes motion smooth; an even
+    // present cadence over uneven content times makes the image speed up and slow down).
+    int64_t real_target = 0;
+    if (gen_ready) {  // auto cap: how long after the game's Present DLSS-G was done
+      P.ready_lag_sum += t0 - j.arrive_us;
+      ++P.ready_lag_n;
+    }
     if (gen_ready && j.half_us > 0) {
-      static int64_t lag_us = 0;
+      static int64_t lag_us = 0, lag_c = 0;
       int64_t ready_lag = t0 - j.arrive_us;
       lag_us = ready_lag > lag_us ? ready_lag : lag_us - (lag_us - ready_lag) / 64;
       int64_t target = 0;
@@ -1088,7 +1130,17 @@ void present_loop() {
         target = P.last_real_call + j.half_us - int64_t(j.relax * double(P.last_real_call + j.half_us - t0));
       else if (j.pace == 2)
         target = j.arrive_us + lag_us;
-      if (target > t0 && target - t0 < 2 * j.half_us) wait_until(target);
+      if (j.pace == 3) {
+        int64_t dt = j.dt_us > 0 ? j.dt_us : 2 * j.half_us;
+        dt = dt < 3000 ? 3000 : dt > 50000 ? 50000 : dt;
+        int64_t need = ready_lag + dt / 2;  // smallest L that has the generated frame ready in time
+        lag_c = need > lag_c ? need : lag_c - (lag_c - need) / 64;
+        target = j.arrive_us + lag_c - dt / 2;
+        real_target = j.arrive_us + lag_c;
+        if (target > t0 && target - t0 < 100000) wait_until(target);
+      } else if (target > t0 && target - t0 < 2 * j.half_us) {
+        wait_until(target);
+      }
     }
     t0 = t1 = t2 = now_us();
     if (gen_ready) {
@@ -1107,7 +1159,13 @@ void present_loop() {
     // The real frame half an interval after the generated one: measured from when the generated
     // Present was called (pace=smooth/arrival) - a Present that blocks must not push the real frame
     // later (pace=ready, the original: from when it returned).
-    if (gen_ready && j.half_us > 0) wait_until((j.pace ? t1 : t_gen) + j.half_us);
+    if (gen_ready && j.half_us > 0) {
+      if (j.pace == 3 && real_target > 0) {
+        if (real_target - now_us() < 100000) wait_until(real_target);
+      } else {
+        wait_until((j.pace ? t1 : t_gen) + j.half_us);
+      }
+    }
     int64_t t_real = now_us(), t4 = t_real;
     if (j.show == "skip_present2") {
       // bisecting: no second present
@@ -1149,6 +1207,71 @@ void join(size_t outstanding = 0) {
   P.cv.wait_for(lk, std::chrono::milliseconds(500), ok);
   P.perf_join_ms += (now_us() - t0) / 1000.0;
   ++P.perf_join_n;
+  ++P.cap_join_n;
+}
+
+// [fg] auto_cap: a real-frame-rate cap with headroom, found by feedback. Without headroom the GPU
+// queue fills (DLSS-G runs on a second device the game's Reflex doesn't account for), DLSS-G
+// finishes ~2 frames after the game's Present, the present thread falls behind and the game blocks
+// on it at irregular times: uneven game frame times = uneven motion, and ~10 ms more latency. With
+// headroom DLSS-G is done well within a frame. Every second: if DLSS-G finished later than
+// auto_cap_lag of a frame interval after the game's Present on average, or the game had to wait for
+// the present thread, the cap drops 4 %; if it finished within auto_cap_lag - 0.15 and the game
+// never waited, it rises 1 % (4 % when far below the target). Starts 2 s after FG starts, at 90 %
+// of the rate then.
+std::atomic<float> g_auto_cap{0};
+void auto_cap_update(bool fg_active) {
+  const Config& cfg = config();
+  static int64_t last = 0, since = 0;
+  static uint32_t frames = 0;
+  int64_t now = now_us();
+  ++frames;
+  if (!cfg.fg_auto_cap || !fg_active) {
+    g_auto_cap = 0;
+    last = since = 0;
+    return;
+  }
+  if (!since) since = now;
+  if (now - since < 2000000) return;  // let FG settle (and loading end) first
+  if (!last) {
+    last = now;
+    frames = 0;
+    P.ready_lag_sum = 0;
+    P.ready_lag_n = 0;
+    P.cap_join_n = 0;
+    return;
+  }
+  if (now - last < 1000000) return;
+  double secs = (now - last) / 1e6;
+  double fps = frames / secs;
+  uint32_t n = P.ready_lag_n.exchange(0);
+  double lag = n ? double(P.ready_lag_sum.exchange(0)) / n : 0;
+  uint32_t waits = P.cap_join_n;
+  P.cap_join_n = 0;
+  frames = 0;
+  last = now;
+  double interval = fps > 1 ? 1e6 / fps : 0;
+  double ratio = interval > 0 ? lag / interval : 0;
+  float cap = g_auto_cap.load();
+  if (cap <= 0) {
+    cap = static_cast<float>(fps * 0.9);
+  } else if (ratio > cfg.fg_auto_cap_lag || waits > fps * 0.02) {
+    cap = static_cast<float>(std::min<double>(cap, fps) * 0.96);
+  } else if (ratio < cfg.fg_auto_cap_lag - 0.35 && waits == 0) {
+    cap *= 1.04f;
+  } else if (ratio < cfg.fg_auto_cap_lag - 0.15 && waits == 0) {
+    cap *= 1.01f;
+  }
+  float lo = cfg.fg_auto_cap_min > 0 ? cfg.fg_auto_cap_min : 30.0f;
+  float hi = cfg.fg_auto_cap_max > 0 ? cfg.fg_auto_cap_max : 240.0f;
+  cap = std::max(lo, std::min(hi, cap));
+  static float logged = 0;
+  if (std::fabs(cap - logged) > 3.0f) {
+    ACO_LOG("fg12: auto cap %.1f fps (real %.1f fps, DLSS-G done %.1f ms = %.2f frames after the game's Present, game "
+            "waited %u times)", cap, fps, lag / 1000.0, ratio, waits);
+    logged = cap;
+  }
+  g_auto_cap = cap;
 }
 
 void enqueue(IDXGISwapChain* sc, PFN_RealPresent present, UINT sync, UINT flags, int64_t half, const std::string& show,
@@ -1169,7 +1292,11 @@ void enqueue(IDXGISwapChain* sc, PFN_RealPresent present, UINT sync, UINT flags,
   j.show = config().fg_skip == "present2" ? std::string("skip_present2") : show;
   j.gate = config().fg_present_gate;
   j.frame = S.backbuffer_id;
-  j.pace = config().fg_pace == "smooth" ? 1 : config().fg_pace == "arrival" ? 2 : 0;
+  const std::string& pm = config().fg_pace;
+  j.pace = pm == "smooth" ? 1 : pm == "arrival" ? 2 : pm == "content" ? 3 : 0;
+  static int64_t prev_arrive = 0;
+  j.dt_us = prev_arrive ? arrive - prev_arrive : 0;
+  prev_arrive = arrive;
   j.relax = config().fg_pace_relax;
   std::lock_guard<std::mutex> lk(P.m);
   // A job that hasn't started yet is late: its generated frame would only delay the real ones.
@@ -1411,6 +1538,8 @@ void fg12_before_resize() {
 
 bool fg12_proxy_active() { return P.proxy == 1; }
 
+float fg12_auto_cap() { return g_auto_cap.load(); }
+
 // Runtime Frame Generation on/off ([fg] toggle_key, default F9; initial state [fg] enabled). The
 // D3D12 device, NGX and the present thread stay alive while off; frames then go out like mode=off.
 bool g_fg_on = true;
@@ -1442,7 +1571,7 @@ bool fg12_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent rea
   int64_t arrive = now_us();
   // The previous frame's presents may still be running (they use the other texture set); the one
   // before must be done before we reuse its set.
-  if (proxy) join(cfg.fg_sync == "gpu" ? 0 : 1);
+  if (proxy) join(cfg.fg_sync == "gpu" ? 0 : cfg.fg_sets >= 3 ? 2 : 1);
 
   // NGX/D3D12 initialisation runs on its own thread; presents stay normal until it is ready.
   update_toggle();
@@ -1509,6 +1638,7 @@ bool fg12_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent rea
           S.verify_pending = 4;
         }
         int64_t half = cfg.fg_pacing && S.frame_interval_us > 0 ? static_cast<int64_t>(S.frame_interval_us / 2) : 0;
+        if (half > 25000) half = 25000;  // never hold a real frame more than 25 ms
         if (proxy && config().fg_present_thread == 1) {
           // Both presents (generated now, real half a frame later) on the present thread.
           enqueue(sc, real, sync, flags, half, cfg.fg_show, arrive);
@@ -1553,15 +1683,25 @@ bool fg12_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent rea
   }
   safe_release(bb);
   if (!done) return false;
-  if (!have_in) return true;
+  if (!have_in) {
+    // No Frame Generation for this frame (toggled off, menus, loading): the next FG frame's interval
+    // must not span the gap. (It did: after e.g. 30 s with FG off the EMA jumped to ~3 s, the real
+    // present then waited half of that and the game, blocked in join, ran at 2 fps for half a minute
+    // while the EMA decayed - also after every menu or loading screen.)
+    S.last_real_present = 0;
+    auto_cap_update(false);
+    return true;
+  }
 
   // Real-frame interval from the game's arrivals here (with the present thread, not inflated by our
-  // own pacing wait).
+  // own pacing wait). A hitch counts at most 2.5x the current interval.
   if (S.last_real_present) {
     double dt = double(arrive - S.last_real_present);
-    S.frame_interval_us = S.frame_interval_us > 0 ? S.frame_interval_us * 0.9 + dt * 0.1 : dt;
+    if (S.frame_interval_us > 0 && dt > 2.5 * S.frame_interval_us) dt = 2.5 * S.frame_interval_us;
+    S.frame_interval_us = S.frame_interval_us > 0 ? S.frame_interval_us * 0.9 + dt * 0.1 : std::min(dt, 50000.0);
   }
   S.last_real_present = arrive;
+  auto_cap_update(true);
   ++S.perf_real;
   perf_report();
   if (proxy) perf_join_report();

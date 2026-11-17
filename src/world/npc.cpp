@@ -13,6 +13,7 @@
 
 #include "core/config.h"
 #include "core/log.h"
+#include "core/tlsext.h"
 
 namespace aco {
 
@@ -270,14 +271,17 @@ void npc_on_present() {
   }
   k = std::clamp(k, 0.1f, 100.0f);
   uint32_t want = static_cast<uint32_t>(std::lround(p.max_orig * static_cast<double>(k)));
-  // The game froze (every thread waiting) whenever ~1000 or more characters were spawned at once
-  // (seen with [world] npc_units), never at <= ~940. The effective cap is maxSpawned x the quality
-  // multiplier (RVA 0x12559c0, 0.75-1.2 by Environment quality), so the raw value is clamped to
-  // keep the effective cap at [world] npc_spawn_ceiling (default 800) or below.
+  // The game froze (every thread waiting) once ~1000 or more characters were spawned at once: each
+  // animated character's Kino instance takes a TLS index and the process runs out of them (see
+  // core/tlsext.h). Without [world] tls_extend keep the effective cap (maxSpawned x the quality
+  // multiplier, RVA 0x12559c0, 0.75-1.2 by Environment quality) at [world] npc_spawn_ceiling
+  // (default 800) or below.
   float mult = reinterpret_cast<float (*)(uintptr_t)>(g_base + kCapMultiplierRva)(s);
   if (!(mult > 0.1f && mult < 4.0f)) mult = 1.2f;  // unexpected: assume the largest shipped value
-  uint32_t ceiling = static_cast<uint32_t>(std::clamp(cfg.world_npc_spawn_ceiling, 100.0f, 5000.0f) / mult);
-  if (want > ceiling && want > p.max_orig) want = std::max(ceiling, p.max_orig);
+  if (!tlsext_active()) {
+    uint32_t ceiling = static_cast<uint32_t>(std::clamp(cfg.world_npc_spawn_ceiling, 100.0f, 5000.0f) / mult);
+    if (want > ceiling && want > p.max_orig) want = std::max(ceiling, p.max_orig);
+  }
   if (k == 1.0f) want = p.max_orig;
   if (cur != want) max_spawned(s) = want;
   p.max_written = want == p.max_orig ? 0 : want;
@@ -291,8 +295,8 @@ void npc_on_present() {
     last_stat = now;
     unsigned tls_free = kTlsSlots - tls_used();
     g_tls_min_free = std::min(g_tls_min_free, tls_free);
-    ACO_LOG("npc: %u spawned, maxSpawned %u (x%.3g quality = cap %.0f), TLS slots free %u (min %u)", spawned_count(g_mgr),
-            max_spawned(s), mult, max_spawned(s) * mult, tls_free, g_tls_min_free);
+    ACO_LOG("npc: %u spawned, maxSpawned %u (x%.3g quality = cap %.0f), TLS slots free %u (min %u), virtual TLS %u",
+            spawned_count(g_mgr), max_spawned(s), mult, max_spawned(s) * mult, tls_free, g_tls_min_free, tlsext_virtual_in_use());
   }
 }
 

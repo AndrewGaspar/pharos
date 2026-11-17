@@ -18,5 +18,8 @@ using PFN_GetBuffer = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, const _
 HRESULT fg12_get_buffer(IDXGISwapChain* sc, UINT index, const _GUID& riid, void** out, PFN_GetBuffer real);
 void fg12_before_resize();
 bool fg12_proxy_active();
+// [fg] auto_cap: the real-frame-rate cap Frame Generation currently wants (0 = none); enforced by the
+// [reflex] limiter.
+float fg12_auto_cap();
 
 } // namespace aco

@@ -15,7 +15,7 @@ bool iat_hook(HMODULE module, const char* dll, const char* func, void* hook, voi
   const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
   if (!dir.VirtualAddress) return false;
   for (auto* imp = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress); imp->Name; ++imp) {
-    if (_stricmp(reinterpret_cast<const char*>(base + imp->Name), dll) != 0) continue;
+    if (dll && _stricmp(reinterpret_cast<const char*>(base + imp->Name), dll) != 0) continue;
     if (!imp->OriginalFirstThunk) continue;
     auto* names = reinterpret_cast<IMAGE_THUNK_DATA*>(base + imp->OriginalFirstThunk);
     auto* slots = reinterpret_cast<IMAGE_THUNK_DATA*>(base + imp->FirstThunk);
@@ -29,7 +29,7 @@ bool iat_hook(HMODULE module, const char* dll, const char* func, void* hook, voi
       __atomic_store_n(orig, prev, __ATOMIC_SEQ_CST);
       __atomic_store_n(&slots->u1.Function, reinterpret_cast<ULONG_PTR>(hook), __ATOMIC_SEQ_CST);
       VirtualProtect(&slots->u1.Function, sizeof(void*), old, &old);
-      ACO_LOG("iat: hooked %s!%s (was %p)", dll, func, prev);
+      ACO_LOG("iat: hooked %s!%s (was %p)", reinterpret_cast<const char*>(base + imp->Name), func, prev);
       return true;
     }
   }
