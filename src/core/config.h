@@ -63,6 +63,8 @@ struct Config {
   std::string fg_mv_units = "px";    // [fg] mv_units: px (MvecScale = mv_scale x render size) | uv
   std::string fg_pace = "smooth";  // [fg] pace: ready | smooth | arrival (when the generated frame is presented)
   float fg_pace_relax = 0.5f;     // [fg] pace_relax (pace=smooth)
+  std::string fg_done_fence = "shared";  // [fg] done_fence: shared | private (fence the CPU waits use)
+  bool fg_ts_guard = true;  // [fg] ts_guard: also wait for DLSS-G's end-of-work timestamp before presenting
   int fg_trace_presents = 1200;  // [fg] trace_presents: presents timed per `touch <out>/fgtrace-start`
   int fg_trace_shots = 120;      // [fg] trace_shots: of those, how many get an image band captured
   bool fg_verify = false;  // [fg] verify: log/dump (previous real, generated, current real) every 2 s

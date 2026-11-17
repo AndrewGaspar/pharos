@@ -101,6 +101,11 @@ struct State {
   ID3D12Fence* done12 = nullptr;
   ID3D11Fence* done11 = nullptr;  // the same fence opened in D3D11 (sync=gpu / feature creation)
   UINT64 done_value = 0;
+  // Same values as done12, but a plain (non-shared) D3D12 fence: [fg] done_fence=private makes the CPU
+  // waits use it (diagnosing whether the shared fence completes before the GPU work it follows).
+  ID3D12Fence* priv12 = nullptr;
+  int eval_slot = -1;      // ring slot of the last evaluation
+  UINT64 eval_ts_old = 0;  // that slot's end timestamp before the evaluation (changes once it has run)
   HANDLE fence_event = nullptr;
   ID3D12CommandAllocator* alloc[kRing] = {};
   UINT64 slot_value[kRing] = {};
@@ -213,9 +218,13 @@ bool make_shared(Shared& s, UINT w, UINT h, DXGI_FORMAT fmt, bool uav) {
   return true;
 }
 
+// The fence CPU waits use ([fg] done_fence).
+ID3D12Fence* wait_fence() { return S.priv12 && config().fg_done_fence == "private" ? S.priv12 : S.done12; }
+
 void wait_d3d12(UINT64 v) {
-  if (S.done12->GetCompletedValue() >= v) return;
-  S.done12->SetEventOnCompletion(v, S.fence_event);
+  ID3D12Fence* f = wait_fence();
+  if (f->GetCompletedValue() >= v) return;
+  f->SetEventOnCompletion(v, S.fence_event);
   WaitForSingleObject(S.fence_event, 2000);
 }
 
@@ -225,7 +234,7 @@ template <typename F>
 bool submit(F&& record, bool cpu_wait) {
   int slot = S.ring;
   S.ring = (S.ring + 1) % kRing;
-  if (S.done12->GetCompletedValue() < S.slot_value[slot]) {
+  if (wait_fence()->GetCompletedValue() < S.slot_value[slot]) {
     ++S.perf_cpu_waits;
     wait_d3d12(S.slot_value[slot]);
   }
@@ -247,6 +256,8 @@ bool submit(F&& record, bool cpu_wait) {
     S.ts_written[slot] = true;
   }
   if (FAILED(S.cl->Close())) return false;
+  S.eval_slot = S.ts_written[slot] ? slot : -1;
+  S.eval_ts_old = S.ts_map ? S.ts_map[slot * 2 + 1] : 0;
 
   // D3D11 -> D3D12: everything the context has recorded so far (our input copies) first.
   UINT64 v_in = ++S.fence_value;
@@ -257,6 +268,7 @@ bool submit(F&& record, bool cpu_wait) {
   S.q->ExecuteCommandLists(1, lists);
   UINT64 v_out = ++S.done_value;
   S.q->Signal(S.done12, v_out);
+  if (S.priv12) S.q->Signal(S.priv12, v_out);
   S.slot_value[slot] = v_out;
   S.eval_v = v_out;
   // D3D12 -> D3D11. sync=gpu: later context work waits on the GPU (vkd3d-proton resolves the D3D12
@@ -269,9 +281,10 @@ bool submit(F&& record, bool cpu_wait) {
 
 // CPU wait for a D3D12 fence value with a caller-owned event; false on timeout.
 bool wait_eval(UINT64 v, HANDLE event, DWORD timeout_ms) {
-  if (!v || S.done12->GetCompletedValue() >= v) return true;
-  S.done12->SetEventOnCompletion(v, event);
-  return WaitForSingleObject(event, timeout_ms) == WAIT_OBJECT_0 || S.done12->GetCompletedValue() >= v;
+  ID3D12Fence* f = wait_fence();
+  if (!v || f->GetCompletedValue() >= v) return true;
+  f->SetEventOnCompletion(v, event);
+  return WaitForSingleObject(event, timeout_ms) == WAIT_OBJECT_0 || f->GetCompletedValue() >= v;
 }
 
 void swap_sets() {
@@ -357,6 +370,8 @@ bool init(ID3D11Device* dev) {
   }
   ACO_LOG("fg12: fences: inputs (D3D11 -> D3D12) shared, completion (D3D12) %s in D3D11",
           S.done11 ? "also opened" : "NOT opened (sync=gpu unavailable)");
+  if (FAILED(S.d12->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void**>(&S.priv12))))
+    S.priv12 = nullptr;
   S.fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
   S.game_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 
@@ -972,6 +987,9 @@ struct Presenter {
   ID3D11Texture2D* gen_tex = nullptr;   // this job's textures (one of the two sets)
   ID3D11Texture2D* real_tex = nullptr;
   std::atomic<uint32_t> gen_dropped{0};  // generated frame not ready in time: real frame only
+  // The fence said "done" but the evaluation's end timestamp hadn't been written yet (the fence
+  // completed before the GPU work it follows); and how often [fg] ts_guard then timed out.
+  std::atomic<uint32_t> gen_early{0}, gen_early_timeout{0}, gen_checked{0};
   double perf_join_ms = 0;
   uint32_t perf_join_n = 0;
   // Present-thread timing: when the generated / real present calls were made after the game's
@@ -1008,6 +1026,8 @@ struct Job {
   uint64_t frame = 0;       // BackbufferFrameID of this job's evaluation (trace)
   int pace = 0;             // [fg] pace: 0 ready, 1 smooth, 2 arrival
   double relax = 0.5;       // [fg] pace_relax
+  int ts_slot = -1;         // ring slot of this job's evaluation (timestamp check), -1 = none
+  UINT64 ts_old = 0;        // that slot's end timestamp before the evaluation
 };
 std::deque<Job> g_jobs;  // guarded by P.m
 int g_active = 0;        // jobs being processed (0/1), guarded by P.m
@@ -1028,6 +1048,20 @@ void present_loop() {
     int64_t t0 = now_us(), t1 = t0, t2 = t0;
     bool gen_ready = !j.skip_gen && wait_eval(j.wait_value, event, 100);
     if (!gen_ready) ++P.gen_dropped;
+    if (gen_ready && j.ts_slot >= 0 && S.ts_map) {
+      // The evaluation's command list ends by resolving its end timestamp into this slot: until the
+      // value changes, the GPU hasn't finished it, whatever the fence says.
+      const volatile UINT64* end = &S.ts_map[j.ts_slot * 2 + 1];
+      ++P.gen_checked;
+      if (*end == j.ts_old) {
+        ++P.gen_early;
+        if (config().fg_ts_guard) {
+          int64_t deadline = now_us() + 50000;
+          while (*end == j.ts_old && now_us() < deadline) Sleep(0);
+          if (*end == j.ts_old) ++P.gen_early_timeout;
+        }
+      }
+    }
     t0 = now_us();
     // Pacing of the generated present ([fg] pace). ready: as soon as DLSS-G is done. smooth: not
     // sooner than half an interval after the previous real present, minus a share ([fg] pace_relax)
@@ -1119,6 +1153,8 @@ void enqueue(IDXGISwapChain* sc, PFN_RealPresent present, UINT sync, UINT flags,
   j.wait_value = config().fg_sync == "gpu" ? 0 : S.eval_v;
   j.gen = S.out.t11;
   j.real = S.real;
+  j.ts_slot = S.eval_slot;
+  j.ts_old = S.eval_ts_old;
   j.show = config().fg_skip == "present2" ? std::string("skip_present2") : show;
   j.gate = config().fg_present_gate;
   j.frame = S.backbuffer_id;
@@ -1198,6 +1234,10 @@ void perf_join_report() {
           "presented +%.2f ms, real +%.2f ms; generated frames dropped %u",
           P.perf_join_n, P.perf_join_n ? P.perf_join_ms / P.perf_join_n : 0.0, n ? dg / 1000.0 / n : 0.0,
           n ? dr / 1000.0 / n : 0.0, P.gen_dropped.exchange(0));
+  ACO_LOG("perf: fg12 completion check: %u of %u generated frames had the fence done before DLSS-G's end "
+          "timestamp (guard timeouts %u) [done_fence=%s ts_guard=%d]",
+          P.gen_early.exchange(0), P.gen_checked.exchange(0), P.gen_early_timeout.exchange(0),
+          S.priv12 && config().fg_done_fence == "private" ? "private" : "shared", config().fg_ts_guard ? 1 : 0);
   double s[6];
   for (int i = 0; i < 6; ++i) s[i] = n ? P.seg_us[i].exchange(0) / 1000.0 / n : 0.0;
   ACO_LOG("perf: fg12 present thread steps (ms/job): pickup %.2f | copy %.2f, Present %.2f (generated) | wait %.2f | "
@@ -1441,7 +1481,7 @@ bool fg12_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent rea
         // Frames alternate between two texture sets; the one we're about to overwrite was last read
         // and written by the evaluation two frames ago (normally long done).
         swap_sets();
-        if (S.done12->GetCompletedValue() < S.eval_v) {
+        if (wait_fence()->GetCompletedValue() < S.eval_v) {
           ++S.perf_cpu_waits;
           wait_eval(S.eval_v, S.game_event, 200);
         }
