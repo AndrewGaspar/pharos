@@ -13,7 +13,7 @@ run_one() {  # one launch + measurement of $k $d $dist; prints the block; return
   sed -i "s/^npc_units=.*/npc_units=$k/; s/^npc_density=.*/npc_density=$d/; s/^npc_distance=.*/npc_distance=$dist/" "$mod/aco_dlss.ini"
   if "$W/tools/npc-re/userplaying.sh"; then echo "$(date -u +%H:%M:%S) not launching: the user is playing"; exit 2; fi
   "$W/scripts/aco" kill-game "$t" >/dev/null 2>&1
-  "$W/scripts/aco" fixture "$t" story-alexandria-port >/dev/null 2>&1
+  "$W/scripts/aco" fixture "$t" "${FIX:-story-alexandria-port}" >/dev/null 2>&1
   timeout 180 "$W/scripts/aco" game "$t" --mod "$mod" >/dev/null 2>&1 || { echo "k=$k: launch failed"; return 1; }
   timeout 420 "$W/scripts/aco-dt" "$t" --story >/dev/null 2>&1 || { echo "k=$k: aco-dt failed"; return 1; }
   sleep 120

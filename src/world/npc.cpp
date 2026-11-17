@@ -26,7 +26,7 @@ constexpr uintptr_t kSettingsOff = 0x10;             // SpawningManager + 0x10 -
 constexpr uintptr_t kSpawnMgrVtRva = 0x363beb0;
 constexpr uintptr_t kSpawnSettingsVtRva = 0x363cc80;
 constexpr uintptr_t kMaxSpawnedOff = 0x38;           // uint32, 200 in the shipped data
-constexpr uint32_t kMaxSafeSpawned = 800;          // see npc_on_present
+constexpr uintptr_t kCapMultiplierRva = 0x12559c0; // float (SpawnSettings*): quality multiplier of the cap
 // The three readers of maxSpawned (each: call cap multiplier 0x12559c0; mov eax/ecx, [reg+0x38]).
 constexpr uintptr_t kReaderRvas[] = {0x1255a9e, 0x1268f21, 0x1259092};
 
@@ -256,10 +256,14 @@ void npc_on_present() {
   }
   k = std::clamp(k, 0.1f, 100.0f);
   uint32_t want = static_cast<uint32_t>(std::lround(p.max_orig * static_cast<double>(k)));
-  // With [world] npc_units the game froze (every thread waiting) once ~1000-1100 characters were
-  // spawned at once, while <= ~900 ran clean: keep the budget below that whatever npc_density says
-  // (the quality multiplier is at most 1.2, so 800 raw -> at most 960 spawned).
-  if (want > kMaxSafeSpawned && want > p.max_orig) want = std::max(kMaxSafeSpawned, p.max_orig);
+  // The game froze (every thread waiting) whenever ~1000 or more characters were spawned at once
+  // (seen with [world] npc_units), never at <= ~940. The effective cap is maxSpawned x the quality
+  // multiplier (RVA 0x12559c0, 0.75-1.2 by Environment quality), so the raw value is clamped to
+  // keep the effective cap at [world] npc_spawn_ceiling (default 900) or below.
+  float mult = reinterpret_cast<float (*)(uintptr_t)>(g_base + kCapMultiplierRva)(s);
+  if (!(mult > 0.1f && mult < 4.0f)) mult = 1.2f;  // unexpected: assume the largest shipped value
+  uint32_t ceiling = static_cast<uint32_t>(std::clamp(cfg.world_npc_spawn_ceiling, 100.0f, 5000.0f) / mult);
+  if (want > ceiling && want > p.max_orig) want = std::max(ceiling, p.max_orig);
   if (k == 1.0f) want = p.max_orig;
   if (cur != want) max_spawned(s) = want;
   p.max_written = want == p.max_orig ? 0 : want;
@@ -271,7 +275,7 @@ void npc_on_present() {
   static ULONGLONG last_stat = 0;
   if (now - last_stat >= 10000) {
     last_stat = now;
-    ACO_LOG("npc: %u spawned, maxSpawned %u", spawned_count(g_mgr), max_spawned(s));
+    ACO_LOG("npc: %u spawned, maxSpawned %u (x%.3g quality = cap %.0f)", spawned_count(g_mgr), max_spawned(s), mult, max_spawned(s) * mult);
   }
 }
 
