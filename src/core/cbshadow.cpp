@@ -62,8 +62,22 @@ bool is_watched_size(uint32_t bw) {
   return false;
 }
 
+// Pointer-only sizes (cbshadow_watch_size_ptr): remember where the last Map(WRITE_DISCARD) of each
+// (context, buffer) put the data, no copy. Mapped dynamic buffers in DXVK stay mapped, so the data
+// can be read at record time; copying every Map instead (reads from write-combined memory) costs
+// far too much for a size as common as 2 KB.
+std::atomic<uint32_t> g_ptr_sizes[kMaxWatchedSizes];
+std::atomic<size_t> g_ptr_size_count{0};
+bool is_ptr_size(uint32_t bw) {
+  size_t n = g_ptr_size_count.load(std::memory_order_acquire);
+  for (size_t i = 0; i < n; ++i)
+    if (g_ptr_sizes[i].load(std::memory_order_relaxed) == bw) return true;
+  return false;
+}
+
 std::mutex g_mutex;
 std::unordered_map<Key, Shadow, KeyHash> g_shadows;
+std::unordered_map<Key, const void*, KeyHash> g_ptrs;
 std::unordered_map<ID3D11Resource*, ID3D11DeviceContext*> g_last_writer;
 
 // Returns the buffer's size if it should be shadowed, else 0.
@@ -90,6 +104,18 @@ HRESULT STDMETHODCALLTYPE hk_Map(ID3D11DeviceContext* self, ID3D11Resource* res,
       auto& s = g_shadows[{self, res}];
       s.data.resize(size);
       s.mapped = out->pData;
+    } else if (type == D3D11_MAP_WRITE_DISCARD && g_ptr_size_count.load(std::memory_order_relaxed)) {
+      D3D11_RESOURCE_DIMENSION dim;
+      res->GetType(&dim);
+      if (dim == D3D11_RESOURCE_DIMENSION_BUFFER) {
+        D3D11_BUFFER_DESC d;
+        static_cast<ID3D11Buffer*>(res)->GetDesc(&d);
+        if ((d.BindFlags & D3D11_BIND_CONSTANT_BUFFER) && is_ptr_size(d.ByteWidth)) {
+          std::lock_guard lock(g_mutex);
+          g_ptrs[{self, res}] = out->pData;
+          g_last_writer[res] = self;
+        }
+      }
     }
   }
   return hr;
@@ -156,8 +182,33 @@ void cbshadow_watch_size(uint32_t byte_width) {
   ACO_LOG("cbshadow: shadowing all %u-byte constant buffers", byte_width);
 }
 
+void cbshadow_watch_size_ptr(uint32_t byte_width) {
+  if (is_ptr_size(byte_width)) return;
+  std::lock_guard lock(g_mutex);
+  if (is_ptr_size(byte_width)) return;
+  size_t n = g_ptr_size_count.load();
+  if (n >= kMaxWatchedSizes) return;
+  g_ptr_sizes[n].store(byte_width, std::memory_order_relaxed);
+  g_ptr_size_count.store(n + 1, std::memory_order_release);
+  ACO_LOG("cbshadow: tracking the mapped data of all %u-byte constant buffers", byte_width);
+}
+
 bool cbshadow_read(ID3D11DeviceContext* ctx, ID3D11Buffer* buf, uint32_t offset, uint32_t size, void* out) {
   std::lock_guard lock(g_mutex);
+  {
+    auto p = g_ptrs.find({ctx, buf});
+    if (p == g_ptrs.end()) {
+      auto lw = g_last_writer.find(buf);
+      if (lw != g_last_writer.end()) p = g_ptrs.find({lw->second, buf});
+    }
+    if (p != g_ptrs.end()) {
+      D3D11_BUFFER_DESC d;
+      buf->GetDesc(&d);
+      if (offset + size > d.ByteWidth) return false;
+      memcpy(out, static_cast<const uint8_t*>(p->second) + offset, size);
+      return true;
+    }
+  }
   auto it = g_shadows.find({ctx, buf});
   if (it == g_shadows.end()) {
     // Written on another context (typically the immediate one) and consumed here.

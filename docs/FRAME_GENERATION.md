@@ -142,9 +142,126 @@ across toggles. 2560x1600, t1, DLSS Performance, Reflex on, latency-bench:
 generated frames back after every re-enable (~80 + 80 presents/s, verify: generated strictly
 between its neighbours), each re-enable logged with one reset.
 
-Still open on this route: frame pacing quality not measured on a real display (this is headless
-gamescope); latency (above); HUD-less/UI handling (the HUD-less input is the DLSS output, the UI is
-interpolated with the scene); camera matrices are identity (DLSS-G relies on motion vectors).
+Still open on this route: latency (above); HUD-less/UI handling (the HUD-less input is the DLSS
+output, the UI is interpolated with the scene).
+
+### Frame pacing and generated-frame timing (2026-11-17)
+
+User report: spinning the camera with FG on looked jumpy at 2560x1600 / 165 Hz (Hyprland), while
+MangoHud's frametime graph was flat.
+
+**Measurement** (`tools/fg-trace <inst> <label>`): `tools/spin.py` turns the camera at a constant
+rate (XTEST mouse-look, ~5000 px/s on screen, ~60 px per real frame), the mod's present trace
+(`touch <out>/fgtrace-start`, `[fg] trace_presents` / `trace_shots`) records the QPC time of every
+Present call/return plus the game's Present arrival, and copies a 2560x100 band of exactly what was
+presented (in present order) for the first 120 presents. `tools/fg-pacing.py` then measures:
+
+- the horizontal image shift between consecutive presented frames (phase correlation on two
+  sub-bands left/right of the player character); for every (real N-1, generated N, real N) the
+  *shift ratio* d(R<sub>N-1</sub>,G<sub>N</sub>) / d(R<sub>N-1</sub>,R<sub>N</sub>), 0.5 = midpoint;
+- present-call intervals by transition (G→R, R→G), Present durations, arrival intervals;
+- *position residual*: the cumulative image position against present time (a constant-rate spin is
+  a straight line) minus a local linear fit, in px: what the eye sees as judder on a VRR display.
+  Also simulated for a fixed 165 Hz display (`mailbox` = newest frame per vblank, as a
+  compositor does with vsync off; `fifo` = every frame in order).
+
+All runs: t2, 2560x1600, DLSS Performance, Ultra High, Discovery Tour Siwa, only this game on the GPU.
+
+| configuration | shift ratio median (p10–p90), outside [0,1] | present-interval sd; G→R / R→G mean (p10–p90) ms | position residual, mean / p90 px (VRR) | real fps |
+|---|---|---|---|---|
+| **before**: one shared fence, `mv_units=uv`, identity camera, `pace=ready` | **−0.69** (−2.24–0.51), **58 of 107** | 2.46; 7.13 (5.57–11.0) / 4.63 (0.45–6.38) | **40.0 / 74.1** | 85 |
+| separate completion fence | 0.497 (0.477–0.518), 2 of 114 | 2.6; 8.02 / 3.73 | 10.4 / 19.7 | 85 |
+| + `mv_units=px` | 0.501 (0.486–0.516), 0 of 117 | 2.6; 8.04 / 3.75 | 11.8 / 22.1 | 85 |
+| + `camera=engine` (`pace=ready`) | 0.500 (0.488–0.518), 0 of 118 | 2.17; 7.03 / 4.83 | 9.8 / 21.2 | 85 |
+| + `pace=smooth` (**new defaults**) | 0.500 (0.491–0.522), 1 of 118 | **0.46**; 5.89 (5.46–6.32) / 5.81 (5.17–6.47) | **6.7 / 12.5** | 85.5 |
+| `pace=arrival` (alternative) | 0.499 (0.481–0.505), 0 of 118 | 2.35; 6.49 / 5.29 | 9.7 / 21.0 | 85 |
+| FG off (`enabled=0`), for reference | – | 1.14; N→N 8.42 | 4.2 / 8.1 | 119 |
+
+(The `camera=engine` row and `pace=arrival` were measured before the real-present timing change
+below; the final `pace=smooth` row includes it.)
+
+**What was wrong**
+
+1. **Generated frames shown before DLSS-G had written them (the jumpiness).** The D3D11 queue
+   (signal "inputs copied", value 2N+1) and the D3D12 queue (signal "evaluation N done", 2N) used
+   the *same* shared fence. Whenever the game's next frame reached its signal before DLSS-G
+   finished, the fence jumped past 2N, the present thread's "evaluation done" check passed
+   immediately and it copied the output texture of the set while DLSS-G was still about to write
+   it: the frame presented as "generated" was the generated frame from two frames earlier. In the
+   trace these show up as the image jumping *back* by ~1.5–2 real frames (+110 px, then −170 px)
+   at every generated present — about half of all generated frames during a spin. (The D3D12
+   signal then also moved the timeline backwards, which Vulkan timeline semaphores don't allow; the
+   two GPU hangs seen during this work under heavy VRAM pressure may be related.) The present
+   *times* were fine, so MangoHud's graph was flat. Fix: a separate completion fence created by
+   D3D12 (`done12`; also opened in D3D11 as `done11` for `sync=gpu` and feature creation). The sync
+   model is otherwise unchanged (`sync=cpu`: D3D11 never waits for D3D12).
+2. **Motion vector units.** At the NGX level DLSS-G expects `MvecScale` to convert the vectors to
+   *pixels of the motion-vector texture* (the FG programming guide's "Motion Vectors" section; the
+   struct comment "normalize to [-1,1]" is Streamline's convention). With our UV-unit vectors and
+   scale 1, DLSS-G saw motion of ~0.05 px, i.e. none, and interpolated from optical flow alone. The
+   synthetic test shows it: a square moving 64 px per frame comes out at the right place with
+   `MvecScale = width` (275.5 between 252 and 316) and is lost entirely with scale 1, 0 or negative
+   (`dlssg_d3d12_test.exe <dir> 1 "" 4 64 <scale>`); at 16–48 px optical flow alone copes. In game
+   (≤ 60 px per real frame) the spread of the ratio shrinks (sd 0.072 → 0.025, outliers 2 → 0).
+   `[fg] mv_units=px` (default) passes `mv_scale x render size`.
+3. **Present timing.** The real frame waited half an interval from when the generated `Present`
+   *returned*; under headless gamescope that call blocks up to ~5–6 ms (p90 4.7 ms), so G→R
+   stretched to 10–12 ms and the next generated frame followed the real one almost at once (R→G
+   p10 0.4–0.9 ms). `pace=smooth` (default) times the real frame from the generated Present's
+   *call*, and holds the generated frame until half an interval after the previous real present,
+   minus `pace_relax` (0.5) of how early DLSS-G finished (so a delay never sticks). Present
+   intervals go from sd 2.3–2.5 ms to 0.46 ms; the latency cost is ~+0.6 ms on the generated present
+   (19.0 vs 18.4 ms after the game's Present) and none on the real one (24.9 vs 25.4 ms).
+   `pace=arrival` (fixed lag after the game's Present) is kept as an option; it was worse.
+
+**Camera** (`[fg] camera=engine`, default): projection, view and previous view-projection come from
+the TAA pass's `PassParams` (`viewToWorld` c4–c6, `RevProjParams.ClipXYZToViewPos` c57–c60) and
+`InstanceParams.worldViewProjPrevFrame` (c12–c15); passed transposed (DLSS-G: row-major,
+post-multiplied), basis from `viewToWorld`, near 0.1, far ~59900 (infinite reversed Z, from the
+projection), vertical FOV 45.2°, aspect 1.6. `ClipXYZToViewPos` carries no TAA jitter (checked:
+0.000 px in the projection while the engine jitter is ±0.5 px), `camera_unjitter=1` strips it if it
+ever does. Reading those constant buffers by copying every Map of their pooled sizes (2048 / 512
+bytes) dropped the game to 15 fps (reads from write-combined memory); `cbshadow_watch_size_ptr`
+remembers only the mapped pointer (DXVK keeps dynamic buffers mapped) and reads 208 bytes per
+frame: no measurable cost. Measured effect on the shift ratio: none (0.500 either way); kept because
+it is what DLSS-G is specified to get.
+
+**Latency / fps** (latency-bench, 40 mouse-look injections, t2, same session conditions):
+
+| | FG off | FG on, old settings (fence fix only) | FG on, new defaults |
+|---|---|---|---|
+| game (real) fps | 125.9 | 87.1 (174 presents/s) | 86.2 (172 presents/s) |
+| input → frame done, median (p10–p90) | 32.6 ms (29.6–37.3) | 51.3 ms (46.5–58.6) | 51.7 ms (48.4–58.2) |
+
+The changes cost no fps or latency. The "old settings" column already includes the fence fix, and
+the traces taken before the fix also ran at 85 real fps. The earlier 76–80 real fps / ~55 ms
+(measured on t1, above) against 86 fps / ~51.5 ms here is variance between instances and sessions,
+not an effect of these changes. Re-validate after the fence change: the F9 toggle, resize / alt-tab
+(feature re-creation waits on the completion fence) and `sync=gpu` (needs the completion fence
+opened in D3D11; logged as `fg12: fences: ...`).
+
+**Fixed-refresh display (the user's Hyprland 165 Hz without VRR).** The trace's display models show
+what an uneven present cadence does on a fixed refresh: with the old pacing (`pace=ready`) ~10 %
+of vblanks repeat a frame and ~10 % of frames are never shown in the mailbox model at 170
+presents/s; with `pace=smooth` 3 % / 6.5 % (most of what remains is simply 171 presents/s > 165 Hz).
+At the user's ~152 presents/s on 165 Hz *without* VRR, at least 13 vblanks per second must repeat a
+frame even with perfect pacing — a 13 Hz beat, visible in a fast pan — and any uneven gen/real
+spacing turns into dropped frames on top. Options:
+
+- **VRR** is the real fix. Hyprland `misc:vrr = 3` enables VRR only for fullscreen windows whose
+  content type is "game"/"video"; Proton games under Xwayland usually don't set a content type,
+  so check `hyprctl monitors | grep -i vrr` *while the game is fullscreen*. If it says `false`, try
+  `misc:vrr = 2` (all fullscreen windows) and make sure the game runs fullscreen (WindowMode).
+- Without VRR, the output rate should divide the refresh: 165 presents/s needs 82.5 real fps
+  (`[reflex] fps_limit=82.5`) — above the user's ~76, so not reachable at these settings; a 120 Hz
+  mode with `[reflex] fps_limit=60` (120 presents/s, one per vblank) is even but costs latency.
+- A "pace to vblank" mode (present on a measured vblank grid) would need display timing that
+  DXGI under Wine/DXVK doesn't expose; not attempted.
+
+The NVRM kernel messages seen during this work (Xid 31 MMU faults in ACOrigins at 16:17:03 and
+16:43:54, `intermapRegisterDmaMapping`/`gpu_vaspace.c` assertion failures at 16:29:50 and
+16:45:15 local time) all happened while four game instances shared the 8 GB GPU (7.3–7.7 GB in
+use); they faulted the offending process' GPU context only.
 
 ## Vulkan route (`mode=on`, not working)
 
@@ -256,9 +373,9 @@ Streamline (D3D12/Vulkan), which also owns the swapchain and frame pacing.
 |---|---|
 | Backbuffer | copy of the game's swapchain image at Present (final frame incl. UI) |
 | Depth | the engine's raw reversed-Z depth copy (R32F, render res) — `DepthInverted=1` |
-| Motion vectors | our DLSS-SR motion vectors (RG16F, render res, UV units, prev−cur), `MvecScale=1`, `CameraMotionIncluded=1` |
+| Motion vectors | our DLSS-SR motion vectors (RG16F, render res, UV units, prev−cur), `MvecScale` = render width/height (`[fg] mv_units=px`; DLSS-G wants pixels, see "Frame pacing"), `CameraMotionIncluded=1` |
 | Jitter | the engine's sub-pixel jitter (pixels) |
-| Camera matrices | **identity for now** (see open issues) |
+| Camera matrices | the engine's (`[fg] camera=engine`, see "Frame pacing and generated-frame timing"); identity with `camera=identity` |
 | HUD-less colour / UI | not yet provided |
 | Output | our own display-size texture (`OutputInterpolated`) |
 
@@ -287,6 +404,8 @@ DLSS-G's GPU work then executes.
   writes `nvngx.log`, `nvngx_dlssg_*.log` etc. into the out dir. (The `LoggingInfo` callback in
   `NVSDK_NGX_FeatureCommonInfo` is ignored by this NGX build.)
 - `show=generated|real|both`: present only one kind of frame, so screenshots capture it.
+- `touch <out>/fgtrace-start` (mode=d3d12): per-present timestamps + image bands into `<out>/fgtrace/`;
+  `tools/fg-trace` drives a constant-rate camera spin around it and runs `tools/fg-pacing.py`.
 - `debug_fill=1`: create the output texture magenta. Don't use a D3D11 UAV clear for this: DXVK
   defers clears until the image's next D3D11 use (our copy *after* NGX), which overwrites NGX's
   output and looks like "NGX never writes".

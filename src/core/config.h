@@ -60,8 +60,8 @@ struct Config {
   bool fg_present_gate = true;  // [fg] present_gate: render thread yields the context to the present thread
   std::string fg_camera = "engine";  // [fg] camera: engine (the game's matrices) | identity
   bool fg_camera_unjitter = true;     // [fg] camera_unjitter: strip TAA jitter from the projection
-  std::string fg_mv_units = "uv";    // [fg] mv_units: uv (MvecScale = mv_scale) | px (x render size)
-  std::string fg_pace = "ready";  // [fg] pace: ready | smooth | arrival (when the generated frame is presented)
+  std::string fg_mv_units = "px";    // [fg] mv_units: px (MvecScale = mv_scale x render size) | uv
+  std::string fg_pace = "smooth";  // [fg] pace: ready | smooth | arrival (when the generated frame is presented)
   float fg_pace_relax = 0.5f;     // [fg] pace_relax (pace=smooth)
   int fg_trace_presents = 1200;  // [fg] trace_presents: presents timed per `touch <out>/fgtrace-start`
   int fg_trace_shots = 120;      // [fg] trace_shots: of those, how many get an image band captured

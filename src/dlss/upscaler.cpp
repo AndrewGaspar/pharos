@@ -568,8 +568,8 @@ bool on_taa(ID3D11DeviceContext* ctx) {
     D3D11_BUFFER_DESC b1{}, b3{};
     cb[1]->GetDesc(&b1);
     cb[3]->GetDesc(&b3);
-    cbshadow_watch_size(b1.ByteWidth);
-    cbshadow_watch_size(b3.ByteWidth);
+    cbshadow_watch_size_ptr(b1.ByteWidth);
+    cbshadow_watch_size_ptr(b3.ByteWidth);
     cam.valid = cbshadow_read(ctx, cb[1], first[1] * 16 + 4 * 16, sizeof(cam.view_to_world), cam.view_to_world) &&
                 cbshadow_read(ctx, cb[1], first[1] * 16 + 57 * 16, sizeof(cam.clip_to_view), cam.clip_to_view) &&
                 cbshadow_read(ctx, cb[3], first[3] * 16 + 12 * 16, sizeof(cam.prev_view_proj), cam.prev_view_proj);

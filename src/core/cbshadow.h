@@ -23,6 +23,9 @@ void cbshadow_set_all(bool enabled);
 void cbshadow_watch(ID3D11Buffer* buf);
 // Shadows every constant buffer of this ByteWidth (for cbuffers rotated through a buffer pool).
 void cbshadow_watch_size(uint32_t byte_width);
+// Like cbshadow_watch_size, but only remembers each buffer's last WRITE_DISCARD Map pointer (no copy;
+// relies on DXVK keeping dynamic buffers mapped). cbshadow_read then reads the mapped memory.
+void cbshadow_watch_size_ptr(uint32_t byte_width);
 // Copies [offset, offset+size) of the shadow into out. Returns false if no shadow exists.
 bool cbshadow_read(ID3D11DeviceContext* ctx, ID3D11Buffer* buf, uint32_t offset, uint32_t size, void* out);
 

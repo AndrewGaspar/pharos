@@ -1059,7 +1059,10 @@ void present_loop() {
       }
     }
     int64_t t_gen = t2 = now_us();
-    if (gen_ready && j.half_us > 0) wait_until(t_gen + j.half_us);
+    // The real frame half an interval after the generated one: measured from when the generated
+    // Present was called (pace=smooth/arrival) - a Present that blocks must not push the real frame
+    // later (pace=ready, the original: from when it returned).
+    if (gen_ready && j.half_us > 0) wait_until((j.pace ? t1 : t_gen) + j.half_us);
     int64_t t_real = now_us(), t4 = t_real;
     if (j.show == "skip_present2") {
       // bisecting: no second present

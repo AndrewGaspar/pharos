@@ -77,8 +77,8 @@ Config load() {
   c.fg_verify = read_float(L"verify", 0.0f, L"fg") != 0.0f;
   c.fg_camera = read_str(L"camera", "engine", L"fg");
   c.fg_camera_unjitter = read_float(L"camera_unjitter", 1.0f, L"fg") != 0.0f;
-  c.fg_mv_units = read_str(L"mv_units", "uv", L"fg");
-  c.fg_pace = read_str(L"pace", "ready", L"fg");
+  c.fg_mv_units = read_str(L"mv_units", "px", L"fg");
+  c.fg_pace = read_str(L"pace", "smooth", L"fg");
   c.fg_pace_relax = read_float(L"pace_relax", 0.5f, L"fg");
   c.fg_trace_presents = static_cast<int>(read_float(L"trace_presents", 1200.0f, L"fg"));
   c.fg_trace_shots = static_cast<int>(read_float(L"trace_shots", 120.0f, L"fg"));
