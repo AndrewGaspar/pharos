@@ -483,8 +483,43 @@ Found statically (headless Ghidra) and checked against a loaded story save (t1, 
 - The game autosaves its story slot right after a story load and now and then while playing. Quit
   to title screen also saves. Saves rebuild nothing else in MetaAI as far as seen.
 - Not tested: fast travel / world change with extras (spawner destruction with added units),
-  combat around extras, visual stacking at CrowdLife stations (extras share their original's slot
-  parameter).
+  combat around extras.
+- **Stacking**: none seen. With `npc_units_log=1` (logs every extra with its original) and
+  `tools/npc-re/stack.py`: of 155 activated extra/original pairs within 120 m of the harbour market,
+  140 were more than 10 m apart and 2 within 2 m. Once activated, an extra gets its own place.
+- **What limits the total** (live `capsweep.sh` after the same hop as the A/B, 120 s per step,
+  each k in its own launch; units = units of civilian spawners per band, from `bands.py`):
+
+  | npc_density:distance | k | spawned (log) | in view | units 0-40 / 40-80 / 80-120 / 120-200 / 200-400 m |
+  |---|---|---|---|---|
+  | 3:1 | 1 | 329 | 2571 | 61 / 112 / 166 / 566 / 1553 |
+  | 3:1 | 2 | 345 | 3052 | 86 / 205 / 258 / 831 / 1929 |
+  | 8:1 | 1 | 367 | 3068 | 87 / 110 / 162 / 594 / 1517 |
+  | 8:1 | 2 | 567 | 4275 | 109 / 214 / 233 / 821 / 1947 |
+  | 8:2 | 1 | 658 | 3974 | 78 / 132 / 161 / 559 / 1527 |
+  | 8:2 | 2 | 930 | 5386 | 104 / 202 / 240 / 796 / 1972 |
+
+  (k=2 with extras for activated units beyond 60 m as well, commit 7909570; an earlier run without
+  that gave 346 / 507 / 524 / 916 spawned at 3:1 / 5:1 / 8:1 / 8:2.)
+  - With k=1 the total stops at ~365 whatever the cap: demand-limited (candidates within the
+    templates' spawn distance), as found earlier.
+  - With k=2 at `npc_density=3` the total does not move (345 vs 329) and k=2 only shifts people
+    toward the player: the cap binds through the budget pressure (spawn distance x0.9 from 0.8 x cap,
+    x0.8 from 0.9 x cap; the effective cap is maxSpawned x the Environment multiplier, which looks
+    like 0.75 here: the plateau sits at 0.8 x 600 x 0.75 = 360).
+  - From `npc_density=5` up, k=2 raises the total 1.4-1.55x (567 vs 367, 930 vs 658) and every
+    distance band has more units (1.25-1.95x). Spawned people go up in proportion to the units that
+    exist, so there is no other hidden limiter. The total stays below 2x because of coverage:
+    units within 60 m of the player that are already activated only get extras after the player
+    leaves, and only units within 260 m of where the player has been are handled.
+  - Per-band *spawned* counts are not measured yet: no reliable per-unit "spawned" field was found
+    (activation record +0x30 is always 0 in story mode; unit +0x30 is a behaviour object present
+    for far units too). In-view skinning load and the total spawned are the measures used.
+- **Bug fixed in `npc.cpp`** (also in the shipped build): the SpawningManager switches between
+  SpawnSettings objects (maxSpawned 200 and 300 in Alexandria), and `npc_on_present` re-read "the
+  original" whenever the object changed, so returning to an object it had already patched
+  multiplied again (seen: 300 -> 900 -> 9000 at npc_density=10). The distance multiplier had the
+  same pattern. Originals are now kept per object (commit dce5893).
 
 ### The Havok deadlock is a vanilla engine bug
 

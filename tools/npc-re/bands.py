@@ -1,6 +1,7 @@
 # bands.py : MetaAI units of civilian spawners by distance band from the player: total, activated
-# (+0x1b8 set) and spawned (+0x30 set: the unit's real objective object, which exists while its
-# character is spawned). Walks the MetaAI manager's objective list; no heap scan.
+# (+0x1b8 set) and +0x30 set (a behaviour object, vtable 0x3789cf0, NOT a spawned marker: it is set
+# for units 200-400 m away too; no reliable per-unit "spawned" field has been found yet). Walks the
+# MetaAI manager's objective list; no heap scan.
 import math, struct, collections
 from live import Live
 
@@ -33,5 +34,5 @@ for i in range(len(b) // 8):
                 act[nm] += struct.unpack_from('<Q', uh, 0x1b8)[0] != 0
                 spn[nm] += struct.unpack_from('<Q', uh, 0x30)[0] != 0
                 break
-print('band(m) units/active/spawned: ' + ' | '.join('%s %d/%d/%d' % (nm, tot[nm], act[nm], spn[nm]) for nm in names) +
+print('band(m) units/active/+0x30: ' + ' | '.join('%s %d/%d/%d' % (nm, tot[nm], act[nm], spn[nm]) for nm in names) +
       ' | spawned total %d' % sum(spn.values()))
