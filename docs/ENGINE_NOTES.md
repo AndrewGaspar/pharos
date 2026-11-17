@@ -667,6 +667,30 @@ froze at 994 and ~1150-1220 spawned) with `pestack.py`, `jobq.py`, `jobwhy.py` (
   an array resize, 0x2dafe30 returns a global). Use `pestack.py`, which starts at the live rsp
   recovered from Wine's syscall frame.
 
+#### npc_units with `tls_extend` (the TLS-exhaustion fix)
+
+- The per-spawner "~256 units" and per-world "~7,500 extras" limits were the same TLS exhaustion:
+  with `tls_extend=1`, k=6/8/10 ran 300 s clean with spawners far above 256 units and 12.5k
+  extras. The 200-per-spawner cap is gone (16000 sanity limit); snapshots hold 16384 units.
+- Scaling (768x480 uncapped, FG off, npc_density 40, Alexandria spawn anchor, spawned civilians
+  per band; `ab-bands.sh`):
+
+  | k | 0-40 m | 40-80 m | 80-120 m | total | fps | task threads | native TLS free (min) |
+  |---|---|---|---|---|---|---|---|
+  | 1 | 58 | 125 | 175 | 369 | 99.2 | 648% | 622 |
+  | 4 | 165 | 315 | 364 | 861 | 75.4 | 713% | 81 |
+  | 6 | 199 | 402 | 479 | 1098 | 69.7 | 736% | 64 |
+  | 8 | 275 | 489 | 543 | 1330 | 63.6 | 736% | 64 |
+  | 10 | 303 | 573 | 644 | ~1540 | 56-60 | 732% | 64 |
+
+  Every band rises at every k; spawned ~= units within 120 m. Short of k x because of coverage
+  (activated units in view are deferred; only units within 400 m get extras).
+- **User settings** (2560x1600, DLSS render_scale 0.6, FG v10 defaults incl. auto_cap, lod 2, cloth
+  render): k=1 / 6 / 8 all hold 55 real / 110 presented fps (auto_cap); GPU 64% / 74% / 72%,
+  VRAM ~5.6 GB; 0-40 m spawned 62 / 209 / 250 (3.4x / 4.0x), in view 2539 / 6935 / 7286 groups.
+- **Soak**: k=8, npc_density 40, 30 min with `roamer.sh` (1,480 m travelled, no teleports): no
+  hang, 814-1,957 spawned, 15.4k extras, 0 failed, 58-60 fps at a 60 cap, native TLS min 63.
+
 ### The Havok deadlock is a vanilla engine bug
 
 Same stack (TaskThread0 spinning in 0x2ffd9e4 <- 0x2e78f07 <- 0x2e16a8d <- 0x2dbf560 (Havok object
