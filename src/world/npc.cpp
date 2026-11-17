@@ -1,6 +1,7 @@
 #include "world/npc.h"
 
 #include <windows.h>
+#include <intrin.h>
 
 #include <algorithm>
 #include <atomic>
@@ -27,7 +28,7 @@ constexpr uintptr_t kSettingsOff = 0x10;             // SpawningManager + 0x10 -
 constexpr uintptr_t kSpawnMgrVtRva = 0x363beb0;
 constexpr uintptr_t kSpawnSettingsVtRva = 0x363cc80;
 constexpr uintptr_t kMaxSpawnedOff = 0x38;           // uint32, 200 in the shipped data
-constexpr uint32_t kMaxSafeSpawned = 800;          // see npc_on_present
+constexpr uintptr_t kCapMultiplierRva = 0x12559c0; // float (SpawnSettings*): quality multiplier of the cap
 // The three readers of maxSpawned (each: call cap multiplier 0x12559c0; mov eax/ecx, [reg+0x38]).
 constexpr uintptr_t kReaderRvas[] = {0x1255a9e, 0x1268f21, 0x1259092};
 
@@ -219,6 +220,19 @@ void apply_distance(uintptr_t s, Patched& p, float k) {
   if (k != 1.0f && !g_scan_thread) g_scan_thread = CreateThread(nullptr, 0, scan_thread, nullptr, 0, nullptr);
 }
 
+// TLS slot use of the process (PEB TlsBitmapBits at +0x80: 64 slots, TlsExpansionBitmapBits at
+// +0x240: 1024). The engine's RW locks each take a TlsAlloc slot; when all 1088 are used the next
+// lock gets index -1 and deadlocks its first writer: the freeze with ~1000+ spawned characters.
+unsigned tls_used() {
+  auto* peb = reinterpret_cast<const uint8_t*>(__readgsqword(0x60));
+  unsigned used = 0;
+  for (int i = 0; i < 2; ++i) used += __builtin_popcount(*reinterpret_cast<const uint32_t*>(peb + 0x80 + 4 * i));
+  for (int i = 0; i < 32; ++i) used += __builtin_popcount(*reinterpret_cast<const uint32_t*>(peb + 0x240 + 4 * i));
+  return used;
+}
+constexpr unsigned kTlsSlots = 64 + 1024;
+unsigned g_tls_min_free = kTlsSlots;
+
 } // namespace
 
 void npc_on_present() {
@@ -257,11 +271,17 @@ void npc_on_present() {
   }
   k = std::clamp(k, 0.1f, 100.0f);
   uint32_t want = static_cast<uint32_t>(std::lround(p.max_orig * static_cast<double>(k)));
-  // With [world] npc_units the game froze (every thread waiting) once ~1000-1100 characters were
-  // spawned at once: each animated character's Kino instance takes a TLS index and the process runs
-  // out of them (see core/tlsext.h). Without [world] tls_extend keep the budget below that whatever
-  // npc_density says (the quality multiplier is at most 1.2, so 800 raw -> at most 960 spawned).
-  if (!tlsext_active() && want > kMaxSafeSpawned && want > p.max_orig) want = std::max(kMaxSafeSpawned, p.max_orig);
+  // The game froze (every thread waiting) once ~1000 or more characters were spawned at once: each
+  // animated character's Kino instance takes a TLS index and the process runs out of them (see
+  // core/tlsext.h). Without [world] tls_extend keep the effective cap (maxSpawned x the quality
+  // multiplier, RVA 0x12559c0, 0.75-1.2 by Environment quality) at [world] npc_spawn_ceiling
+  // (default 800) or below.
+  float mult = reinterpret_cast<float (*)(uintptr_t)>(g_base + kCapMultiplierRva)(s);
+  if (!(mult > 0.1f && mult < 4.0f)) mult = 1.2f;  // unexpected: assume the largest shipped value
+  if (!tlsext_active()) {
+    uint32_t ceiling = static_cast<uint32_t>(std::clamp(cfg.world_npc_spawn_ceiling, 100.0f, 5000.0f) / mult);
+    if (want > ceiling && want > p.max_orig) want = std::max(ceiling, p.max_orig);
+  }
   if (k == 1.0f) want = p.max_orig;
   if (cur != want) max_spawned(s) = want;
   p.max_written = want == p.max_orig ? 0 : want;
@@ -273,7 +293,10 @@ void npc_on_present() {
   static ULONGLONG last_stat = 0;
   if (now - last_stat >= 10000) {
     last_stat = now;
-    ACO_LOG("npc: %u spawned, maxSpawned %u", spawned_count(g_mgr), max_spawned(s));
+    unsigned tls_free = kTlsSlots - tls_used();
+    g_tls_min_free = std::min(g_tls_min_free, tls_free);
+    ACO_LOG("npc: %u spawned, maxSpawned %u (x%.3g quality = cap %.0f), TLS slots free %u (min %u), virtual TLS %u",
+            spawned_count(g_mgr), max_spawned(s), mult, max_spawned(s) * mult, tls_free, g_tls_min_free, tlsext_virtual_in_use());
   }
 }
 

@@ -49,7 +49,7 @@ constexpr unsigned kMaxExtrasPerWorld = 60000;  // hard ceiling; [world] npc_uni
 std::atomic<unsigned> g_max_extras{kMaxExtrasPerWorld};
 constexpr unsigned kMaxCreatePerStep = 96;
 std::atomic<unsigned> g_rate{kMaxCreatePerStep};  // [world] npc_units_rate (diagnostics): units per 100 ms step
-constexpr uint32_t kMaxUnitsPerSpawner = 200;  // see augment_spawner
+constexpr uint32_t kMaxUnitsPerSpawner = 16000;  // see augment_spawner
 
 uintptr_t g_base = 0;
 std::atomic<int> g_k{1};
@@ -160,12 +160,12 @@ bool in_view(float x, float y, float z) {
 unsigned augment_spawner(uintptr_t mgr, uintptr_t sp, int k, float px, float py, unsigned budget) {
   // Spawners grow by k-1 units per original, and a spawner can be handled over several steps
   // (step budget, units deferred while in view), so this must hold k x the biggest spawner.
-  constexpr uint32_t kMaxUnits = 4096;
+  constexpr uint32_t kMaxUnits = 16384;
   uintptr_t arr = rd<uintptr_t>(sp + 0xa0);
   uint32_t n = rd<uint32_t>(sp + 0xa8) >> 17;
   uintptr_t ents = rd<uintptr_t>(sp + 0xc2);
   uint32_t ne = rd<uint32_t>(sp + 0xca) >> 17;
-  if (!n || n > kMaxUnits || !ne || ne > 64 || !arr || !ents) return 0;
+  if (!n || n > kMaxUnits || !ne || ne > 256 || !arr || !ents) return 0;
   static uintptr_t units[kMaxUnits];  // sim thread only
   memcpy(units, reinterpret_cast<void*>(arr), n * 8);  // the array grows while we add
   unsigned made = 0;
@@ -190,9 +190,9 @@ unsigned augment_spawner(uintptr_t mgr, uintptr_t sp, int k, float px, float py,
     float pos[4];
     memcpy(pos, reinterpret_cast<void*>(u + 0x10), 16);
     for (int j = 1; j < k; ++j) {
-      // A spawner with more than 255 units freezes the game a few seconds later (k=6 and k=8 both
-      // froze after ~1430 originals had their extras, at different extra counts, while k=4 with
-      // spawners of up to ~60 originals -> 240 units ran fine): keep every spawner below that.
+      // Sanity limit only: the freezes once blamed on big spawners (and on ~7500 extras per world)
+      // were TLS index exhaustion (core/tlsext.h); with [world] tls_extend k=10 ran clean with
+      // spawners far above 256 units and 12.5k extras.
       if ((rd<uint32_t>(sp + 0xa8) >> 17) >= kMaxUnitsPerSpawner) break;
       float a = 2.39996f * (i * 7 + j);  // spread around the original, 1.0-2.0 m away
       float r = 1.0f + 0.25f * (j % 5);
@@ -210,6 +210,33 @@ unsigned augment_spawner(uintptr_t mgr, uintptr_t sp, int k, float px, float py,
     }
   }
   return made;
+}
+
+// Units of areas the world streams out are destroyed with their spawners, so the handled / extra
+// sets would keep stale pointers (and a reused address would make a new unit look handled). Once a
+// minute keep only units that still sit in a spawner, and count the live extras.
+ULONGLONG g_last_prune = 0;
+void prune(uintptr_t mgr) {
+  uintptr_t list = rd<uintptr_t>(mgr + kObjListOff);
+  uint32_t n = rd<uint32_t>(mgr + kObjListOff + 8);
+  if (!n || n > 400000 || !readable(list, size_t(n) * 8)) return;
+  std::unordered_set<uintptr_t> live;
+  live.reserve(g_done.size() + 1024);
+  const uintptr_t spvt = g_base + kSpawnerVtRva;
+  for (uint32_t i = 0; i < n; ++i) {
+    uintptr_t sp = rd<uintptr_t>(list + 8 * i);
+    if (!sp || rd<uintptr_t>(sp) != spvt) continue;
+    uintptr_t arr = rd<uintptr_t>(sp + 0xa0);
+    uint32_t nu = rd<uint32_t>(sp + 0xa8) >> 17;
+    if (!arr || nu > 16384) continue;
+    for (uint32_t j = 0; j < nu; ++j) live.insert(rd<uintptr_t>(arr + 8 * j));
+  }
+  for (auto it = g_done.begin(); it != g_done.end();) it = live.count(*it) ? std::next(it) : g_done.erase(it);
+  std::vector<uintptr_t> keep;
+  keep.reserve(g_created.size());
+  for (uintptr_t u : g_created) if (live.count(u)) keep.push_back(u);
+  g_created.swap(keep);
+  g_extras = static_cast<unsigned>(g_created.size());
 }
 
 void step(uintptr_t mgr) {
@@ -246,7 +273,10 @@ void step(uintptr_t mgr) {
     made += augment_spawner(mgr, sp, k, px, py, g_rate.load() - made);
   }
   g_cursor = i;  // resume where this slice stopped
-  if (g_done.size() > 200000) g_done.clear();
+  if (now - g_last_prune > 60000) {
+    g_last_prune = now;
+    prune(mgr);
+  }
   g_stat_extras = g_extras;
   g_stat_failed = g_failed;
   g_stat_spawners = static_cast<unsigned>(g_done.size());
@@ -381,7 +411,7 @@ void npc_units_on_present() {
   if (now - last_stat >= 10000) {
     last_stat = now;
     uintptr_t lu = g_last_unit.load();
-    ACO_LOG("npc_units: %u extra units (%u units handled, %u failed), objective list %u, last extra %p (activation %p)",
+    ACO_LOG("npc_units: %u live extra units (%u units handled, %u failed), objective list %u, last extra %p (activation %p)",
             g_stat_extras.load(), g_stat_spawners.load(), g_stat_failed.load(), g_list_n.load(),
             reinterpret_cast<void*>(lu), reinterpret_cast<void*>(lu && readable(lu + 0x1b8, 8) ? rd<uintptr_t>(lu + 0x1b8) : 0));
     LARGE_INTEGER f;
