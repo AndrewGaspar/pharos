@@ -44,6 +44,7 @@ constexpr uint32_t kOwnerLinkHash = 0xcf078f5e;
 // ~120 m for most) get their extras, so the new units go through the normal activation -> spawn
 // path like the others.
 constexpr float kRingOuter = 260.0f;
+constexpr float kNoPopRadius = 60.0f;
 constexpr unsigned kMaxExtrasPerWorld = 4000;
 constexpr unsigned kMaxCreatePerStep = 48;
 
@@ -142,9 +143,11 @@ unsigned augment_spawner(uintptr_t mgr, uintptr_t sp, int k, float px, float py,
   for (uint32_t i = 0; i < n && made < budget && g_extras < kMaxExtrasPerWorld; ++i) {
     uintptr_t u = units[i];
     if (!u || rd<uintptr_t>(u) != g_base + kUnitVtRva) continue;
-    if (rd<uintptr_t>(u + 0x1b8)) continue;  // activated: too late for this one
     float d = std::hypot(rd<float>(u + 0x10) - px, rd<float>(u + 0x14) - py);
     if (d > kRingOuter) continue;
+    // Activated units get extras too (the MetaAI activates the new unit on its own), but not close
+    // to the player, where the new character could appear in view.
+    if (rd<uintptr_t>(u + 0x1b8) && d < kNoPopRadius) continue;
     if (!g_done.insert(u).second) continue;   // handled before, or one of our extras
     if ((rd<uint8_t>(u + 0x5a) & 6) || (rd<uint8_t>(u + 0x90) & 0x40)) continue;  // dead / group / scripted
     uintptr_t link = rd<uintptr_t>(u + 0x38), entry = 0;
