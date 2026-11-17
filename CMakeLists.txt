@@ -19,6 +19,7 @@ add_library(aco_d3d11 SHARED
   src/core/config.cpp
   src/core/latency.cpp
   src/core/iat.cpp
+  src/core/tlsext.cpp
   src/core/dump.cpp
   src/core/memtool.cpp
   src/world/world.cpp
