@@ -44,7 +44,8 @@ constexpr uint32_t kOwnerLinkHash = 0xcf078f5e;
 // ~120 m for most) get their extras, so the new units go through the normal activation -> spawn
 // path like the others.
 constexpr float kRingOuter = 400.0f;
-constexpr unsigned kMaxExtrasPerWorld = 60000;
+constexpr unsigned kMaxExtrasPerWorld = 60000;  // hard ceiling; [world] npc_units_max lowers it
+std::atomic<unsigned> g_max_extras{kMaxExtrasPerWorld};
 constexpr unsigned kMaxCreatePerStep = 96;
 
 uintptr_t g_base = 0;
@@ -165,7 +166,7 @@ unsigned augment_spawner(uintptr_t mgr, uintptr_t sp, int k, float px, float py,
   static uintptr_t units[kMaxUnits];  // sim thread only
   memcpy(units, reinterpret_cast<void*>(arr), n * 8);  // the array grows while we add
   unsigned made = 0;
-  for (uint32_t i = 0; i < n && made < budget && g_extras < kMaxExtrasPerWorld; ++i) {
+  for (uint32_t i = 0; i < n && made < budget && g_extras < g_max_extras.load(); ++i) {
     uintptr_t u = units[i];
     if (!u || rd<uintptr_t>(u) != g_base + kUnitVtRva) continue;
     float d = std::hypot(rd<float>(u + 0x10) - px, rd<float>(u + 0x14) - py);
@@ -232,7 +233,7 @@ void step(uintptr_t mgr) {
   unsigned made = 0;
   const uintptr_t spvt = g_base + kSpawnerVtRva;
   uint32_t i = g_cursor;
-  for (; i < end && made < kMaxCreatePerStep && g_extras < kMaxExtrasPerWorld; ++i) {
+  for (; i < end && made < kMaxCreatePerStep && g_extras < g_max_extras.load(); ++i) {
     uintptr_t sp = rd<uintptr_t>(list + 8 * i);
     if (!sp || rd<uintptr_t>(sp) != spvt) continue;
     made += augment_spawner(mgr, sp, k, px, py, kMaxCreatePerStep - made);
@@ -328,6 +329,7 @@ void npc_units_on_present() {
   if (k == 1) return;  // the hook stays installed but idle
   g_kill_req = static_cast<int>(config().world_npc_units_kill);
   g_log_units = config().world_npc_units_log != 0.0f;
+  { float mx = config().world_npc_units_max; g_max_extras = mx > 0 ? std::min<unsigned>(static_cast<unsigned>(mx), kMaxExtrasPerWorld) : kMaxExtrasPerWorld; }
   uintptr_t world = load(load(g_base + kGameGlobalRva) + 0xc0);
   uintptr_t mgr = load(world + kMetaAIOff);
   if (!mgr) return;
