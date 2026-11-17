@@ -70,7 +70,7 @@ Entry* entry(DWORD v, bool create) {
 
 DWORD WINAPI hk_alloc() {
   uintptr_t ra = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
-  if (ra - g_img >= g_img_size || native_free() > kReserve) {
+  if (!g_active.load(std::memory_order_relaxed) || ra - g_img >= g_img_size || native_free() > kReserve) {
     DWORD r = g_alloc();
     if (r != TLS_OUT_OF_INDEXES) return r;
   }
