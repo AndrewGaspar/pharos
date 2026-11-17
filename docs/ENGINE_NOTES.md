@@ -520,6 +520,27 @@ Found statically (headless Ghidra) and checked against a loaded story save (t1, 
   original" whenever the object changed, so returning to an object it had already patched
   multiplied again (seen: 300 -> 900 -> 9000 at npc_density=10). The distance multiplier had the
   same pattern. Originals are now kept per object (commit dce5893).
+- **Per-band spawned measure** (`tools/npc-re/spawnbands.py`): the MetaAI manager keeps the spawn
+  records of its spawned (or spawning) objectives at +0x48 ({ptr, n << 17}, vtable 0x363be88; a
+  unit's record is its +0x1b8; +0x34 == 1 marks the pending ones). The array's size follows the
+  game's spawned count (355 vs 341; after a live cap cut 223 vs 207, and the 80-120 m band emptied
+  first). Not spawn markers: activation record +0x30 (always 0 in story), unit +0x30 / +0x108
+  (behaviour objects, present for far units too), manager +0x498 (far objectives).
+- **Scaling** (k = npc_units, `npc_density=40` so the cap never binds, npc_distance 1, 768x480
+  uncapped, FG off, fresh launch at the Alexandria spawn anchor, 120 s settle, `ab-bands.sh`;
+  spawned civilians per band, two or three samples averaged; full-coverage build 4650ca2/c7061c6):
+
+  | k | 0-40 m | 40-80 m | 80-120 m | 120-200 m | total | fps | task threads (% of a core) | GPU util |
+  |---|---|---|---|---|---|---|---|---|
+  | 1 | 59 | 114 | 173 | 15 | 361 | 91.6 | 472 | 31% |
+  | 2 | 93 | 187 | 243 | 12 | 535 | 76.6 | 689 | 39% |
+  | 4 | 150 | 277 | 322 | 15 | 763 | - | - | - |
+
+  (Run interrupted at k=4.) Every band rises, and spawned ~= units within 120 m (the activation
+  range is the spawn limit once the cap has headroom). Coverage at k=4 was only ~2-2.8x per band:
+  spawners that had grown past 128 units were skipped (fixed in f4209f1, snapshot up to 4096). At
+  768x480 the game is CPU-bound (GPU 31-39%): k=2 costs 16% of the frame rate, almost all in the
+  task threads (+46% CPU). Our hook is 0.04 ms per MetaAI update.
 
 ### The Havok deadlock is a vanilla engine bug
 
