@@ -436,27 +436,55 @@ Found statically (headless Ghidra) and checked against a loaded story save (t1, 
   0x1d5da90, 0x1d18460 for `MetaAIObjectiveSpawnerDynamic` -> 0x1d5db60). The MetaAI manager
   update (0x1daf5f0) is virtual slot 47 (+0x178) of the manager vtable 0x377e7e8 (89 slots).
 
-#### `[world] npc_units` experiment (src/world/npc_units.cpp, default off; unfinished)
+#### `[world] npc_units` experiment (src/world/npc_units.cpp, default off)
 
 - Runs on the MetaAI update thread: the manager's vtable pointer (World+0x1688, vtable 0x377e7e8)
-  is swapped to a heap copy whose slot 47 calls the game's update (0x1daf5f0), then ours. That is
-  a data write; no code bytes are modified. Each unit of a `MetaAIVirtualObjectiveSpawner` (found
-  through the manager's list of all virtual objectives, +0x3b8 with a plain u32 count at +0x3c0:
-  49546 objectives, 3952 such spawners around Alexandria) that is within 260 m and not activated
-  yet (+0x1b8 == 0) gets k-1 units of the same archetype 1-2 m away. They are created with the
-  0x1dab8a0 sequence minus its two kill calls. The engine gives each one a fresh id at +0x8.
-- Measured state (t1, 768x480, story fixture, alexandria-dt-start, fixed camera): the creation
-  works with no failures and no crash over ~6 minutes (741 extras 10 s after load, 1086 after a
-  short hop away and back). Units within 40/80/120 m went from 57/141/266 to 76/223/405, all
-  activated. In-view skinning groups/frame: vanilla (k=1, npc_density=1) 2177 (sd 431); k=2,
-  npc_density=1 2330 (sd 349; within noise, the spawn cap binds); k=2 with npc_density=3 raised
-  live, about 2600-2700 (12 samples, run cut short), spawned 337-339 of 600. Not yet controlled
-  (k=1 at npc_density=3 under the same hop was not measured). Not yet done: the walker soak, and
-  the kill, autosave and reload test (`npc_units_kill` kills the nearest extra unit with the
-  engine's kill).
-- The game autosaves its story slot (3/4.save) right after a story load. A save is rebuilt from
-  scratch each time (see above), with dead units within 950 m of the player (+0x3a0 of
-  [manager+0x358]; +0x3a4 = 150 m inner bound when it applies).
+  is swapped to a heap copy whose slot 47 calls the game's update (0x1daf5f0), then ours (a data
+  write; no code bytes are modified). It walks the manager's list of all virtual objectives
+  (+0x3b8, plain u32 count at +0x3c0: 49546 objectives, 3952 `MetaAIVirtualObjectiveSpawner`s
+  around Alexandria) in slices; every unit (vtable 0x377eab8) of such a spawner within 260 m of the
+  player that the MetaAI has not activated yet (+0x1b8 == 0) gets k-1 units of its archetype 1-2 m
+  away, built with the 0x1dab8a0 sequence minus its two kill calls. The engine gives each a fresh
+  id (+0x8). Units already activated near the player are left alone until they deactivate (~120 m),
+  so a fresh load only gets extras beyond that ring until the player moves.
+- **A/B** (t1, 768x480, FG off, 30 fps cap, story fixture, both at `npc_density=3`, interleaved
+  1/2/1/2 on fresh launches; each run: load at the Alexandria spawn anchor, hop 180 m west for 30 s,
+  hop back, 30 s settle, 120 s of samples; `tools/npc-re/ab-units.sh`):
+
+  | k | in-view skinning groups/frame (sd) | units <=40 / 80 / 120 m (all active) | spawned (cap 600) |
+  |---|---|---|---|
+  | 1 | 2704 (387) | 58 / 181 / 342 | 339 |
+  | 2 | 3421 (540) | 106 / 296 / 517 | 349 |
+  | 1 | 2474 (350) | 63 / 186 / 348 | 336 |
+  | 2 | 3461 (508) | 102 / 293 / 529 | 346 |
+
+  k=2: +33% characters drawn in view (3441 vs 2589), 1.7x units within 40 m, about the same total
+  spawned: the spawner fills the near ring first, so the extras replace far NPCs. With
+  `npc_density=1` the cap binds and k=2 shows almost nothing (2330 vs 2177).
+- **Cost**: our part of the MetaAI update is 0.064-0.085 ms on average (max 0.4-1.0 ms while a
+  batch of up to 48 units is created) against 0.18-0.31 ms for the game's update, ~300 updates per
+  10 s: about 2 ms per second of one task thread. ~1100-1460 extras exist after a few minutes in
+  Alexandria (cap 4000 per world).
+- **Stability**: 23-minute walker soak at k=2 / npc_density=3 (no teleports, 290-357 spawned, 0
+  failed creations): no hang. Plus ~45 minutes over the A/B and save runs, with short teleports:
+  no hang or crash.
+- **Save test** (`npc_units_kill=1` kills the nearest extra with the engine's kill; dead flag set):
+  neither the autosave during play nor the save made by Quit to title screen (both write 3/4.save)
+  runs the MetaAI save builder: breakpoints on 0x1e03b50 / 0x1df8a70 did not fire while
+  `MetaAISaveData` was serialized (0x1df9990, from the AssassinSaveGameData serializer 0x1ef59b9).
+  Those saves write the `MetaAISaveData` that was loaded, unchanged. After reloading the
+  post-kill save, the loaded `MetaAISaveData` held only the fixture's old record (1257, -617), the
+  apply 0x1decae0 ran once and 0x1dab8a0 never ran (that record's spawner is not loaded), and no
+  restored body appeared. The 18 vanilla dead units near the player were not recorded either. The
+  save loaded cleanly twice. So in these save paths a dead extra leaves nothing, the same as a dead
+  vanilla unit. The builder is gated by a local flag in the world save 0x1f00390 (call at
+  0x1f00d93, caller 0x1ef3930); what sets it was not found (world change / fast travel are
+  candidates). If it runs, records are in the vanilla format (see above).
+- The game autosaves its story slot right after a story load and now and then while playing. Quit
+  to title screen also saves. Saves rebuild nothing else in MetaAI as far as seen.
+- Not tested: fast travel / world change with extras (spawner destruction with added units),
+  combat around extras, visual stacking at CrowdLife stations (extras share their original's slot
+  parameter).
 
 ### The Havok deadlock is a vanilla engine bug
 
