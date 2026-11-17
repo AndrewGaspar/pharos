@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# fg-contend <fg-instance> <load-instance> <label> [contention_s]
+# Frame Generation under GPU contention: traces <fg-instance> (tools/fg-trace) before, during and
+# after a period in which a second game (<load-instance>, already in the world with [fg] mode=off,
+# idling at [reflex] fps_limit=5) runs uncapped. Prints each trace's shift-ratio summary and the
+# FG perf lines (generated frames dropped = the present thread's 100 ms wait for DLSS-G timed out;
+# "completion check" = fence done before DLSS-G's end timestamp, builds with it).
+# Results: build/fgtrace/<label>-{pre,during,after1,after2}/. Every wait has a deadline.
+set -uo pipefail
+fg=$1 load=$2 label=$3 secs=${4:-60}
+here=$(cd "$(dirname "$0")/.." && pwd)
+L=/home/ajg/Games/aco-dlss-instances/$fg/out/aco_dlss.log
+trap '"$here/tools/ini-set" "$load" reflex.fps_limit=5' EXIT
+summary() {
+  local d=$here/build/fgtrace/$1
+  [[ -f $d/report.txt ]] || { echo "  $1: no trace"; return; }
+  echo "  $1: $(grep -E 'presents \(' "$d/report.txt" | sed 's/.*: //') | $(grep -E 'span' "$d/report.txt" | sed 's/^ *//')"
+  grep -E "shift ratio|outside" "$d/report.txt" | sed 's/^ */    /'
+}
+perf() {  # perf lines since line $1
+  tail -n +"$1" "$L" | grep -E "perf: fg real|generated frames dropped|completion check|timed out|DEBUG wait_eval" | cut -c14- |
+    sed -E 's/after the game.s Present: generated presented [^;]*; //' | tail -n "${2:-8}"
+}
+trace() {
+  local n; n=$(wc -l < "$L")
+  timeout 200 "$here/tools/fg-trace" "$fg" "$label-$1" >/dev/null 2>&1 || echo "  $1: trace failed"
+  summary "$label-$1"
+  perf "$n" 8 | sed 's/^/    /'
+}
+echo "##### $label"
+trace pre
+"$here/tools/ini-set" "$load" reflex.fps_limit=0
+t0=$SECONDS
+echo "  [contention on: $load uncapped]"
+sleep 10
+trace during
+while ((SECONDS - t0 < secs)); do sleep 2; done
+n=$(wc -l < "$L")
+"$here/tools/ini-set" "$load" reflex.fps_limit=5
+echo "  [contention off after $((SECONDS - t0)) s] perf during the rest of the contention:"
+sleep 4
+trace after1
+sleep 15
+trace after2

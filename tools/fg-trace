@@ -13,14 +13,16 @@ L=$I/out/aco_dlss.log
 cp "$here/tools/spin.py" "$I/out/"
 rm -rf "$I/out/fgtrace" "$I/out/fgtrace-start"
 start=$(wc -l < "$L")
+# (not `tail | grep -q` under pipefail: grep exiting at the first match can fail tail with SIGPIPE)
+written() { [[ $(tail -n +"$start" "$L" | grep -c "fg12: trace written") -gt 0 ]]; }
 "$here/scripts/aco" exec "$name" python3 /out/spin.py 20 "$dx" "$period" &
 spin=$!
 sleep 2
 touch "$I/out/fgtrace-start"
 end=$((SECONDS + 90))
-until tail -n +"$start" "$L" | grep -q "fg12: trace written" || ((SECONDS >= end)); do sleep 0.5; done
+until written || ((SECONDS >= end)); do sleep 0.5; done
 wait "$spin" || true
-tail -n +"$start" "$L" | grep -q "fg12: trace written" || { echo "fg-trace: no trace written (FG running? see $L)" >&2; exit 1; }
+written || { echo "fg-trace: no trace written (FG running? see $L)" >&2; exit 1; }
 out=$here/build/fgtrace/$label
 rm -rf "$out"; mkdir -p "$out"
 cp "$I"/out/fgtrace/* "$out/"

@@ -263,6 +263,54 @@ The NVRM kernel messages seen during this work (Xid 31 MMU faults in ACOrigins a
 16:45:15 local time) all happened while four game instances shared the 8 GB GPU (7.3–7.7 GB in
 use); they faulted the offending process' GPU context only.
 
+### Stale generated frames after GPU contention: the event latch (2026-11-17)
+
+On the user's machine a session that started under GPU contention showed stale generated frames
+(58/118 inverted shift ratios with `pace=smooth`, 108/118 with `pace=ready`), in runs, showing
+gen(N-2) (the texture set's previous output), and stayed that way after the contention ended. A
+fresh session was clean. Theory (9e2c3d8): a present-thread wait for DLSS-G that times out
+(100 ms) leaves its `SetEventOnCompletion` registered. When it fires, it sets the auto-reset event,
+and the *next* wait returns at once although the fence is below its value. From then on every wait
+returns one evaluation early (each registration fires during the following wait): the thread is
+latched one evaluation behind until two signals happen to coalesce.
+
+**Reproduction (t2, 2560x1600, `tools/profiles/fg-minimal.ini`, t1 as the load at PixelDensity
+2.0 uncapped, total VRAM ≤ 6.4 GB).** Debug builds of each version, made with
+`tools/fg-latch-dbg.py` (scratch copies only), count fence-event waits, timeouts and wakes with the
+fence still below the value, and add `[fg] dbg_present_wait_ms` (live) to force present-wait
+timeouts. `tools/fg-contend` traces before, during and after a 60 s contention period;
+`tools/fg-latch-force` forces timeouts (3 ms wait for 5 s), restores 100 ms and traces twice.
+
+| build | trigger | event waits that woke with the fence below the value (per 2 s), afterwards | completion check (a9fc0a2+) | traces after: inverted / n |
+|---|---|---|---|---|
+| v6 cfc92d7 | **natural**: one 100 ms timeout during a teleport load hitch (`1 timed out`, then `2`, `127`, then ~200 of ~200 waits) | ~200 of ~200, permanently | – | 62 / 112 (median ratio −0.93) |
+| v6 (earlier session, uninstrumented) | load of a second game while FG ran, VRAM 7.3 GB | – | – | 95/111 before contention, 40/110 during, 82/112 and 92/112 after |
+| v6 (instrumented, other sessions) | 60 s natural contention (t2 at 62 real fps) | 0 (no timeouts) | – | 1/118, 0/118, 0/118, 0/118 |
+| a9fc0a2, ts_guard=0 | 60 s natural contention | 0 (no timeouts) | 0 | 0/118, 1/118, –, 0/118 |
+| a9fc0a2, ts_guard=0 | forced (7 timeouts) | 173 of 173, 175 of 175 | **173 of 173** "fence done before DLSS-G's end timestamp" | **113 / 113** (median −1.53) |
+| a9fc0a2, ts_guard=1 | still latched (same session) | 172 of 172, 191 of 191 | 191 of 191, guard timeouts 0 | 1 / 118 |
+| HEAD 9e2c3d8, ts_guard=0 | 60 s natural contention | 0 | 0 | 0, 1, 0, 0 / 118 |
+| HEAD, ts_guard=0 | forced (323 timeouts) | 1 stale wake caught (`wait_on` re-checks and keeps waiting) | 0 | 0 / 118, 0 / 118 |
+| HEAD, ts_guard=1 | forced (283 timeouts) | 1 caught | 0 | 0 / 118, 0 / 118 |
+
+Conclusions:
+- The theory holds. A single present-wait timeout is enough, and the latch outlives its cause
+  indefinitely. Natural 60 s contention here (DLSS-G 7 ms, 62 real fps) never timed out; load
+  hitches (teleport/streaming, another game loading with VRAM near full) did. That matches the
+  user's session that *started* under contention.
+- The a9fc0a2 counter is misnamed for this case: the fence was *not* done. The event woke early,
+  and the end-timestamp check sees the unfinished evaluation. Both the timestamp guard and
+  `wait_on` fix the symptom; `wait_on` fixes the cause (the fence's own value is the only thing
+  trusted). The timestamp check stays useful as a cheap independent tripwire (0 on HEAD).
+- Under forced timeouts a9 hardly times out at all (7 vs ~300 on HEAD), because latched waits
+  return immediately. That is the latch hiding its own cause.
+- Caveat: these are debug builds (counters + the wait knob); the shipped HEAD differs only by those.
+- Debug-build counter line: `perf: DEBUG wait_eval: N event waits, T timed out (...), E woke with the
+  fence below the value (present thread; game thread G)`; game-thread waits never woke early in
+  any run.
+- `tools/fg-trace` occasionally reported "no trace written" although the mod wrote it: `tail | grep -q`
+  under `pipefail` fails when grep exits first (SIGPIPE). Fixed.
+
 ## Vulkan route (`mode=on`, not working)
 
 Everything up to the generated image works: DLSS-G is created and evaluated on DXVK's VkDevice every

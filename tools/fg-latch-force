@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# fg-latch-force <instance> <label> [wait_ms] [seconds]
+# Forces timeouts of the present thread's wait for DLSS-G (debug builds with [fg] dbg_present_wait_ms,
+# see tools/fg-latch-dbg.py) for a few seconds, restores 100 ms, then traces twice (tools/fg-trace)
+# and prints the shift-ratio summary and the wait counters. A build whose waits trust a stale event
+# signal stays latched one evaluation behind after the timeouts stop.
+set -uo pipefail
+name=$1 label=$2 ms=${3:-3} secs=${4:-5}
+here=$(cd "$(dirname "$0")/.." && pwd)
+L=/home/ajg/Games/aco-dlss-instances/$name/out/aco_dlss.log
+trap '"$here/tools/ini-set" "$name" fg.dbg_present_wait_ms=100' EXIT
+show() {
+  local d=$here/build/fgtrace/$1
+  [[ -f $d/report.txt ]] || { echo "  $1: no trace"; return; }
+  echo "  $1:"; grep -E "shift ratio|outside" "$d/report.txt" | sed 's/^ */    /'
+}
+counters() {
+  tail -n +"$1" "$L" | grep -E "DEBUG wait_eval|completion check|generated frames dropped" | cut -c14- |
+    sed -E 's/after the game.s Present: generated presented [^;]*; //' | tail -n "${2:-6}" | sed 's/^/    /'
+}
+echo "##### $label (present wait ${ms} ms for ${secs} s)"
+n=$(wc -l < "$L")
+"$here/tools/ini-set" "$name" fg.dbg_present_wait_ms="$ms"
+sleep "$secs"
+"$here/tools/ini-set" "$name" fg.dbg_present_wait_ms=100
+sleep 2
+echo "  while forced:"; counters "$n" 6
+for k in after1 after2; do
+  n=$(wc -l < "$L")
+  timeout 200 "$here/tools/fg-trace" "$name" "$label-$k" >/dev/null 2>&1 || echo "  $k: trace failed"
+  show "$label-$k"; counters "$n" 4
+  sleep 10
+done
