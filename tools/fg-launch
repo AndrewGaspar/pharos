@@ -3,11 +3,12 @@
 # Frame Generation dev loop: fresh game launch with build/mod plus ini overrides, waits until the
 # mod's Frame Generation is running (new log only), then drives the menus into Discovery Tour.
 # ACO_PROFILE=<tools/profiles name> picks the graphics profile (default ultra-high).
+# ACO_MOD=<dir> launches another build instead of build/mod.
 set -euo pipefail
 name=$1; shift
 here=$(cd "$(dirname "$0")/.." && pwd)
 I=/home/ajg/Games/aco-dlss-instances/$name
-mod=$(mktemp -d); cp -a "$here/build/mod/." "$mod/"
+mod=$(mktemp -d); cp -a "${ACO_MOD:-$here/build/mod}/." "$mod/"
 for kv in "$@"; do
   sec=${kv%%.*}; rest=${kv#*.}; key=${rest%%=*}; val=${rest#*=}
   python3 -I - "$mod/aco_dlss.ini" "$sec" "$key" "$val" <<'PY'
