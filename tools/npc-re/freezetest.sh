@@ -21,7 +21,7 @@ for spec in "$@"; do
     sleep 5
     if (( $(date +%s) - $(stat -c %Y "$L") > 15 )); then froze=1; break; fi
   done
-  ex=$(grep 'npc_units: [0-9]* extra' "$L" | tail -1 | sed 's/.*npc_units: \([0-9]*\) extra units (\([0-9]*\) units handled.*/\1 extras, \2 handled/')
+  ex=$(grep 'npc_units: [0-9]* [a-z ]*extra' "$L" | tail -1 | sed 's/.*npc_units: \([0-9]*\) [a-z ]*extra units (\([0-9]*\) units handled.*/\1 extras, \2 handled/')
   fps=$(grep -o 'perf: [0-9.]* fps' "$L" | tail -5 | awk '{s+=$2; n++} END {if (n) printf "%.1f", s/n}')
   echo "k=$k max=$mx: $( ((froze)) && echo "FROZE after $((secs - (end - SECONDS))) s" || echo "ok for $secs s"), $ex, last fps $fps"
   ACO_INST=$t python3 "$W/tools/npc-re/bulkcount.py" | sed "s/^/    bulk: /"

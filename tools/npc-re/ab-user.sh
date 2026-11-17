@@ -32,7 +32,7 @@ run_one() {
   real=$(grep -o 'fg real [0-9.]* fps' /tmp/abuser.$$ | awk '{s+=$3; n++} END {if (n) printf "%.1f", s/n}')
   pres=$(grep -o '= [0-9.]* presents/s' /tmp/abuser.$$ | awk '{s+=$2; n++} END {if (n) printf "%.1f", s/n}')
   fps=$(grep -o 'perf: [0-9.]* fps' /tmp/abuser.$$ | awk '{s+=$2; n++} END {if (n) printf "%.1f", s/n}')
-  extra=$(grep 'npc_units: [0-9]* extra\|npc_units: cost' /tmp/abuser.$$ | tail -2 | sed 's/.*npc_units: /  /')
+  extra=$(grep 'npc_units: [0-9]* [a-z ]*extra\|npc_units: cost' /tmp/abuser.$$ | tail -2 | sed 's/.*npc_units: /  /')
   tls=$(grep -o 'TLS slots free [0-9]* (min [0-9]*)' /tmp/abuser.$$ | tail -1)
   rm -f /tmp/abuser.$$
   task=$(echo "$out" | sed -n 's/.*TaskThread# \([0-9]*\).*/\1/p')

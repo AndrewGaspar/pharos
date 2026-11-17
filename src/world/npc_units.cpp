@@ -212,6 +212,33 @@ unsigned augment_spawner(uintptr_t mgr, uintptr_t sp, int k, float px, float py,
   return made;
 }
 
+// Units of areas the world streams out are destroyed with their spawners, so the handled / extra
+// sets would keep stale pointers (and a reused address would make a new unit look handled). Once a
+// minute keep only units that still sit in a spawner, and count the live extras.
+ULONGLONG g_last_prune = 0;
+void prune(uintptr_t mgr) {
+  uintptr_t list = rd<uintptr_t>(mgr + kObjListOff);
+  uint32_t n = rd<uint32_t>(mgr + kObjListOff + 8);
+  if (!n || n > 400000 || !readable(list, size_t(n) * 8)) return;
+  std::unordered_set<uintptr_t> live;
+  live.reserve(g_done.size() + 1024);
+  const uintptr_t spvt = g_base + kSpawnerVtRva;
+  for (uint32_t i = 0; i < n; ++i) {
+    uintptr_t sp = rd<uintptr_t>(list + 8 * i);
+    if (!sp || rd<uintptr_t>(sp) != spvt) continue;
+    uintptr_t arr = rd<uintptr_t>(sp + 0xa0);
+    uint32_t nu = rd<uint32_t>(sp + 0xa8) >> 17;
+    if (!arr || nu > 16384) continue;
+    for (uint32_t j = 0; j < nu; ++j) live.insert(rd<uintptr_t>(arr + 8 * j));
+  }
+  for (auto it = g_done.begin(); it != g_done.end();) it = live.count(*it) ? std::next(it) : g_done.erase(it);
+  std::vector<uintptr_t> keep;
+  keep.reserve(g_created.size());
+  for (uintptr_t u : g_created) if (live.count(u)) keep.push_back(u);
+  g_created.swap(keep);
+  g_extras = static_cast<unsigned>(g_created.size());
+}
+
 void step(uintptr_t mgr) {
   int k = g_k.load();
   if (k <= 1) return;
@@ -246,7 +273,10 @@ void step(uintptr_t mgr) {
     made += augment_spawner(mgr, sp, k, px, py, g_rate.load() - made);
   }
   g_cursor = i;  // resume where this slice stopped
-  if (g_done.size() > 200000) g_done.clear();
+  if (now - g_last_prune > 60000) {
+    g_last_prune = now;
+    prune(mgr);
+  }
   g_stat_extras = g_extras;
   g_stat_failed = g_failed;
   g_stat_spawners = static_cast<unsigned>(g_done.size());
@@ -381,7 +411,7 @@ void npc_units_on_present() {
   if (now - last_stat >= 10000) {
     last_stat = now;
     uintptr_t lu = g_last_unit.load();
-    ACO_LOG("npc_units: %u extra units (%u units handled, %u failed), objective list %u, last extra %p (activation %p)",
+    ACO_LOG("npc_units: %u live extra units (%u units handled, %u failed), objective list %u, last extra %p (activation %p)",
             g_stat_extras.load(), g_stat_spawners.load(), g_stat_failed.load(), g_list_n.load(),
             reinterpret_cast<void*>(lu), reinterpret_cast<void*>(lu && readable(lu + 0x1b8, 8) ? rd<uintptr_t>(lu + 0x1b8) : 0));
     LARGE_INTEGER f;

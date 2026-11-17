@@ -30,7 +30,7 @@ run_one() {  # one launch + measurement of $k $d $dist; prints the block; return
   fps=$(grep -o 'perf: [0-9.]* fps' /tmp/abbands.$$ | awk '{s+=$2; n++} END {if (n) printf "%.1f", s/n}')
   g=$(grep 'geo:' /tmp/abbands.$$ | sed 's/.*dispatches \([0-9]*\) groups.*/\1/' | awk '{s+=$1; n++} END {if (n) printf "%.0f", s/n}')
   sp=$(grep 'npc: [0-9]* spawned' /tmp/abbands.$$ | sed 's/.*npc: \([0-9]*\) spawned.*/\1/' | awk '{s+=$1; n++} END {if (n) printf "%.0f", s/n}')
-  extra=$(grep 'npc_units: [0-9]* extra\|npc_units: cost' /tmp/abbands.$$ | tail -2 | sed 's/.*npc_units: /  /')
+  extra=$(grep 'npc_units: [0-9]* [a-z ]*extra\|npc_units: cost' /tmp/abbands.$$ | tail -2 | sed 's/.*npc_units: /  /')
   tls=$(grep -o 'TLS slots free [0-9]* (min [0-9]*)' /tmp/abbands.$$ | tail -1)
   rm -f /tmp/abbands.$$
   task=$(echo "$out" | sed -n 's/.*TaskThread# \([0-9]*\).*/\1/p')

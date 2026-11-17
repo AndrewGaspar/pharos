@@ -19,7 +19,7 @@ while ((SECONDS < end)) && kill -0 $rpid 2>/dev/null; do
   sleep 60
   age=$(( $(date +%s) - $(stat -c %Y "$L") ))
   sp=$(grep 'npc: [0-9]* spawned' "$L" | tail -1 | sed 's/.*npc: \([0-9]*\) spawned.*/\1/')
-  ex=$(grep 'npc_units: [0-9]* extra' "$L" | tail -1 | sed 's/.*npc_units: \([0-9]*\) extra units (\([0-9]*\) units handled, \([0-9]*\) failed).*/\1 extras, \3 failed/')
+  ex=$(grep 'npc_units: [0-9]* [a-z ]*extra' "$L" | tail -1 | sed 's/.*npc_units: \([0-9]*\) [a-z ]*extra units (\([0-9]*\) units handled, \([0-9]*\) failed).*/\1 extras, \3 failed/')
   co=$(grep 'npc_units: cost' "$L" | tail -1 | sed 's/.*ours \([0-9.]*\) ms avg \/ \([0-9.]*\) ms max/ours \1 ms avg, \2 max/')
   fr=$(grep -o 'fg real [0-9.]* fps\|perf: [0-9.]* fps' "$L" | tail -1)
   tl=$(grep -o 'TLS slots free [0-9]* (min [0-9]*)' "$L" | tail -1)
