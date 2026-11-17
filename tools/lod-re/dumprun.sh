@@ -10,10 +10,10 @@ scripts/aco kill-game t1
 scripts/aco game t1 --mod build/mod --profile "$profile" >/dev/null
 timeout 400 scripts/aco-dt t1 | tail -1
 sleep 20
-n0=$(grep -c "dump: wrote" $O/aco_dlss.log || true)
+n0=$(grep -c "dump: wrote" $O/pharos.log || true)
 touch $O/dump-image
-for i in $(seq 90); do [ "$(grep -c "dump: wrote" $O/aco_dlss.log || true)" -gt "$n0" ] && break; sleep 2; done
-grep "dump: wrote" $O/aco_dlss.log | tail -1
+for i in $(seq 90); do [ "$(grep -c "dump: wrote" $O/pharos.log || true)" -gt "$n0" ] && break; sleep 2; done
+grep "dump: wrote" $O/pharos.log | tail -1
 mv $O/ACOrigins.image "$D/$label.image"
-grep "geo:" $O/aco_dlss.log | tail -2
+grep "geo:" $O/pharos.log | tail -2
 echo "dumped $label"

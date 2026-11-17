@@ -5,7 +5,7 @@ struct IDXGISwapChain;
 
 namespace aco {
 
-// Input-to-frame latency instrumentation (enabled with latency_log=1 in aco_dlss.ini).
+// Input-to-frame latency instrumentation (enabled with latency_log=1 in pharos.ini).
 //
 // Writes two CSVs to the out dir, all times in ns of the QPC clock (under Wine this is
 // CLOCK_MONOTONIC_RAW, so external input injectors on the Linux side can share the time base):

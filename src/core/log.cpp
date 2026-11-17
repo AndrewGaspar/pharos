@@ -35,7 +35,7 @@ const std::wstring& out_dir() {
 void log_init() {
   std::lock_guard lock(g_mutex);
   if (g_file) return;
-  std::wstring path = out_dir() + L"\\aco_dlss.log";
+  std::wstring path = out_dir() + L"\\pharos.log";
   g_file = _wfopen(path.c_str(), L"w");
 }
 

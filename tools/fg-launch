@@ -11,7 +11,7 @@ I=/home/ajg/Games/aco-dlss-instances/$name
 mod=$(mktemp -d); cp -a "${ACO_MOD:-$here/build/mod}/." "$mod/"
 for kv in "$@"; do
   sec=${kv%%.*}; rest=${kv#*.}; key=${rest%%=*}; val=${rest#*=}
-  python3 -I - "$mod/aco_dlss.ini" "$sec" "$key" "$val" <<'PY'
+  python3 -I - "$mod/pharos.ini" "$sec" "$key" "$val" <<'PY'
 import sys
 p, sec, key, val = sys.argv[1:]
 lines = open(p).read().split("\n"); cur = None; done = False
@@ -24,7 +24,7 @@ open(p, "w").write("\n".join(lines))
 PY
 done
 "$here/scripts/aco" kill-game "$name" >/dev/null 2>&1 || true
-rm -f "$I/out/aco_dlss.log" "$I"/out/nvngx*.log
+rm -f "$I/out/pharos.log" "$I"/out/nvngx*.log
 "$here/scripts/aco" game "$name" --mod "$mod" --profile "${ACO_PROFILE:-ultra-high}" >/dev/null
 rm -rf "$mod"
 "$here/scripts/aco-dt" "$name"

@@ -4,8 +4,8 @@
 set -uo pipefail
 t=$1 settle=$2; shift 2
 I=/home/ajg/Games/aco-dlss-instances/$t
-INI="$I/prefix/drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher/games/Assassin's Creed Origins/aco_dlss.ini"
-L=$I/out/aco_dlss.log
+INI="$I/prefix/drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher/games/Assassin's Creed Origins/pharos.ini"
+L=$I/out/pharos.log
 touch "$I/out/geo"
 for arg in "$@"; do
   d=${arg%%:*} dist=${arg#*:}

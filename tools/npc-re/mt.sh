@@ -4,7 +4,7 @@
 set -euo pipefail
 t=$1; shift
 O=/home/ajg/Games/aco-dlss-instances/$t/out
-L=$O/aco_dlss.log
+L=$O/pharos.log
 n0=$(wc -l < "$L")
 printf '%s\n' "$@" > "$O/memtool.txt"
 end=$((SECONDS + 90))

@@ -81,7 +81,7 @@ rep("""void present_loop() {""", """DWORD dbg_present_wait_ms() {
   int64_t t = now_us();
   if (t - last > 500000) {
     last = t;
-    v = GetPrivateProfileIntW(L"fg", L"dbg_present_wait_ms", 100, (module_dir() + L"\\\\aco_dlss.ini").c_str());
+    v = GetPrivateProfileIntW(L"fg", L"dbg_present_wait_ms", 100, (module_dir() + L"\\\\pharos.ini").c_str());
   }
   return v;
 }

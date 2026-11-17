@@ -3,7 +3,7 @@
 set -uo pipefail
 vt=$1; shift
 O=/home/ajg/Games/aco-dlss-instances/t1/out
-L=$O/aco_dlss.log
+L=$O/pharos.log
 avg() { # average indirect/frame of the last 3 geo lines
   grep "geo:" $L | tail -3 | sed 's/.*, \([0-9]*\) indirect.*/\1/' | awk '{s+=$1} END {printf "%.0f", s/NR}'
 }

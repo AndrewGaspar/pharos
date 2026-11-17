@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # capsweep.sh <instance> <settle s> <density:distance>... : live sweep of [world] npc_density /
-# npc_distance (written to the instance's aco_dlss.ini; reloaded live), reporting per step the
+# npc_distance (written to the instance's pharos.ini; reloaded live), reporting per step the
 # spawned count (mean of the mod's 10 s log lines over the last half of the settle time) and the
 # in-view skinning load. Leaves the last setting in place.
 set -uo pipefail
 t=$1 settle=$2; shift 2
 I=/home/ajg/Games/aco-dlss-instances/$t
-INI="$I/prefix/drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher/games/Assassin's Creed Origins/aco_dlss.ini"
-L=$I/out/aco_dlss.log
+INI="$I/prefix/drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher/games/Assassin's Creed Origins/pharos.ini"
+L=$I/out/pharos.log
 for arg in "$@"; do
   d=${arg%%:*} dist=${arg#*:}
   sed -i "/^\[world\]/,\$ s/^npc_density=.*/npc_density=$d/; /^\[world\]/,\$ s/^npc_distance=.*/npc_distance=$dist/" "$INI"

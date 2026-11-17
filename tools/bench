@@ -9,11 +9,11 @@ I=/home/ajg/Games/aco-dlss-instances/$name
 ini="$I/prefix/drive_c/users/steamuser/Documents/Assassin's Creed Origins/ACO.ini"
 sed -i "s/^PixelDensity=.*/PixelDensity=$density/; s/^VSyncMode=.*/VSyncMode=0/" "$ini"
 mod=$(mktemp -d); cp -a "$here/build/mod/." "$mod/"
-sed -i 's/^render_scale=.*/render_scale=0/' "$mod/aco_dlss.ini"
-for kv in "$@"; do sed -i "s/^${kv%%=*}=.*/$kv/" "$mod/aco_dlss.ini"; done
+sed -i 's/^render_scale=.*/render_scale=0/' "$mod/pharos.ini"
+for kv in "$@"; do sed -i "s/^${kv%%=*}=.*/$kv/" "$mod/pharos.ini"; done
 "$here/scripts/aco" game "$name" --mod "$mod" >/dev/null
 "$here/scripts/aco-dt" "$name" >/dev/null 2>&1
 sleep 12
-grep "perf: [0-9]" "$I/out/aco_dlss.log" | tail -4 | sed 's/.*perf: //' |
+grep "perf: [0-9]" "$I/out/pharos.log" | tail -4 | sed 's/.*perf: //' |
   awk -v l="$label" '{fps+=$1; split($0,a,"upscale gpu "); split(a[2],b," "); gpu+=b[1]; line=$0} END {printf "%-22s %6.1f fps  upscale gpu %.2f ms  (%s)\n", l, fps/NR, gpu/NR, substr(line, index(line,"render"))}'
 rm -rf "$mod"

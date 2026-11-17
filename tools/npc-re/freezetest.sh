@@ -5,12 +5,12 @@
 set -uo pipefail
 t=$1 mod=$2 secs=$3; shift 3
 W=$(cd "$(dirname "$0")/../.." && pwd)
-L=/home/ajg/Games/aco-dlss-instances/$t/out/aco_dlss.log
+L=/home/ajg/Games/aco-dlss-instances/$t/out/pharos.log
 for spec in "$@"; do
   IFS=: read -r k mx <<<"$spec"
-  sed -i "s/^npc_units=.*/npc_units=$k/" "$mod/aco_dlss.ini"
-  grep -q '^npc_units_max=' "$mod/aco_dlss.ini" || sed -i "s/^npc_units=.*/&\nnpc_units_max=0/" "$mod/aco_dlss.ini"
-  sed -i "s/^npc_units_max=.*/npc_units_max=$mx/" "$mod/aco_dlss.ini"
+  sed -i "s/^npc_units=.*/npc_units=$k/" "$mod/pharos.ini"
+  grep -q '^npc_units_max=' "$mod/pharos.ini" || sed -i "s/^npc_units=.*/&\nnpc_units_max=0/" "$mod/pharos.ini"
+  sed -i "s/^npc_units_max=.*/npc_units_max=$mx/" "$mod/pharos.ini"
   if "$W/tools/npc-re/userplaying.sh"; then echo "not launching: the user is playing"; exit 2; fi
   "$W/scripts/aco" kill-game "$t" >/dev/null 2>&1
   "$W/scripts/aco" fixture "$t" story-alexandria-port >/dev/null 2>&1

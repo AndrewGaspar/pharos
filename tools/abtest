@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # abtest <instance> <crop WxH+X+Y> <label=key:val,key:val> ...
-# For each variant: patch the live aco_dlss.ini, wait for reload + DLSS convergence, take 4 shots,
+# For each variant: patch the live pharos.ini, wait for reload + DLSS convergence, take 4 shots,
 # report sharpness (Laplacian std-dev, higher = sharper) and temporal noise (mean abs diff between
 # consecutive shots, lower = more stable) on the crop.
 set -euo pipefail
 name=$1 crop=$2; shift 2
 here=$(cd "$(dirname "$0")/.." && pwd)
-ini="/home/ajg/Games/aco-dlss-instances/$name/prefix/drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher/games/Assassin's Creed Origins/aco_dlss.ini"
+ini="/home/ajg/Games/aco-dlss-instances/$name/prefix/drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher/games/Assassin's Creed Origins/pharos.ini"
 out=${ABTEST_OUT:-$here/build/abtest}; mkdir -p "$out"
 for variant in "$@"; do
   label=${variant%%=*}; kvs=${variant#*=}

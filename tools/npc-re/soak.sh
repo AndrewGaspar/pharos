@@ -7,8 +7,8 @@ t=$1 mins=$2 d=$3 dist=$4; shift 4
 here=$(cd "$(dirname "$0")" && pwd)
 W=$here/../..
 I=/home/ajg/Games/aco-dlss-instances/$t
-INI="$I/prefix/drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher/games/Assassin's Creed Origins/aco_dlss.ini"
-L=$I/out/aco_dlss.log
+INI="$I/prefix/drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher/games/Assassin's Creed Origins/pharos.ini"
+L=$I/out/pharos.log
 locs=("$@")
 sed -i "/^\[world\]/,\$ s/^npc_density=.*/npc_density=$d/; /^\[world\]/,\$ s/^npc_distance=.*/npc_distance=$dist/" "$INI"
 end=$((SECONDS + mins * 60)); i=0; next_tp=$((SECONDS + 90)); status=ok

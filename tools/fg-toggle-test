@@ -7,7 +7,7 @@
 set -uo pipefail
 name=$1; n=${2:-6}; shift; shift || true
 here=$(cd "$(dirname "$0")/.." && pwd)
-L=/home/ajg/Games/aco-dlss-instances/$name/out/aco_dlss.log
+L=/home/ajg/Games/aco-dlss-instances/$name/out/pharos.log
 timeout 420 "$here/tools/fg-launch" "$name" fg.mode=d3d12 fg.enabled=1 fg.verify=1 "$@" >/dev/null 2>&1 \
   || { echo "launch failed"; exit 1; }
 end=$((SECONDS + 120))

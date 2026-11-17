@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(aco_dlss LANGUAGES C CXX)
+project(pharos LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

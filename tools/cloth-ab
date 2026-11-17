@@ -6,7 +6,7 @@
 set -euo pipefail
 name=$1 fps=${2:-165}
 here=$(cd "$(dirname "$0")/.." && pwd)
-gi="/home/ajg/Games/aco-dlss-instances/$name/prefix/drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher/games/Assassin's Creed Origins/aco_dlss.ini"
+gi="/home/ajg/Games/aco-dlss-instances/$name/prefix/drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher/games/Assassin's Creed Origins/pharos.ini"
 sed -i "/^\[reflex\]/,/^\[/ s/^fps_limit=.*/fps_limit=$fps/" "$gi"
 for mode in game render game render; do
   sed -i "/^\[cloth\]/,\$ s/^mode=.*/mode=$mode/" "$gi"

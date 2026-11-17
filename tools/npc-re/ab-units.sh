@@ -3,13 +3,13 @@
 # launch of the story fixture story-alexandria-port: load (player at the Alexandria spawn anchor),
 # hop 180 m west for 30 s (so the units around the spawn anchor deactivate and, with k > 1, get their
 # extras), hop back, settle, then inview-now.sh 120 s (skinning groups/frame + units near) and the
-# spawned count. The mod dir's aco_dlss.ini is edited (npc_units=k) before each launch.
+# spawned count. The mod dir's pharos.ini is edited (npc_units=k) before each launch.
 set -uo pipefail
 t=$1 mod=$2; shift 2
 W=$(cd "$(dirname "$0")/../.." && pwd)
-L=/home/ajg/Games/aco-dlss-instances/$t/out/aco_dlss.log
+L=/home/ajg/Games/aco-dlss-instances/$t/out/pharos.log
 for k in "$@"; do
-  sed -i "s/^npc_units=.*/npc_units=$k/" "$mod/aco_dlss.ini"
+  sed -i "s/^npc_units=.*/npc_units=$k/" "$mod/pharos.ini"
   if "$W/tools/npc-re/userplaying.sh"; then echo "$(date -u +%H:%M:%S) not launching: the user is playing"; exit 2; fi
   "$W/scripts/aco" kill-game "$t" >/dev/null 2>&1
   "$W/scripts/aco" fixture "$t" story-alexandria-port >/dev/null 2>&1
