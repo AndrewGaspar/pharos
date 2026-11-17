@@ -1040,6 +1040,9 @@ struct Presenter {
   // the pacing wait - for the generated (g) and real (r) present.
   std::atomic<int64_t> seg_us[6] = {};  // pickup, fill_g, present_g, wait, fill_r, present_r
   int64_t last_real_call = 0;  // present thread: when the last real Present was called
+  std::atomic<int64_t> ready_lag_sum{0};  // [fg] auto_cap inputs
+  std::atomic<uint32_t> ready_lag_n{0};
+  uint32_t cap_join_n = 0;
 } P;
 
 ID3D11Texture2D* real_backbuffer(IDXGISwapChain* sc) {
@@ -1114,6 +1117,10 @@ void present_loop() {
     // time even when the game's frame times vary (with VRR this is what makes motion smooth; an even
     // present cadence over uneven content times makes the image speed up and slow down).
     int64_t real_target = 0;
+    if (gen_ready) {  // auto cap: how long after the game's Present DLSS-G was done
+      P.ready_lag_sum += t0 - j.arrive_us;
+      ++P.ready_lag_n;
+    }
     if (gen_ready && j.half_us > 0) {
       static int64_t lag_us = 0, lag_c = 0;
       int64_t ready_lag = t0 - j.arrive_us;
@@ -1200,6 +1207,71 @@ void join(size_t outstanding = 0) {
   P.cv.wait_for(lk, std::chrono::milliseconds(500), ok);
   P.perf_join_ms += (now_us() - t0) / 1000.0;
   ++P.perf_join_n;
+  ++P.cap_join_n;
+}
+
+// [fg] auto_cap: a real-frame-rate cap with headroom, found by feedback. Without headroom the GPU
+// queue fills (DLSS-G runs on a second device the game's Reflex doesn't account for), DLSS-G
+// finishes ~2 frames after the game's Present, the present thread falls behind and the game blocks
+// on it at irregular times: uneven game frame times = uneven motion, and ~10 ms more latency. With
+// headroom DLSS-G is done well within a frame. Every second: if DLSS-G finished later than
+// auto_cap_lag of a frame interval after the game's Present on average, or the game had to wait for
+// the present thread, the cap drops 4 %; if it finished within auto_cap_lag - 0.15 and the game
+// never waited, it rises 1 % (4 % when far below the target). Starts 2 s after FG starts, at 90 %
+// of the rate then.
+std::atomic<float> g_auto_cap{0};
+void auto_cap_update(bool fg_active) {
+  const Config& cfg = config();
+  static int64_t last = 0, since = 0;
+  static uint32_t frames = 0;
+  int64_t now = now_us();
+  ++frames;
+  if (!cfg.fg_auto_cap || !fg_active) {
+    g_auto_cap = 0;
+    last = since = 0;
+    return;
+  }
+  if (!since) since = now;
+  if (now - since < 2000000) return;  // let FG settle (and loading end) first
+  if (!last) {
+    last = now;
+    frames = 0;
+    P.ready_lag_sum = 0;
+    P.ready_lag_n = 0;
+    P.cap_join_n = 0;
+    return;
+  }
+  if (now - last < 1000000) return;
+  double secs = (now - last) / 1e6;
+  double fps = frames / secs;
+  uint32_t n = P.ready_lag_n.exchange(0);
+  double lag = n ? double(P.ready_lag_sum.exchange(0)) / n : 0;
+  uint32_t waits = P.cap_join_n;
+  P.cap_join_n = 0;
+  frames = 0;
+  last = now;
+  double interval = fps > 1 ? 1e6 / fps : 0;
+  double ratio = interval > 0 ? lag / interval : 0;
+  float cap = g_auto_cap.load();
+  if (cap <= 0) {
+    cap = static_cast<float>(fps * 0.9);
+  } else if (ratio > cfg.fg_auto_cap_lag || waits > fps * 0.02) {
+    cap = static_cast<float>(std::min<double>(cap, fps) * 0.96);
+  } else if (ratio < cfg.fg_auto_cap_lag - 0.35 && waits == 0) {
+    cap *= 1.04f;
+  } else if (ratio < cfg.fg_auto_cap_lag - 0.15 && waits == 0) {
+    cap *= 1.01f;
+  }
+  float lo = cfg.fg_auto_cap_min > 0 ? cfg.fg_auto_cap_min : 30.0f;
+  float hi = cfg.fg_auto_cap_max > 0 ? cfg.fg_auto_cap_max : 240.0f;
+  cap = std::max(lo, std::min(hi, cap));
+  static float logged = 0;
+  if (std::fabs(cap - logged) > 3.0f) {
+    ACO_LOG("fg12: auto cap %.1f fps (real %.1f fps, DLSS-G done %.1f ms = %.2f frames after the game's Present, game "
+            "waited %u times)", cap, fps, lag / 1000.0, ratio, waits);
+    logged = cap;
+  }
+  g_auto_cap = cap;
 }
 
 void enqueue(IDXGISwapChain* sc, PFN_RealPresent present, UINT sync, UINT flags, int64_t half, const std::string& show,
@@ -1466,6 +1538,8 @@ void fg12_before_resize() {
 
 bool fg12_proxy_active() { return P.proxy == 1; }
 
+float fg12_auto_cap() { return g_auto_cap.load(); }
+
 // Runtime Frame Generation on/off ([fg] toggle_key, default F9; initial state [fg] enabled). The
 // D3D12 device, NGX and the present thread stay alive while off; frames then go out like mode=off.
 bool g_fg_on = true;
@@ -1615,6 +1689,7 @@ bool fg12_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent rea
     // present then waited half of that and the game, blocked in join, ran at 2 fps for half a minute
     // while the EMA decayed - also after every menu or loading screen.)
     S.last_real_present = 0;
+    auto_cap_update(false);
     return true;
   }
 
@@ -1626,6 +1701,7 @@ bool fg12_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent rea
     S.frame_interval_us = S.frame_interval_us > 0 ? S.frame_interval_us * 0.9 + dt * 0.1 : std::min(dt, 50000.0);
   }
   S.last_real_present = arrive;
+  auto_cap_update(true);
   ++S.perf_real;
   perf_report();
   if (proxy) perf_join_report();

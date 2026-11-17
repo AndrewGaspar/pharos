@@ -5,6 +5,7 @@
 #include <dxgi.h>
 
 #include <algorithm>
+#include <cmath>
 #include <atomic>
 #include <map>
 #include <mutex>
@@ -13,6 +14,7 @@
 #include "core/config.h"
 #include "core/iat.h"
 #include "core/log.h"
+#include "fg/fg_d3d12.h"
 #include "reflex/nvapi_min.h"
 
 namespace aco {
@@ -144,28 +146,40 @@ SleepResult sleep_with_watchdog(DWORD timeout_ms) {
   return WaitForSingleObject(S.sleep_done, timeout_ms) == WAIT_OBJECT_0 ? SleepResult::ok : SleepResult::overrun;
 }
 
+// fps_limit, or Frame Generation's automatic cap when no explicit limit is set.
+float effective_limit() {
+  float l = config().reflex_fps_limit;
+  return l > 0 ? l : fg12_auto_cap();
+}
+
 // (Re)applies the sleep mode when the config or the device changed.
 void apply_mode() {
   const Config& cfg = config();
+  const float limit = effective_limit();
   if (S.stalled) return;
-  if (S.applied_dev == S.dev && S.applied_mode == cfg.reflex && S.applied_limit == cfg.reflex_fps_limit &&
+  if (S.applied_dev == S.dev && S.applied_mode == cfg.reflex && std::fabs(S.applied_limit - limit) < 0.5f &&
       S.applied_optimize == cfg.reflex_optimize && S.applied_limiter == cfg.reflex_limiter)
     return;
   S.applied_limiter = cfg.reflex_limiter;
   S.applied_optimize = cfg.reflex_optimize;
   S.applied_dev = S.dev;
   S.applied_mode = cfg.reflex;
-  S.applied_limit = cfg.reflex_fps_limit;
+  S.applied_limit = limit;
   nv::SetSleepModeParams p{};
   p.version = nv::kSetSleepModeVer;
   p.bLowLatencyMode = cfg.reflex == "on" || cfg.reflex == "boost";
   p.bLowLatencyBoost = cfg.reflex == "boost";
-  p.minimumIntervalUs = cfg.reflex_fps_limit > 0 && cfg.reflex_limiter != "cpu"
-                            ? static_cast<nv::NvU32>(1e6 / cfg.reflex_fps_limit) : 0;
+  p.minimumIntervalUs = limit > 0 && cfg.reflex_limiter != "cpu" ? static_cast<nv::NvU32>(1e6 / limit) : 0;
   p.bUseMarkersToOptimize = cfg.reflex_optimize;
   nv::Status st = S.set_sleep_mode(S.dev, &p);
   S.sleeping = st == 0 && p.bLowLatencyMode;
   S.frame_begun = false;
+  static std::string last_logged;
+  char key[96];
+  snprintf(key, sizeof(key), "%d%d%d%d%d", p.bLowLatencyMode, p.bLowLatencyBoost, p.minimumIntervalUs > 0,
+           p.bUseMarkersToOptimize, st);
+  if (key == last_logged && cfg.reflex_fps_limit <= 0) return;  // only the automatic cap moved
+  last_logged = key;
   ACO_LOG("reflex: SetSleepMode(low_latency=%d boost=%d min_interval=%uus optimize=%d) -> %d", p.bLowLatencyMode,
           p.bLowLatencyBoost, p.minimumIntervalUs, p.bUseMarkersToOptimize, st);
   if (S.get_sleep_status) {
@@ -347,11 +361,13 @@ void reflex_on_present_begin(IDXGISwapChain* sc) {
 // game falls behind by more than a frame the grid restarts from now (no catch-up bursts).
 void cpu_limit() {
   const Config& cfg = config();
-  if (cfg.reflex_limiter != "cpu" || cfg.reflex_fps_limit <= 0) {
+  const float limit = effective_limit();
+  // limiter=driver needs Reflex sleeping; without it (mode=off, or not armed yet) we enforce the cap.
+  if ((cfg.reflex_limiter != "cpu" && S.sleeping) || limit <= 0) {
     S.cap_next = 0;
     return;
   }
-  int64_t interval = static_cast<int64_t>(1e6 / cfg.reflex_fps_limit);
+  int64_t interval = static_cast<int64_t>(1e6 / limit);
   int64_t now = now_us();
   if (!S.cap_next || now - S.cap_next > interval) S.cap_next = now;
   for (;;) {
@@ -371,7 +387,7 @@ void reflex_on_present_end() {
   ++S.frame_id;
   int64_t t0 = now_us();
   // Generous: a legitimate sleep is at most about one frame (or one fps_limit interval).
-  float limit = config().reflex_fps_limit;
+  float limit = effective_limit();
   DWORD timeout = 500 + (limit > 0 ? static_cast<DWORD>(2000.0f / limit) : 0);
   SleepResult r = sleep_with_watchdog(timeout);
   if (r != SleepResult::ok) {
