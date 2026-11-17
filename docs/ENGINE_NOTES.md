@@ -327,7 +327,68 @@ Alexandria harbour (535-607 spawned) and Memphis (130-306), 84-89 fps, no hang (
   tagged-unit array at +0x14}; `MetaAISpawnerDeadUnitSaveData` = two qwords + handle). Killing a
   clone in story mode would most likely write a record for an id the vanilla game never created;
   how a load treats that is unknown. This is the stop condition for runtime cloning until the
-  dead-unit write path (and whether clones can be excluded from it) is understood.
+  dead-unit write path (and whether clones can be excluded from it) is understood. (Resolved
+  below: there is no per-unit id in the save.)
+
+#### What the MetaAI save stores about units (dead / tagged units)
+
+Found statically (headless Ghidra) and checked against a loaded story save (t1, fixture
+`story-alexandria-port`, hardware breakpoints on the serializers during the load).
+
+- **Layouts.** `MetaAISaveData` (TypeInfo size 0x48, serializer RVA 0x1df9990) = Anvil arrays at
+  +0x0 (16-byte elements), **+0xc `MetaAISpawnerSaveData`** (0x20), +0x18 (0x18), +0x24 (8-byte
+  links: `MetaAITaggedStaticSaveData`). The live object that the game fills also has two
+  runtime-only arrays: +0x30 (pointers to virtual spawners) and +0x3c (0xf0-byte per-spawner
+  "recently killed" counters with timestamps, expired by RVA 0x1dcea40 after
+  `[0x4c59408]+0x187c` seconds; used to throttle respawns, RVA 0x1df1200 / 0x1def2a0; not saved).
+  `MetaAISpawnerSaveData` (serializer 0x1df9ea0) = {+0 link to the spawner's *data* objective,
+  +0x8 dead-unit array, +0x14 tagged-unit array}. `MetaAISpawnerDeadUnitSaveData` (0x20,
+  serializer 0x1df9e20) = {+0 Vec4 = the unit's position (x, y, z, 0), +0x10 link to the unit's
+  data objective}. `MetaAISpawnerTaggedUnitSaveData` (0x10) = {link, u32 tag, u32 count}.
+  Anvil property type codes seen: 0x0d = Vec4, 0x12 = object link, 0x16 = array.
+- **The "unit id" is not saved.** Every virtual object (spawner or unit) has a link to its *data*
+  objective at +0x38 (link record = {object, refcount, 64-bit object id}). For units that data
+  object is a **`MetaAIObjectiveHuman`** (vtable RVA 0x3775820) which is an *archetype* shared by
+  many units (Alexandria: 9322 units, only 225 distinct +0x38 links; one archetype is used by 421
+  units across 100+ spawners). The u32 at unit+0x8 is not unique either (6907 distinct values for
+  9322 units) and is not part of any save record. The spawner key is the spawner's data object
+  (virtual spawner +0x60, the link created with hash 0xe112dcef).
+- **Write path = rebuilt at every save, not on death.** The world save (RVA 0x1f00390) calls
+  RVA **0x1e03b50** (MetaAISaveData, world): clears the saved arrays, then 0x1df8d60 (tagged units)
+  and **0x1df8a70** (dead units). 0x1df8a70 walks the spawner list at +0x30 and each spawner's
+  units (+0xa0) and appends `{unit+0x10 (16 bytes), unit+0x38}` to the spawner's record (found or
+  created by 0x1ddd380, keyed by spawner+0x60; append = 0x1dcb2a0) when **all** of:
+  1. unit byte +0x5a bit 1 is set: the unit is dead (set by the unit kill handler RVA 0x1da4a70 /
+     0x1da4a10);
+  2. unit byte +0x90 bit 6 is clear (set by RVA 0x1d65f60 when a system takes a unit over with
+     spawn/scripting parameters that have flag bit 6, i.e. scripted/mission-controlled units are
+     never recorded);
+  3. squared distance from the unit position to the player entity ([[world+0x10]+0x98]) is below
+     `[world+0x358]+0x3a0`^2 and, when the player's +0x1f8 link resolves to an object with
+     (+0x5a & 3) != 0, above `[world+0x358]+0x3a4`^2;
+  4. the spawner has a data object (+0x60 != 0).
+  So only bodies lying near the player at save time are kept (the user's save had exactly one
+  record). Tagged units (0x1df8d60) are keyed the same way (archetype link + tag value + count).
+- **Load path.** RVA **0x1decae0** walks the loaded records; for each spawner record whose data
+  object has a live virtual spawner it calls **0x1dab8a0**(spawner, world, &archetype link, &pos)
+  per dead record. That looks the archetype up in the spawner's archetype list (packed array at
+  spawner **+0xc2**, count at +0xca; e.g. 3 archetypes for a 4-unit spawner) and, if found,
+  **instantiates a new unit** of that archetype at the saved position (archetype data vtable
+  +0xa8 = create virtual object; then spawner vtable +0x240 (add unit), append to +0xa0 via
+  0x136f630, unit +0x90 |= 0x8000). A record whose archetype is not in the spawner's list is
+  skipped. Nothing matches existing units or ids.
+- **Consequence for extra units.** An extra unit that copies an existing unit's spawner and
+  archetype produces, when it is dead near the player at a save, a record of exactly the vanilla
+  form (same spawner link, an archetype the spawner lists, a position). The loader handles any
+  number of such records by creating one restored unit each, as it does for vanilla bodies. A unit
+  with +0x90 bit 6 set is never recorded (but that bit also changes behaviour: scripted units).
+- **Creating units at runtime, the engine's way.** 0x1dab8a0 is the game's own "add a unit of
+  archetype A at position P to spawner S" routine; generic runtime creation of a virtual objective
+  from a data objective is 0x1d61e40 / wrapper 0x1d62100 (returns the existing virtual if the data
+  object already has one, so it cannot duplicate). Data objective classes create their virtual
+  through vtable +0xa8 (e.g. 0x1d181a0 for `MetaAIObjectiveSpawner` -> virtual spawner ctor
+  0x1d5da90, 0x1d18460 for `MetaAIObjectiveSpawnerDynamic` -> 0x1d5db60). The MetaAI manager
+  update (0x1daf5f0) is virtual slot 47 (+0x178) of the manager vtable 0x377e7e8 (89 slots).
 
 ### The Havok deadlock is a vanilla engine bug
 
