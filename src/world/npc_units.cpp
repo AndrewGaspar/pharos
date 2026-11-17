@@ -49,7 +49,7 @@ constexpr unsigned kMaxExtrasPerWorld = 60000;  // hard ceiling; [world] npc_uni
 std::atomic<unsigned> g_max_extras{kMaxExtrasPerWorld};
 constexpr unsigned kMaxCreatePerStep = 96;
 std::atomic<unsigned> g_rate{kMaxCreatePerStep};  // [world] npc_units_rate (diagnostics): units per 100 ms step
-constexpr uint32_t kMaxUnitsPerSpawner = 200;  // see augment_spawner
+constexpr uint32_t kMaxUnitsPerSpawner = 4000;  // see augment_spawner
 
 uintptr_t g_base = 0;
 std::atomic<int> g_k{1};
@@ -190,9 +190,9 @@ unsigned augment_spawner(uintptr_t mgr, uintptr_t sp, int k, float px, float py,
     float pos[4];
     memcpy(pos, reinterpret_cast<void*>(u + 0x10), 16);
     for (int j = 1; j < k; ++j) {
-      // A spawner with more than 255 units freezes the game a few seconds later (k=6 and k=8 both
-      // froze after ~1430 originals had their extras, at different extra counts, while k=4 with
-      // spawners of up to ~60 originals -> 240 units ran fine): keep every spawner below that.
+      // Sanity limit only: the freezes once blamed on big spawners (and on ~7500 extras per world)
+      // were TLS index exhaustion (core/tlsext.h); with [world] tls_extend k=10 ran clean with
+      // spawners far above 256 units and 12.5k extras.
       if ((rd<uint32_t>(sp + 0xa8) >> 17) >= kMaxUnitsPerSpawner) break;
       float a = 2.39996f * (i * 7 + j);  // spread around the original, 1.0-2.0 m away
       float r = 1.0f + 0.25f * (j % 5);
