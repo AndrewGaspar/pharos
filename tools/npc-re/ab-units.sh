@@ -10,6 +10,7 @@ W=$(cd "$(dirname "$0")/../.." && pwd)
 L=/home/ajg/Games/aco-dlss-instances/$t/out/aco_dlss.log
 for k in "$@"; do
   sed -i "s/^npc_units=.*/npc_units=$k/" "$mod/aco_dlss.ini"
+  if "$W/tools/npc-re/userplaying.sh"; then echo "$(date -u +%H:%M:%S) not launching: the user is playing"; exit 2; fi
   "$W/scripts/aco" kill-game "$t" >/dev/null 2>&1
   "$W/scripts/aco" fixture "$t" story-alexandria-port >/dev/null 2>&1
   timeout 180 "$W/scripts/aco" game "$t" --mod "$mod" --fps 30 >/dev/null 2>&1 || { echo "k=$k: launch failed"; continue; }

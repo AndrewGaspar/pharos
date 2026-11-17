@@ -12,6 +12,7 @@ L=$I/out/aco_dlss.log
 for spec in "$@"; do
   IFS=: read -r k d dist <<<"$spec"
   sed -i "s/^npc_units=.*/npc_units=$k/; s/^npc_density=.*/npc_density=$d/; s/^npc_distance=.*/npc_distance=$dist/" "$mod/aco_dlss.ini"
+  if "$W/tools/npc-re/userplaying.sh"; then echo "$(date -u +%H:%M:%S) not launching: the user is playing"; exit 2; fi
   "$W/scripts/aco" kill-game "$t" >/dev/null 2>&1
   "$W/scripts/aco" fixture "$t" story-alexandria-port >/dev/null 2>&1
   timeout 180 "$W/scripts/aco" game "$t" --mod "$mod" >/dev/null 2>&1 || { echo "$spec: launch failed"; continue; }
