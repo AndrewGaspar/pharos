@@ -72,7 +72,9 @@ struct Config {
   bool reflex_probe = false;
   float world_npc_density = 1.0f;         // [world] npc_density
   float world_npc_distance = 1.0f;        // [world] npc_distance
-  float world_lod_distance = 1.0f;        // [world] lod_distance      // [reflex] probe (input thread diagnostics)
+  float world_lod_distance = 1.0f;        // [world] lod_distance
+  std::string world_lod_mode = "far";      // [world] lod_mode: far (patched culling shaders, LOD range max only) | all (old: scale every range)
+  std::string world_lod_skip;             // [world] lod_skip (diagnostics): culling shader hash prefixes left unpatched
   std::string cloth_mode = "game";  // [cloth] mode: game | render | scale (see cloth/cloth.h)
   float cloth_scale = 1.0f;         // [cloth] scale (mode=scale, diagnostics)
 };
