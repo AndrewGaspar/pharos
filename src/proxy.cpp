@@ -20,6 +20,7 @@
 #include "fg/fg_d3d12.h"
 #include "fg/vk_device_ext.h"
 #include "core/memtool.h"
+#include "core/tlsext.h"
 #include "world/npc.h"
 #include "world/npc_units.h"
 #include "world/teleport.h"
@@ -77,6 +78,7 @@ HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain* self, UINT sync, UINT flags
     dump_poll();
     fg_on_present(self);
     memtool_poll();
+    tlsext_poll();
     world_on_present();
     npc_on_present();
     npc_units_on_present();

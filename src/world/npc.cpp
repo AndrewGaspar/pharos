@@ -12,6 +12,7 @@
 
 #include "core/config.h"
 #include "core/log.h"
+#include "core/tlsext.h"
 
 namespace aco {
 
@@ -257,9 +258,10 @@ void npc_on_present() {
   k = std::clamp(k, 0.1f, 100.0f);
   uint32_t want = static_cast<uint32_t>(std::lround(p.max_orig * static_cast<double>(k)));
   // With [world] npc_units the game froze (every thread waiting) once ~1000-1100 characters were
-  // spawned at once, while <= ~900 ran clean: keep the budget below that whatever npc_density says
-  // (the quality multiplier is at most 1.2, so 800 raw -> at most 960 spawned).
-  if (want > kMaxSafeSpawned && want > p.max_orig) want = std::max(kMaxSafeSpawned, p.max_orig);
+  // spawned at once: each animated character's Kino instance takes a TLS index and the process runs
+  // out of them (see core/tlsext.h). Without [world] tls_extend keep the budget below that whatever
+  // npc_density says (the quality multiplier is at most 1.2, so 800 raw -> at most 960 spawned).
+  if (!tlsext_active() && want > kMaxSafeSpawned && want > p.max_orig) want = std::max(kMaxSafeSpawned, p.max_orig);
   if (k == 1.0f) want = p.max_orig;
   if (cur != want) max_spawned(s) = want;
   p.max_written = want == p.max_orig ? 0 : want;

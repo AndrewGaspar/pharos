@@ -86,6 +86,7 @@ struct Config {
   float world_npc_units_rate = 0.0f;      // [world] npc_units_rate (diagnostics): extra units created per 100 ms (0 = 96)
   float world_npc_units_max = 0.0f;       // [world] npc_units_max: cap on extra units per world (0 = built-in)
   float world_npc_units_kill = 0.0f;      // [world] npc_units_kill (test: raise by one to kill an extra unit)
+  float world_tls_extend = 1.0f;          // [world] tls_extend: virtual TLS indices past the process limit (core/tlsext.h)
   float world_lod_distance = 1.0f;        // [world] lod_distance
   std::string world_lod_mode = "far";      // [world] lod_mode: far (patched culling shaders, LOD range max only) | all (old: scale every range)
   std::string world_lod_skip;             // [world] lod_skip (diagnostics): culling shader hash prefixes left unpatched
