@@ -565,6 +565,30 @@ Found statically (headless Ghidra) and checked against a loaded story save (t1, 
 - **Soak**: k=4, npc_density=40, per-spawner cap 200: 12-minute walker soak (30 fps cap), no hang,
   745-870 spawned (vs ~360 at k=1), 0 failed creations, our hook 0.03-0.1 ms per update (one 11 ms
   spike while a large batch was created).
+- **The real ceiling: ~1000 spawned characters at once.** A 30-minute roaming soak at k=4 (user
+  settings, `tools/npc-re/soak-roam.sh`) froze after 35 s at 1056 spawned; every freeze so far
+  happened with the game's spawned count at ~1000-1400 (k=4 soaks 1023-1073 / 1056, k=6-10
+  1100-1400), none at <= ~940. Not an exception (a vectored exception logger saw none), not the
+  creation rate (slow creation at 36 units/100 ms froze the same way, 265 s in, with creation
+  almost finished), not the per-spawner count alone. With maxSpawned clamped to 800 raw
+  (`kMaxSafeSpawned`, npc.cpp) k=6 and k=10 ran 300 s clean (they froze within 25-265 s without
+  it), but the spawn budget pressure then empties the 80-120 m band (k=10: 197 / 307 / 12 vs k=1
+  59 / 114 / 173): redistribution again. A fixed pool of about 1024 spawned characters (or their
+  animation / bulk / controller slots) is the likely limit; not located. So the across-the-board
+  gain tops out near 2.5x vanilla's ~360-400 spawned in a city.
+- **GPU cost at the user's settings** (t1 2560x1600, DLSS Performance at render_scale 0.6,
+  lod_distance 2, cloth render, npc_density 10, fixed camera at the Alexandria spawn anchor,
+  `tools/npc-re/ab-user.sh`):
+
+  | FG | k | real fps | presented/s | GPU util | VRAM | spawned |
+  |---|---|---|---|---|---|---|
+  | on | 1 | 71.9 | 143.7 | 96% | 4.9 GB | 355 |
+  | on | 4 | 69.7 | 139.4 | 96% | 5.4 GB | 776 |
+  | off | 1 | 89.4 | - | 86% | 4.7 GB | 358 |
+  | off | 4 | 76.7 | - | 73% (CPU-bound) | 4.8 GB | 815 |
+
+  With FG the frame is GPU-bound and k=4 costs ~3%; without FG k=4 makes the game CPU-bound
+  (-14%).
   (First run interrupted at k=4.) Every band rises, and spawned ~= units within 120 m (the activation
   range is the spawn limit once the cap has headroom). Coverage at k=4 was only ~2-2.8x per band:
   spawners that had grown past 128 units were skipped (fixed in f4209f1, snapshot up to 4096). At
