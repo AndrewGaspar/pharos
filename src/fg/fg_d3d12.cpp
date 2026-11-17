@@ -893,6 +893,28 @@ void perf_report() {
   S.perf_gpu_n = 0;
 }
 
+// A GPU timestamp of our D3D12 queue in now_us() time (ID3D12CommandQueue::GetClockCalibration,
+// refreshed every second). Present thread only.
+bool gpu_to_us(UINT64 ts, int64_t* out) {
+  static UINT64 cal_gpu = 0, cal_cpu = 0;
+  static int64_t cal_at = 0;
+  static LARGE_INTEGER qf = [] {
+    LARGE_INTEGER v;
+    QueryPerformanceFrequency(&v);
+    return v;
+  }();
+  if (!S.q || S.ts_freq <= 0 || !ts) return false;
+  int64_t now = now_us();
+  if (!cal_at || now - cal_at > 1000000) {
+    UINT64 g = 0, c = 0;
+    if (FAILED(S.q->GetClockCalibration(&g, &c)) || !g || !c) return false;
+    cal_gpu = g, cal_cpu = c, cal_at = now;
+  }
+  double cpu_us = double(cal_cpu) * 1e6 / double(qf.QuadPart);
+  *out = int64_t(cpu_us + (double(int64_t(ts - cal_gpu)) * 1e6 / S.ts_freq));
+  return true;
+}
+
 void wait_until(int64_t t_us) {
   for (;;) {
     int64_t left = t_us - now_us();
@@ -1081,6 +1103,11 @@ struct Presenter {
   int64_t last_real_call = 0;  // present thread: when the last real Present was called
   std::atomic<int64_t> ready_lag_sum{0};  // [fg] auto_cap inputs
   std::atomic<uint32_t> ready_lag_n{0};
+  // Where that lag comes from (first generated frame, GPU timestamps mapped to QPC): game's Present ->
+  // DLSS-G starts on the GPU (game GPU work, input copies, vkd3d's CPU-side resolution of the shared
+  // fence wait, GPU scheduling) | its GPU duration | GPU end -> present thread awake (fence event).
+  std::atomic<int64_t> lag_start_sum{0}, lag_gpu_sum{0}, lag_wake_sum{0};
+  std::atomic<uint32_t> lag_split_n{0};
   uint32_t cap_join_n = 0;
 } P;
 
@@ -1172,6 +1199,14 @@ void present_loop() {
       if (k == 0) {  // auto cap: how long after the game's Present DLSS-G was done
         P.ready_lag_sum += t_ready - j.arrive_us;
         ++P.ready_lag_n;
+        int64_t g0 = 0, g1 = 0;
+        if (j.ts_slot[0] >= 0 && gpu_to_us(S.ts_map[j.ts_slot[0] * 2], &g0) &&
+            gpu_to_us(S.ts_map[j.ts_slot[0] * 2 + 1], &g1) && g1 >= g0 && g1 <= t_ready + 2000) {
+          P.lag_start_sum += g0 - j.arrive_us;
+          P.lag_gpu_sum += g1 - g0;
+          P.lag_wake_sum += t_ready - g1;
+          ++P.lag_split_n;
+        }
       }
       // Pacing ([fg] pace). The first generated frame - ready: as soon as DLSS-G is done. smooth: not
       // sooner than one step after the previous real present, minus a share ([fg] pace_relax) of how
@@ -1565,6 +1600,12 @@ void perf_join_report() {
   for (int i = 0; i < 6; ++i) s[i] = n ? P.seg_us[i].exchange(0) / 1000.0 / n : 0.0;
   ACO_LOG("perf: fg12 present thread steps (ms/job): pickup %.2f | copy %.2f, Present %.2f (generated) | wait %.2f | "
           "copy %.2f, Present %.2f (real)", s[0], s[1], s[2], s[3], s[4], s[5]);
+  uint32_t ln = P.lag_split_n.exchange(0);
+  double l0 = P.lag_start_sum.exchange(0), l1 = P.lag_gpu_sum.exchange(0), l2 = P.lag_wake_sum.exchange(0);
+  if (ln)
+    ACO_LOG("perf: fg12 DLSS-G lag split (first generated frame, ms after the game's Present): GPU start +%.2f, GPU "
+            "duration %.2f, present thread awake %.2f after the GPU end (%u frames, multiplier %dx)",
+            l0 / 1000.0 / ln, l1 / 1000.0 / ln, l2 / 1000.0 / ln, ln, g_mult.load());
   P.perf_join_ms = 0;
   P.perf_join_n = 0;
   last = now;
