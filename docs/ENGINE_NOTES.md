@@ -535,8 +535,14 @@ Found statically (headless Ghidra) and checked against a loaded story save (t1, 
   | 1 | 59 | 114 | 173 | 15 | 361 | 91.6 | 472 | 31% |
   | 2 | 93 | 187 | 243 | 12 | 535 | 76.6 | 689 | 39% |
   | 4 | 150 | 277 | 322 | 15 | 763 | - | - | - |
+  | 4 (fixed) | 185 | 347 | 387 | 21 | 940 | 61.1 | 726 | 34% |
+  | 6 (fixed) | 368 | 400 | 321 | 18 | 1107 | (game paused) | | |
+  | 8 (fixed) | 465 | 410 | 497 | 21 | 1393 | (game paused) | | |
 
-  (Run interrupted at k=4.) Every band rises, and spawned ~= units within 120 m (the activation
+  k=6 and k=8: the samples were taken while the game was paused (Ubisoft service restarts during
+  the runs: task threads 0%, GPU 0%, frozen counts), so only their counts at that moment are
+  usable and fps is missing. In view at k=4: 6805 skinning groups/frame (2.7x k=1).
+  (First run interrupted at k=4.) Every band rises, and spawned ~= units within 120 m (the activation
   range is the spawn limit once the cap has headroom). Coverage at k=4 was only ~2-2.8x per band:
   spawners that had grown past 128 units were skipped (fixed in f4209f1, snapshot up to 4096). At
   768x480 the game is CPU-bound (GPU 31-39%): k=2 costs 16% of the frame rate, almost all in the
