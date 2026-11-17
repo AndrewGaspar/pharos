@@ -67,6 +67,7 @@ struct Job {
   uint32_t render_w = 0, render_h = 0;
   float jitter_x = 0, jitter_y = 0;
   uint64_t frame = 0;
+  FgCamera cam;
   ~Job() {
     safe_release(color);
     safe_release(depth);
@@ -195,6 +196,7 @@ struct State {
   uint32_t fg_rw = 0, fg_rh = 0;
   float fg_jx = 0, fg_jy = 0;
   uint64_t fg_frame = 0;
+  FgCamera fg_cam;
   int eval_failures = 0;
   LARGE_INTEGER last_eval_time{};
 
@@ -466,6 +468,7 @@ void run_job(const Job& job) {
   S.fg_jx = job.jitter_x * cfg.jitter_x;
   S.fg_jy = job.jitter_y * cfg.jitter_y;
   S.fg_frame = S.frame.load();
+  S.fg_cam = job.cam;
   int timer = S.gpu_timer.start(S.imm);
   if (cfg.debug == "motion") {
     blit(S.mv_srv, job.render_w, job.render_h, kernels::kBlitMotion, 0.05f);
@@ -558,6 +561,19 @@ bool on_taa(ID3D11DeviceContext* ctx) {
     cbshadow_watch_size(bd.ByteWidth);
   }
   bool have_tc = cb[5] && cbshadow_read(ctx, cb[5], first[5] * 16, sizeof(tc), &tc);
+  // Camera for Frame Generation ([fg] camera=engine): PassParams (cb1) and InstanceParams (cb3) are
+  // pooled too; shadow them by size as well (until the first write after this, no camera).
+  FgCamera cam;
+  if (cfg.fg_mode == "d3d12" && cfg.fg_camera == "engine" && cb[1] && cb[3]) {
+    D3D11_BUFFER_DESC b1{}, b3{};
+    cb[1]->GetDesc(&b1);
+    cb[3]->GetDesc(&b3);
+    cbshadow_watch_size(b1.ByteWidth);
+    cbshadow_watch_size(b3.ByteWidth);
+    cam.valid = cbshadow_read(ctx, cb[1], first[1] * 16 + 4 * 16, sizeof(cam.view_to_world), cam.view_to_world) &&
+                cbshadow_read(ctx, cb[1], first[1] * 16 + 57 * 16, sizeof(cam.clip_to_view), cam.clip_to_view) &&
+                cbshadow_read(ctx, cb[3], first[3] * 16 + 12 * 16, sizeof(cam.prev_view_proj), cam.prev_view_proj);
+  }
   static std::atomic<int> diag{0};
   if (diag++ < 6)
     ACO_LOG("upscaler: TAA ctx=%p imm=%d have_tc=%d color=%p motion=%p depth=%p rt0=%p cb1=%p cb3=%p", static_cast<void*>(ctx),
@@ -645,6 +661,7 @@ bool on_taa(ID3D11DeviceContext* ctx) {
   job->jitter_x = tc.sub_pixel_jitter[0];
   job->jitter_y = tc.sub_pixel_jitter[1];
   job->frame = S.frame.load();
+  job->cam = cam;
   S.taa_replaced_frame.store(job->frame);
   S.n_taa++;
   {
@@ -865,6 +882,7 @@ bool upscaler_fg_inputs(FgInputs* o) {
   o->jitter_x = S.fg_jx;
   o->jitter_y = S.fg_jy;
   o->frame = S.fg_frame;
+  o->cam = S.fg_cam;
   return true;
 }
 

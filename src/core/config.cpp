@@ -75,6 +75,13 @@ Config load() {
   c.fg_sync = read_str(L"sync", "cpu", L"fg");
   c.fg_present_gate = read_float(L"present_gate", 1.0f, L"fg") != 0.0f;
   c.fg_verify = read_float(L"verify", 0.0f, L"fg") != 0.0f;
+  c.fg_camera = read_str(L"camera", "engine", L"fg");
+  c.fg_camera_unjitter = read_float(L"camera_unjitter", 1.0f, L"fg") != 0.0f;
+  c.fg_mv_units = read_str(L"mv_units", "uv", L"fg");
+  c.fg_pace = read_str(L"pace", "ready", L"fg");
+  c.fg_pace_relax = read_float(L"pace_relax", 0.5f, L"fg");
+  c.fg_trace_presents = static_cast<int>(read_float(L"trace_presents", 1200.0f, L"fg"));
+  c.fg_trace_shots = static_cast<int>(read_float(L"trace_shots", 120.0f, L"fg"));
   c.fg12_descriptor_heap = read_float(L"descriptor_heap", 1.0f, L"fg") != 0.0f;
   {
     auto parse = [](const std::string& extra, std::vector<std::pair<std::string, unsigned int>>& out) {
@@ -111,7 +118,7 @@ bool same(const Config& a, const Config& b) {
   return a.enabled == b.enabled && a.backend == b.backend && a.preset == b.preset && a.debug == b.debug &&
          a.jitter_x == b.jitter_x && a.jitter_y == b.jitter_y && a.mv_x == b.mv_x && a.mv_y == b.mv_y &&
          a.render_scale == b.render_scale && a.mip_bias == b.mip_bias && a.mip_bias_offset == b.mip_bias_offset &&
-         a.latency_log == b.latency_log && a.fg_mode == b.fg_mode && a.fg_mv_scale == b.fg_mv_scale && a.fg_pacing == b.fg_pacing && a.fg_show == b.fg_show && a.fg_debug_fill == b.fg_debug_fill && a.fg_ngx_log == b.fg_ngx_log && a.fg_bb_format_dxgi == b.fg_bb_format_dxgi && a.fg_extra == b.fg_extra && a.fg_input == b.fg_input && a.fg_swap_outputs == b.fg_swap_outputs && a.fg_hudless == b.fg_hudless && a.fg_refresh_hz == b.fg_refresh_hz && a.fg_count == b.fg_count && a.fg_show_index == b.fg_show_index && a.fg_raw_output == b.fg_raw_output && a.fg_trace_cu == b.fg_trace_cu && a.fg_hide_handle64 == b.fg_hide_handle64 && a.fg12_descriptor_heap == b.fg12_descriptor_heap && a.fg_verify == b.fg_verify && a.fg_present_gate == b.fg_present_gate && a.fg_sync == b.fg_sync && a.fg_frame_latency == b.fg_frame_latency && a.fg_skip == b.fg_skip && a.fg_enabled == b.fg_enabled && a.fg_toggle_key == b.fg_toggle_key && a.fg_buffers == b.fg_buffers && a.fg_present_thread == b.fg_present_thread && a.fg_create_extra == b.fg_create_extra && a.reflex == b.reflex && a.reflex_fps_limit == b.reflex_fps_limit &&
+         a.latency_log == b.latency_log && a.fg_mode == b.fg_mode && a.fg_mv_scale == b.fg_mv_scale && a.fg_pacing == b.fg_pacing && a.fg_show == b.fg_show && a.fg_debug_fill == b.fg_debug_fill && a.fg_ngx_log == b.fg_ngx_log && a.fg_bb_format_dxgi == b.fg_bb_format_dxgi && a.fg_extra == b.fg_extra && a.fg_input == b.fg_input && a.fg_swap_outputs == b.fg_swap_outputs && a.fg_hudless == b.fg_hudless && a.fg_refresh_hz == b.fg_refresh_hz && a.fg_count == b.fg_count && a.fg_show_index == b.fg_show_index && a.fg_raw_output == b.fg_raw_output && a.fg_trace_cu == b.fg_trace_cu && a.fg_hide_handle64 == b.fg_hide_handle64 && a.fg12_descriptor_heap == b.fg12_descriptor_heap && a.fg_verify == b.fg_verify && a.fg_camera == b.fg_camera && a.fg_pace == b.fg_pace && a.fg_pace_relax == b.fg_pace_relax && a.fg_camera_unjitter == b.fg_camera_unjitter && a.fg_mv_units == b.fg_mv_units && a.fg_trace_presents == b.fg_trace_presents && a.fg_trace_shots == b.fg_trace_shots && a.fg_present_gate == b.fg_present_gate && a.fg_sync == b.fg_sync && a.fg_frame_latency == b.fg_frame_latency && a.fg_skip == b.fg_skip && a.fg_enabled == b.fg_enabled && a.fg_toggle_key == b.fg_toggle_key && a.fg_buffers == b.fg_buffers && a.fg_present_thread == b.fg_present_thread && a.fg_create_extra == b.fg_create_extra && a.reflex == b.reflex && a.reflex_fps_limit == b.reflex_fps_limit &&
          a.reflex_probe == b.reflex_probe && a.reflex_markers == b.reflex_markers &&
          a.reflex_marker_set == b.reflex_marker_set && a.reflex_optimize == b.reflex_optimize &&
          a.toggle_key == b.toggle_key && a.cloth_mode == b.cloth_mode && a.cloth_scale == b.cloth_scale &&
