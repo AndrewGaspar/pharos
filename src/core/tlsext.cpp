@@ -8,6 +8,7 @@
 #include <cstring>
 
 #include "core/config.h"
+#include "core/iat.h"
 #include "core/log.h"
 
 namespace aco {
@@ -30,6 +31,7 @@ GetFn g_get;
 SetFn g_set;
 
 DWORD g_slot = TLS_OUT_OF_INDEXES;     // our native slot -> per-thread Block
+uintptr_t g_img = 0, g_img_size = 0;    // the game image (only its TlsAlloc calls get virtual indices)
 struct Entry { void* v; uint32_t gen; uint32_t pad; };
 struct Block { Entry* chunks[kMaxVirt / kChunk]; };
 
@@ -67,7 +69,8 @@ Entry* entry(DWORD v, bool create) {
 }
 
 DWORD WINAPI hk_alloc() {
-  if (native_free() > kReserve) {
+  uintptr_t ra = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+  if (ra - g_img >= g_img_size || native_free() > kReserve) {
     DWORD r = g_alloc();
     if (r != TLS_OUT_OF_INDEXES) return r;
   }
@@ -117,37 +120,39 @@ BOOL WINAPI hk_set(DWORD i, LPVOID val) {
 
 bool install() {
   auto* base = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
-  HMODULE k32 = GetModuleHandleW(L"kernel32.dll"), kb = GetModuleHandleW(L"kernelbase.dll");
-  const struct { uintptr_t rva; const char* name; } want[] = {
-      {kSlotAlloc, "TlsAlloc"}, {kSlotGet, "TlsGetValue"}, {kSlotSet, "TlsSetValue"}, {kSlotFree, "TlsFree"}};
-  void* cur[4];
-  for (int i = 0; i < 4; ++i) {
+  HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+  if (!k32) return false;
+  g_img = reinterpret_cast<uintptr_t>(base);
+  g_img_size = reinterpret_cast<IMAGE_NT_HEADERS*>(base + reinterpret_cast<IMAGE_DOS_HEADER*>(base)->e_lfanew)
+                   ->OptionalHeader.SizeOfImage;
+  const struct { uintptr_t rva; const char* name; void* hook; void** orig; } want[] = {
+      {kSlotAlloc, "TlsAlloc", reinterpret_cast<void*>(&hk_alloc), reinterpret_cast<void**>(&g_alloc)},
+      {kSlotGet, "TlsGetValue", reinterpret_cast<void*>(&hk_get), reinterpret_cast<void**>(&g_get)},
+      {kSlotSet, "TlsSetValue", reinterpret_cast<void*>(&hk_set), reinterpret_cast<void**>(&g_set)},
+      {kSlotFree, "TlsFree", reinterpret_cast<void*>(&hk_free), reinterpret_cast<void**>(&g_free)}};
+  // The game must be calling kernel32's exports through its private import table (filled by the
+  // VMProtect loader; patching that table does not stick: it was found reverted after the world load).
+  for (const auto& w : want) {
     MEMORY_BASIC_INFORMATION mbi{};
-    if (!VirtualQuery(base + want[i].rva, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT) return false;
-    cur[i] = *reinterpret_cast<void* volatile*>(base + want[i].rva);
-    void* a = k32 ? reinterpret_cast<void*>(GetProcAddress(k32, want[i].name)) : nullptr;
-    void* b = kb ? reinterpret_cast<void*>(GetProcAddress(kb, want[i].name)) : nullptr;
-    if (!cur[i] || (cur[i] != a && cur[i] != b)) {
-      ACO_LOG("tls: import slot rva %llx is %p, not %s (%p / %p); tls_extend disabled",
-              (unsigned long long)want[i].rva, cur[i], want[i].name, a, b);
+    if (!VirtualQuery(base + w.rva, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT) return false;
+    void* cur = *reinterpret_cast<void* volatile*>(base + w.rva);
+    void* a = reinterpret_cast<void*>(GetProcAddress(k32, w.name));
+    if (!cur || cur != a) {
+      ACO_LOG("tls: game import slot rva %llx is %p, not kernel32!%s (%p); tls_extend disabled",
+              (unsigned long long)w.rva, cur, w.name, a);
       return false;
     }
   }
-  g_alloc = reinterpret_cast<AllocFn>(cur[0]);
-  g_get = reinterpret_cast<GetFn>(cur[1]);
-  g_set = reinterpret_cast<SetFn>(cur[2]);
-  g_free = reinterpret_cast<FreeFn>(cur[3]);
-  g_slot = g_alloc();
+  // Wine's kernel32 exports are stubs that jump through kernel32's own import table (to
+  // kernelbase): hook those entries. Every caller of kernel32's Tls* passes through us; only the
+  // game's own TlsAlloc calls ever receive virtual indices.
+  g_slot = TlsAlloc();
   if (g_slot == TLS_OUT_OF_INDEXES) return false;
-  void* hooks[4] = {reinterpret_cast<void*>(&hk_alloc), reinterpret_cast<void*>(&hk_get),
-                    reinterpret_cast<void*>(&hk_set), reinterpret_cast<void*>(&hk_free)};
-  for (int i = 0; i < 4; ++i) {
-    void** p = reinterpret_cast<void**>(base + want[i].rva);
-    DWORD old = 0;
-    if (!VirtualProtect(p, sizeof(void*), PAGE_READWRITE, &old)) return false;
-    __atomic_store_n(p, hooks[i], __ATOMIC_SEQ_CST);
-    VirtualProtect(p, sizeof(void*), old, &old);
-  }
+  for (const auto& w : want)
+    if (!iat_hook(k32, nullptr, w.name, w.hook, w.orig)) {
+      ACO_LOG("tls: kernel32 does not import %s; tls_extend disabled", w.name);
+      return false;  // hooks installed so far only pass through
+    }
   return true;
 }
 

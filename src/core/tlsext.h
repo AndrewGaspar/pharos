@@ -12,10 +12,12 @@ namespace aco {
 // "~1000 spawned characters" freeze (docs/ENGINE_NOTES.md, "Spawned-character limit").
 //
 // The game calls TlsAlloc/TlsFree/TlsGetValue/TlsSetValue through its private import table (RVA
-// 0x353a688..0x353a6a0, filled by the VMProtect loader). We swap those four pointers (data writes;
-// no code is modified) for wrappers that pass everything through to kernel32 until fewer than
-// kReserve native indices are left, then hand out "virtual" indices (>= 0x10000) whose per-thread
-// values live in our own table. Native indices take one compare on the way to kernel32.
+// 0x353a688..0x353a6a0, filled by the VMProtect loader, which refills it: swapping those entries
+// does not stick). Wine's kernel32 exports are stubs that jump through kernel32's own import table
+// to kernelbase; we swap those four kernel32 import entries (data writes; no code is modified) for
+// wrappers that pass native indices straight through (one compare) and, for TlsAlloc called from
+// the game image once 64 or fewer native indices are left, hand out "virtual" indices (>= 0x10000)
+// whose per-thread values live in our own table.
 void tlsext_poll();
 
 // Free native TLS indices (PEB bitmaps; -1 if unknown) and virtual indices handed out so far.
