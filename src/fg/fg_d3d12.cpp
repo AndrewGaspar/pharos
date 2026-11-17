@@ -1108,6 +1108,8 @@ struct Presenter {
   // fence wait, GPU scheduling) | its GPU duration | GPU end -> present thread awake (fence event).
   std::atomic<int64_t> lag_start_sum{0}, lag_gpu_sum{0}, lag_wake_sum{0};
   std::atomic<uint32_t> lag_split_n{0};
+  std::atomic<int64_t> gpu_lag_sum{0};  // game Present -> DLSS-G GPU end (auto cap with [fg] auto_cap_lag_from=gpu)
+  std::atomic<uint32_t> gpu_lag_n{0};
   uint32_t cap_join_n = 0;
 } P;
 
@@ -1206,6 +1208,8 @@ void present_loop() {
           P.lag_gpu_sum += g1 - g0;
           P.lag_wake_sum += t_ready - g1;
           ++P.lag_split_n;
+          P.gpu_lag_sum += g1 - j.arrive_us;
+          ++P.gpu_lag_n;
         }
       }
       // Pacing ([fg] pace). The first generated frame - ready: as soon as DLSS-G is done. smooth: not
@@ -1398,6 +1402,8 @@ void pacing_update(bool fg_active) {
     PC.wait0 = reflex_wait_us();
     P.ready_lag_sum = 0;
     P.ready_lag_n = 0;
+    P.gpu_lag_sum = 0;
+    P.gpu_lag_n = 0;
     P.cap_join_n = 0;
     return;
   }
@@ -1405,7 +1411,12 @@ void pacing_update(bool fg_active) {
   double secs = (now - PC.last) / 1e6;
   double fps = PC.frames / secs;
   uint32_t n = P.ready_lag_n.exchange(0);
-  double lag = n ? double(P.ready_lag_sum.exchange(0)) / n : 0;
+  double lag_ready = n ? double(P.ready_lag_sum.exchange(0)) / n : 0;
+  uint32_t gn = P.gpu_lag_n.exchange(0);
+  double lag_gpu = gn ? double(P.gpu_lag_sum.exchange(0)) / gn : 0;
+  // [fg] auto_cap_lag_from: ready = when the present thread had the first generated frame (includes
+  // waiting for the previous job and the fence wake-up), gpu = when DLSS-G finished on the GPU.
+  double lag = cfg.fg_auto_cap_lag_from == "gpu" && gn ? lag_gpu : lag_ready;
   uint32_t waits = P.cap_join_n;
   P.cap_join_n = 0;
   uint64_t w = reflex_wait_us();
@@ -1482,8 +1493,8 @@ void pacing_update(bool fg_active) {
   static int logged_mult = 0;
   if (std::fabs(cap - logged) > 3.0f || PC.mult != logged_mult) {
     ACO_LOG("fg12: auto cap %.1f fps, %dx (real %.1f fps, DLSS-G done %.1f ms = %.2f frames after the game's Present, game "
-            "waited %u times, limiter/Reflex sleep %.1f ms/frame, headroom cap %.1f, target %.0f Hz)",
-            cap, PC.mult, fps, lag / 1000.0, ratio, waits, slack / 1000.0, PC.head, target);
+            "waited %u times, limiter/Reflex sleep %.1f ms/frame, headroom cap %.1f, target %.0f Hz; lag ready %.1f / GPU end %.1f ms)",
+            cap, PC.mult, fps, lag / 1000.0, ratio, waits, slack / 1000.0, PC.head, target, lag_ready / 1000.0, lag_gpu / 1000.0);
     logged = cap;
     logged_mult = PC.mult;
   }
