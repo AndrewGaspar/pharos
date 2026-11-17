@@ -44,7 +44,7 @@ constexpr uint32_t kOwnerLinkHash = 0xcf078f5e;
 // ~120 m for most) get their extras, so the new units go through the normal activation -> spawn
 // path like the others.
 constexpr float kRingOuter = 400.0f;
-constexpr unsigned kMaxExtrasPerWorld = 8000;
+constexpr unsigned kMaxExtrasPerWorld = 60000;
 constexpr unsigned kMaxCreatePerStep = 96;
 
 uintptr_t g_base = 0;
@@ -312,7 +312,7 @@ void npc_units_on_present() {
   static int state = 0;  // 0 unchecked, 1 ok, 2 unsupported
   int k = static_cast<int>(std::lround(config().world_npc_units));
   if (k < 1) k = 1;
-  if (k > 4) k = 4;
+  if (k > 16) k = 16;
   if (state == 0) {
     if (k == 1) return;
     state = verify() ? 1 : 2;

@@ -21,7 +21,9 @@ for spec in "$@"; do
   n0=$(wc -l < "$L")
   touch "$I/out/geo"
   echo "== k=$k npc_density=$d npc_distance=$dist $(date -u +%H:%M:%S)"
-  for i in 1 2 3; do sleep 20; ACO_INST=$t python3 "$W/tools/npc-re/spawnbands.py" | sed 's/^/  /'; done
+  for i in 1 2; do sleep 15; ACO_INST=$t python3 "$W/tools/npc-re/spawnbands.py" | sed 's/^/  /'; done
+  ACO_INST=$t python3 "$W/tools/npc-re/threadcpu.py" 25 | sed 's/^/  /'
+  ACO_INST=$t python3 "$W/tools/npc-re/spawnbands.py" | sed 's/^/  /'
   rm -f "$I/out/geo"
   tail -n +"$((n0 + 1))" "$L" > /tmp/abbands.$$
   fps=$(grep -o 'perf: [0-9.]* fps' /tmp/abbands.$$ | awk '{s+=$2; n++} END {if (n) printf "%.1f", s/n}')
