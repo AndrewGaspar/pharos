@@ -47,7 +47,7 @@ constexpr float kRingOuter = 400.0f;
 constexpr unsigned kMaxExtrasPerWorld = 60000;  // hard ceiling; [world] npc_units_max lowers it
 std::atomic<unsigned> g_max_extras{kMaxExtrasPerWorld};
 constexpr unsigned kMaxCreatePerStep = 96;
-constexpr uint32_t kMaxUnitsPerSpawner = 250;  // see augment_spawner
+constexpr uint32_t kMaxUnitsPerSpawner = 200;  // see augment_spawner
 
 uintptr_t g_base = 0;
 std::atomic<int> g_k{1};

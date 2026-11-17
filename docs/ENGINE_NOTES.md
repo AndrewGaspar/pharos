@@ -548,7 +548,8 @@ Found statically (headless Ghidra) and checked against a loaded story save (t1, 
     spin. Before a per-spawner cap it froze after ~1430 originals had their extras whatever k
     was (k=6: 7075 / 7295 extras, k=8: ~10000), while k=4 (spawners up to ~240 units) never
     froze; the frozen game had spawners with 256-422 units. So a spawner must stay below 256
-    units (u8 somewhere): extras now stop at 250 per spawner (commit after 093ccb6).
+    units (u8 somewhere): extras now stop at 200 per spawner. A cap of 250 still froze once in a
+    walker soak at k=4 (spawner at exactly 250, 4606 extras), 200 ran a 12-minute soak.
   - With that cap: k=6 ran 240 s (6535 extras, 54 fps uncapped), k=8 froze at 7635 extras
     (155 s), k=10 at 7453 (30 s): a second, global limit at ~7500 extras, i.e. ~16.5-17k civilian
     units in the loaded world (16658 counted in the frozen k=10 game). Which pool it is was not
@@ -561,6 +562,9 @@ Found statically (headless Ghidra) and checked against a loaded story save (t1, 
   tracks the spawned characters (+ animals etc.), so it looks like the representation of spawned
   MetaAI characters (jobs `SetupMetaAISpawnedUnitBulk` / `UpdateMetaAISpawnedUnitBulk`), not a
   separate cheap far crowd. No `FakeCrowdHerder` is reachable from the World object.
+- **Soak**: k=4, npc_density=40, per-spawner cap 200: 12-minute walker soak (30 fps cap), no hang,
+  745-870 spawned (vs ~360 at k=1), 0 failed creations, our hook 0.03-0.1 ms per update (one 11 ms
+  spike while a large batch was created).
   (First run interrupted at k=4.) Every band rises, and spawned ~= units within 120 m (the activation
   range is the spawn limit once the cap has headroom). Coverage at k=4 was only ~2-2.8x per band:
   spawners that had grown past 128 units were skipped (fixed in f4209f1, snapshot up to 4096). At
