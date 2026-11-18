@@ -702,6 +702,79 @@ froze at 994 and ~1150-1220 spawned) with `pestack.py`, `jobq.py`, `jobwhy.py` (
   restored from the save (these saves don't rebuild the MetaAI dead-unit records, as found
   earlier), no hang.
 
+#### npc_units v12: the post-fast-travel stall, unit classes, urban / rural, variety
+
+- **Stall after a world change (v11 bug).** After a Sinai -> Alexandria fast travel no extras were
+  made: `step()` returned before doing anything. Repro (t1, Alexandria -> Sinai -> Alexandria
+  with the game's own fast travel, `tools/npc-re/ft-sinai.sh`), logging what v11's checks would
+  have done: the player root was fine in every step, but v11's `readable(list, n * 8)` on the
+  MetaAI manager's objective list (49546 entries, 396 KB) failed in every step (96 of 96 per 10 s)
+  once the world had changed: the reallocated list spans two allocator reservations, and
+  `VirtualQuery` reports only the first. `readable_span` (walks the regions) fixes it; extras came
+  back right after the travel (9.3k live extras within two minutes). Within Egypt (the earlier
+  fast-travel tour) the list never moved, so that tour was not affected: its 395-959 spawned per
+  city came from where the fast-travel points are (city edges).
+- **Unit classes.** Objectives holding units (`+0xa0` arrays) and their unit classes, from the
+  manager's list in Alexandria (`tools/npc-re/objfactions.py`; class names from TypeInfo via
+  `vtname.py`): `MetaAIVirtualObjectiveSpawner` (0x377d218) holds `MetaAIVirtualObjectiveHuman`
+  (0x377eab8, ~15k), `...RideableAnimal` (0x3781720, horses/camels), `...SmallWaterVehicle`
+  (0x3786208, boats) and `...Vehicle` (0x377ca18); `...AnimalSpawner` (0x3781f20) holds
+  `...Animal` (0x377f560); `...Ambush` (0x3781cf0), `...StaticCage`, `...AnimalLocation`,
+  `...BountyHunterSpawner` (0x3784400) hold their own. npc_units only ever touched Human units of
+  plain spawners.
+- **Factions.** A Human unit's archetype (`MetaAIObjectiveHuman`, +0x38 link) links its faction
+  at +0x10 (`MetaAIFactionData`, vtable 0x3789a88). Around Alexandria: faction id 0x2dfb71a566 =
+  ~11k units in 55 archetypes (civilians); 0x45bafa6a55 = ~2.7k (also the only faction in the
+  bounty-hunter spawner: Ptolemaic soldiers / guards); 0x3b79cbd9a8 and 0x157058a1b3 (both in
+  `Ambush` objectives: bandits); animal factions (0x3fda49da1f, 0xc637..., 0xbf37...) in animal
+  spawners; 0x13e08432389 for rideable animals. **Byte +0x30 of the faction is 0 for the
+  civilian and rideable factions and 1 for every combat faction** (soldiers, bandits, wild
+  animals, 0x157058a1b7, 0x7ae9ae2e08): v12 uses it as civilian vs hostile. The faction's
+  float4 at +0x20 differs per human faction (a UI colour?).
+- **Urban vs rural.** The measure is the number of original civilian-spawner Human units within
+  ~150 m (7 x 7 cells of 50 m, rebuilt once a minute). At the player (`tools/npc-re/urbanity.py`,
+  k=1): Alexandria spawn anchor 802 (units within 400 m: median 877), Memphis 820 (722),
+  Krokodilopolis 494 (414), Siwa's centre 352 (439), Faiyum farmland 46. Threshold 300: cities
+  and towns urban, farms and Sinai's countryside rural.
+- **Variety and spread.** Each extra now copies a random original of the same class from the
+  same spawner: its archetype entry (so the spawner's own archetype mix, weighted by use, is the
+  palette) and its place plus 1-4 m. Extras of one unit no longer start in a clump on one spot.
+  Save safety is unchanged: an extra is still (spawner, an archetype that spawner lists,
+  position), which is what the dead-unit records hold and what the loader matches.
+- **Hang during a jump; pause after one.** The first k=8 run of `tools/npc-re/v12-places.sh` hung
+  (main thread at 99%, log silent) during the debug teleport Memphis -> Faiyum farm (4.3 km), in the
+  middle of a burst of 200 extras created within 2 s of the jump, while the old area was streaming
+  out. Since then `step()` makes no units for 8 s after the player moves > 150 m between steps
+  (fast travel, respawn, teleport; logged as "player jump(s)"). The rerun passed every stage.
+  (Not proven to be our fault: instant teleports also trigger the vanilla Havok deadlock below; no
+  stack was taken.)
+- **Results (t1, 768x480, k=1 vs k=8, rural 2, hostile 1, `npc_density=40`, `tls_extend=1`;
+  spawned civilians per band 0-40 / 40-80 / 80-120 / 120-200 m, total):**
+
+  | place | k=1 | k=8 |
+  |---|---|---|
+  | Alexandria (spawn anchor) | 73/118/170/14, 375 | 295/533/458/18, 1304 |
+  | Memphis (fast travel) | 30/76/143/15, 264 | 81/365/561/31, 1038 |
+  | Faiyum farm (teleport) | 0/0/4/2, 6 | 0/0/6/0, 6 |
+  | Sinai (fast travel; rural) | 8/26/45/0, 79 | 9/36/54/0, 99 |
+  | Alexandria after travel | 28/88/171/18, 305 | 99/393/611/20, 1123 |
+  | quit to title + reload | 24/80/148/12, 264 | 92/236/542/46, 916 |
+
+  Every band up in the cities (x3-4 total), Sinai +25% at the rural value, the farm is empty
+  either way. 55-60 fps (cap 60) everywhere; native TLS slots went down to 64 free, virtual TLS
+  peaked at 421 indices (`tls_extend` is required at k=8). No hostile extras at the default 1.
+- **Spread and variety (k=8, Alexandria, `tools/npc-re/clump.py 80`):** 536 activated extras
+  within 80 m, 24 archetypes among them; nearest sibling (another extra of the same original)
+  median 33.9 m, 9% within 3 m (v11: every sibling started on the same spot). Nearest
+  same-archetype extra: median 2.8 m, 51% within 3 m: crowds are dense and a spawner's mix is a
+  few dozen archetypes. Side-by-side look (`samearch.py`, a same-archetype pair 1.3 m apart,
+  screenshot): two women of the same build in different dress colours (green / teal), so one
+  archetype is not one fixed look; at 768x480 that is a hint, not proof.
+- **Soak (k=8, `tools/npc-re/soak-roam.sh t1 build/mod-uncap 12`):** 12 minutes roaming
+  Alexandria (992 m), 1045-1692 spawned, 6.3-8.8k live extras, 0 failed, 53-60 fps, no hang.
+  Hook cost 0.16-0.25 ms avg per MetaAI update; one 10 s window at 2.4 ms avg / 40 ms max (that
+  window had only 174 MetaAI updates instead of ~600, i.e. the game itself stalled then too).
+
 ### The Havok deadlock is a vanilla engine bug
 
 Same stack (TaskThread0 spinning in 0x2ffd9e4 <- 0x2e78f07 <- 0x2e16a8d <- 0x2dbf560 (Havok object

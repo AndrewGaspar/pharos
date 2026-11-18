@@ -3,11 +3,13 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -171,7 +173,9 @@ bool in_view(float x, float y, float z) {
 
 // The player's position from either static root (validated like world/teleport.cpp: after some
 // fast travels the first root does not lead to the entity), else the render camera's.
-std::atomic<unsigned> g_skip_player{0}, g_skip_list{0}, g_cam_pos{0};
+std::atomic<unsigned> g_skip_player{0}, g_skip_list{0}, g_cam_pos{0}, g_jumps{0};
+// What v11 (5011c6e) would have done: its single player root and single-region list check.
+std::atomic<unsigned> g_v11_player_fail{0}, g_v11_list_fail{0}, g_steps{0};
 bool player_xy(float& px, float& py) {
   for (uintptr_t e : {load(load(g_base + kPlayerRootRva)), load(load(g_base + kPlayerRoot2Rva) + 0x78)}) {
     if (!readable(e, 0x60) || rd<uintptr_t>(e) != g_base + kEntityVtRva) continue;
@@ -188,6 +192,45 @@ bool player_xy(float& px, float& py) {
   return false;
 }
 
+// ---- What kind of unit, and how crowded is its neighbourhood ------------------------------------
+// A unit's archetype (+0x38 -> MetaAIObjectiveHuman) links its faction at +0x10 (MetaAIFactionData,
+// vtable RVA 0x3789a88). Byte +0x30 of the faction is 0 for the civilian faction (and rideable
+// animals), 1 for every combat faction: Ptolemaic soldiers (also the bounty hunters'), bandits /
+// ambushers, wild animals (docs/ENGINE_NOTES.md, "Unit classes and factions").
+constexpr uintptr_t kFactionVtRva = 0x3789a88;
+enum class UnitClass { Civilian, Hostile, Unknown };
+UnitClass classify(uintptr_t u) {
+  uintptr_t arche = link_object(rd<uintptr_t>(u + 0x38));
+  if (!arche || !readable(arche + 0x10, 8)) return UnitClass::Unknown;
+  uintptr_t fac = link_object(rd<uintptr_t>(arche + 0x10));
+  if (!fac || !readable(fac, 0x38) || rd<uintptr_t>(fac) != g_base + kFactionVtRva) return UnitClass::Unknown;
+  return rd<uint8_t>(fac + 0x30) ? UnitClass::Hostile : UnitClass::Civilian;
+}
+
+// Urban vs rural: original (non-extra) units of civilian spawners per 50 m cell, rebuilt once a minute
+// by prune(); a unit is urban when the originals within ~150 m (7 x 7 cells) reach the threshold.
+std::unordered_set<uintptr_t> g_created_set;
+std::unordered_map<int64_t, uint32_t> g_grid;
+constexpr float kCell = 50.0f;
+int64_t cell_key(int cx, int cy) { return (static_cast<int64_t>(cx) << 32) ^ static_cast<uint32_t>(cy); }
+void grid_add(float x, float y) { ++g_grid[cell_key(static_cast<int>(std::floor(x / kCell)), static_cast<int>(std::floor(y / kCell)))]; }
+uint32_t originals_near(float x, float y) {
+  int cx = static_cast<int>(std::floor(x / kCell)), cy = static_cast<int>(std::floor(y / kCell));
+  uint32_t n = 0;
+  for (int dx = -3; dx <= 3; ++dx)
+    for (int dy = -3; dy <= 3; ++dy) {
+      auto it = g_grid.find(cell_key(cx + dx, cy + dy));
+      if (it != g_grid.end()) n += it->second;
+    }
+  return n;
+}
+std::atomic<int> g_k_rural{1}, g_k_hostile{1};
+std::atomic<unsigned> g_urban_threshold{300};
+std::atomic<unsigned> g_made_urban{0}, g_made_rural{0}, g_made_hostile{0};
+
+uint32_t g_rng = 0x9e3779b9u;
+uint32_t rnd() { g_rng ^= g_rng << 13; g_rng ^= g_rng >> 17; g_rng ^= g_rng << 5; return g_rng; }
+
 // Extras for the units of spawner `sp` that are within the ring, not activated yet and not handled
 // before. Units are handled one by one (big spawners have 60+ units spread over a district, some of
 // them always active near the player). Returns the number of units created.
@@ -202,41 +245,73 @@ unsigned augment_spawner(uintptr_t mgr, uintptr_t sp, int k, float px, float py,
   if (!n || n > kMaxUnits || !ne || ne > 256 || !arr || !ents) return 0;
   static uintptr_t units[kMaxUnits];  // sim thread only
   memcpy(units, reinterpret_cast<void*>(arr), n * 8);  // the array grows while we add
+  // The spawner's own originals, by class: the "palette" extras are drawn from. Each extra copies a
+  // random original of the same class (its archetype entry and, with a small offset, its place), so
+  // extras follow the spawner's mix of archetypes and spread over its whole area instead of
+  // stacking up next to one unit.
+  static uintptr_t donors[2][kMaxUnits];
+  uint32_t nd[2] = {0, 0};
+  for (uint32_t i = 0; i < n; ++i) {
+    uintptr_t u = units[i];
+    if (!u || rd<uintptr_t>(u) != g_base + kUnitVtRva || g_created_set.count(u)) continue;
+    if ((rd<uint8_t>(u + 0x5a) & 6) || (rd<uint8_t>(u + 0x90) & 0x40)) continue;  // dead / group / scripted
+    UnitClass c = classify(u);
+    if (c == UnitClass::Unknown) continue;
+    donors[c == UnitClass::Hostile][nd[c == UnitClass::Hostile]++] = u;
+  }
+  auto entry_of = [&](uintptr_t u) -> uintptr_t {
+    uintptr_t link = rd<uintptr_t>(u + 0x38);
+    for (uint32_t e = 0; e < ne; ++e) {
+      uintptr_t c = rd<uintptr_t>(ents + 8 * e);
+      if (c && rd<uintptr_t>(c) == link) return c;
+    }
+    return 0;
+  };
   unsigned made = 0;
   for (uint32_t i = 0; i < n && made < budget && g_extras < g_max_extras.load(); ++i) {
     uintptr_t u = units[i];
     if (!u || rd<uintptr_t>(u) != g_base + kUnitVtRva) continue;
-    float d = std::hypot(rd<float>(u + 0x10) - px, rd<float>(u + 0x14) - py);
-    if (d > kRingOuter) continue;
+    float ux = rd<float>(u + 0x10), uy = rd<float>(u + 0x14);
+    if (std::hypot(ux - px, uy - py) > kRingOuter) continue;
     // Activated units get extras too: the MetaAI activates the new unit on its own. So that no
     // character appears in view, an activated unit near the camera and in front of it is left for
     // later (the player turns or moves on); everything else is handled at once, so after a load or
     // a fast travel the whole 400 m area gets its extras within seconds.
-    if (rd<uintptr_t>(u + 0x1b8) && in_view(rd<float>(u + 0x10), rd<float>(u + 0x14), rd<float>(u + 0x18))) continue;
+    if (rd<uintptr_t>(u + 0x1b8) && in_view(ux, uy, rd<float>(u + 0x18))) continue;
     if (!g_done.insert(u).second) continue;   // handled before, or one of our extras
     if ((rd<uint8_t>(u + 0x5a) & 6) || (rd<uint8_t>(u + 0x90) & 0x40)) continue;  // dead / group / scripted
-    uintptr_t link = rd<uintptr_t>(u + 0x38), entry = 0;
-    for (uint32_t e = 0; e < ne; ++e) {
-      uintptr_t c = rd<uintptr_t>(ents + 8 * e);
-      if (c && rd<uintptr_t>(c) == link) { entry = c; break; }
-    }
-    if (!entry) continue;
-    float pos[4];
-    memcpy(pos, reinterpret_cast<void*>(u + 0x10), 16);
-    for (int j = 1; j < k; ++j) {
-      // Sanity limit only: the freezes once blamed on big spawners (and on ~7500 extras per world)
-      // were TLS index exhaustion (core/tlsext.h); with [world] tls_extend k=10 ran clean with
-      // spawners far above 256 units and 12.5k extras.
-      if ((rd<uint32_t>(sp + 0xa8) >> 17) >= kMaxUnitsPerSpawner) break;
-      float a = 2.39996f * (i * 7 + j);  // spread around the original, 1.0-2.0 m away
-      float r = 1.0f + 0.25f * (j % 5);
+    UnitClass cls = classify(u);
+    if (cls == UnitClass::Unknown) continue;
+    bool hostile = cls == UnitClass::Hostile;
+    bool urban = originals_near(ux, uy) >= g_urban_threshold.load();
+    int kk = hostile ? g_k_hostile.load() : urban ? k : g_k_rural.load();
+    uint32_t pool = nd[hostile];
+    if (kk <= 1 || !pool) continue;
+    for (int j = 1; j < kk; ++j) {
+      if ((rd<uint32_t>(sp + 0xa8) >> 17) >= kMaxUnitsPerSpawner) break;  // sanity limit
+      // A donor of the same class; one that is active and in view would put the new character in
+      // front of the camera, so try a few and fall back to u itself.
+      uintptr_t d = u;
+      for (int t = 0; t < 4; ++t) {
+        uintptr_t c = donors[hostile][rnd() % pool];
+        if (!(rd<uintptr_t>(c + 0x1b8) && in_view(rd<float>(c + 0x10), rd<float>(c + 0x14), rd<float>(c + 0x18)))) { d = c; break; }
+      }
+      uintptr_t entry = entry_of(d);
+      if (!entry) { d = u; entry = entry_of(u); }
+      if (!entry) break;
+      float pos[4];
+      memcpy(pos, reinterpret_cast<void*>(d + 0x10), 16);
+      float a = (rnd() % 6283) * 0.001f, r = 1.0f + (rnd() % 3000) * 0.001f;  // 1-4 m from the donor
       float q[4] = {pos[0] + r * std::cos(a), pos[1] + r * std::sin(a), pos[2], pos[3]};
       if (uintptr_t nu = add_unit(mgr, sp, entry, q)) {
         ++g_extras;
         ++made;
+        ++(hostile ? g_made_hostile : urban ? g_made_urban : g_made_rural);
         g_last_unit = nu;
         g_created.push_back(nu);
-        if (g_log_units) ACO_LOG("npc_units: extra %p of %p (spawner %p)", reinterpret_cast<void*>(nu), reinterpret_cast<void*>(u), reinterpret_cast<void*>(sp));
+        g_created_set.insert(nu);
+        if (g_log_units) ACO_LOG("npc_units: extra %p of %p (spawner %p, donor %p, %s)", reinterpret_cast<void*>(nu), reinterpret_cast<void*>(u),
+                                 reinterpret_cast<void*>(sp), reinterpret_cast<void*>(d), hostile ? "hostile" : urban ? "urban" : "rural");
         g_done.insert(nu);
       } else {
         ++g_failed;
@@ -270,7 +345,11 @@ void prune(uintptr_t mgr) {
   keep.reserve(g_created.size());
   for (uintptr_t u : g_created) if (live.count(u)) keep.push_back(u);
   g_created.swap(keep);
+  g_created_set = std::unordered_set<uintptr_t>(g_created.begin(), g_created.end());
   g_extras = static_cast<unsigned>(g_created.size());
+  g_grid.clear();
+  for (uintptr_t u : live)
+    if (u && !g_created_set.count(u) && readable(u, 0x20) && rd<uintptr_t>(u) == g_base + kUnitVtRva) grid_add(rd<float>(u + 0x10), rd<float>(u + 0x14));
 }
 
 void step(uintptr_t mgr) {
@@ -286,12 +365,35 @@ void step(uintptr_t mgr) {
     g_list_n = 0;
     g_done.clear();
     g_created.clear();
+    g_created_set.clear();
+    g_grid.clear();
+    g_last_prune = 0;
     g_extras = g_failed = 0;
     g_cursor = 0;
   }
   read_camera();
   float px, py;
+  ++g_steps;
+  {
+    uintptr_t pl = load(load(g_base + kPlayerRootRva));
+    if (!readable(pl + 0x50, 12)) ++g_v11_player_fail;
+    uintptr_t l = rd<uintptr_t>(mgr + kObjListOff);
+    uint32_t c = rd<uint32_t>(mgr + kObjListOff + 8);
+    if (!c || c > 400000 || !readable(l, size_t(c) * 8)) ++g_v11_list_fail;
+  }
   if (!player_xy(px, py)) { ++g_skip_player; return; }
+  // After a jump (fast travel, respawn, a debug teleport) the world streams whole areas out and in;
+  // leave the spawners alone for a while so we never add units to one that is being torn down.
+  {
+    static float lx = 0, ly = 0;
+    static ULONGLONG quiet_until = 0;
+    if (std::hypot(px - lx, py - ly) > 150.0f) {
+      if (lx != 0 || ly != 0) { quiet_until = now + 8000; ++g_jumps; }
+      lx = px, ly = py;
+    }
+    lx = px, ly = py;
+    if (now < quiet_until) return;
+  }
   // The manager's list of all virtual objectives ({ptr} at +0x3b8, plain u32 count at +0x3c0),
   // walked in slices so one update never reads more than a few thousand objects.
   uintptr_t list = rd<uintptr_t>(mgr + kObjListOff);
@@ -309,7 +411,7 @@ void step(uintptr_t mgr) {
     made += augment_spawner(mgr, sp, k, px, py, g_rate.load() - made);
   }
   g_cursor = i;  // resume where this slice stopped
-  if (now - g_last_prune > 60000) {
+  if (g_grid.empty() || now - g_last_prune > 60000) {
     g_last_prune = now;
     prune(mgr);
   }
@@ -432,6 +534,9 @@ void npc_units_on_present() {
   if (k == 1) return;  // the hook stays installed but idle
   g_kill_req = static_cast<int>(config().world_npc_units_kill);
   g_log_units = config().world_npc_units_log != 0.0f;
+  g_k_rural = std::clamp(static_cast<int>(std::lround(config().world_npc_units_rural)), 1, 16);
+  g_k_hostile = std::clamp(static_cast<int>(std::lround(config().world_npc_units_hostile)), 1, 16);
+  g_urban_threshold = static_cast<unsigned>(std::clamp(config().world_npc_urban_threshold, 1.0f, 100000.0f));
   { float r = config().world_npc_units_rate; g_rate = r >= 1 ? std::min<unsigned>(static_cast<unsigned>(r), kMaxCreatePerStep) : kMaxCreatePerStep; }
   { float mx = config().world_npc_units_max; g_max_extras = mx > 0 ? std::min<unsigned>(static_cast<unsigned>(mx), kMaxExtrasPerWorld) : kMaxExtrasPerWorld; }
   uintptr_t world = load(load(g_base + kGameGlobalRva) + 0xc0);
@@ -447,6 +552,7 @@ void npc_units_on_present() {
   if (now - last_stat >= 10000) {
     last_stat = now;
     uintptr_t lu = g_last_unit.load();
+    ACO_LOG("npc_units: made in 10 s: %u urban, %u rural, %u hostile", g_made_urban.exchange(0), g_made_rural.exchange(0), g_made_hostile.exchange(0));
     ACO_LOG("npc_units: %u live extra units (%u units handled, %u failed), objective list %u, last extra %p (activation %p)",
             g_stat_extras.load(), g_stat_spawners.load(), g_stat_failed.load(), g_list_n.load(),
             reinterpret_cast<void*>(lu), reinterpret_cast<void*>(lu && readable(lu + 0x1b8, 8) ? rd<uintptr_t>(lu + 0x1b8) : 0));
@@ -456,6 +562,9 @@ void npc_units_on_present() {
     if (uintptr_t sm = g_stat_mgr.load(); sm && sm != mgr)
       ACO_LOG("npc_units: stepping manager %p, but the world's is %p", reinterpret_cast<void*>(sm), reinterpret_cast<void*>(mgr));
     unsigned sp = g_skip_player.exchange(0), sl = g_skip_list.exchange(0), cp = g_cam_pos.exchange(0);
+    if (unsigned j = g_jumps.exchange(0)) ACO_LOG("npc_units: %u player jump(s) in 10 s: paused creating units for 8 s", j);
+    unsigned vp = g_v11_player_fail.exchange(0), vl = g_v11_list_fail.exchange(0), st = g_steps.exchange(0);
+    if (vp || vl) ACO_LOG("npc_units: of %u steps in 10 s, v11's checks would have failed: player root %u, objective list %u", st, vp, vl);
     if (sp || sl || cp)
       ACO_LOG("npc_units: steps skipped in 10 s: %u no player position, %u objective list unreadable; %u used the camera position", sp, sl, cp);
     if (calls)
