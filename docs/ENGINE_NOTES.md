@@ -775,6 +775,82 @@ froze at 994 and ~1150-1220 spawned) with `pestack.py`, `jobq.py`, `jobwhy.py` (
   Hook cost 0.16-0.25 ms avg per MetaAI update; one 10 s window at 2.4 ms avg / 40 ms max (that
   window had only 174 MetaAI updates instead of ~600, i.e. the game itself stalled then too).
 
+#### Senu (v13): hitches, the cost of a spawned character, memory, strobing
+
+The user's report (v12, 2560x1600, render_scale 0.333, FG on, npc_units=8, npc_density=40): severe
+hitches flying Senu over Alexandria (17:31:48-17:32:13 local: 5-27 fps, single frames of 1.2 / 1.6 /
+2.8 s), recovered after ~30 s; then 30-38 fps while hovering with 2800-3110 spawned.
+
+- **Senu and the spawning.** Senu = `EagleMode` (ControlMappings.xml scancode 47 = V); hover =
+  `EagleStop` (right mouse, held); boost = LShift. A / D steer her (~80 deg/s); mouse look only turns
+  the camera. She flies straight along the heading the camera had when she took off, ~9.7 m/s,
+  15-30 m above the ground. The spawning follows her: circling 70 m around the centre (k=8)
+  spawned swings 1150 <-> 2090 every lap (+50/s, -30/s; despawns 1 per frame). Flying away, the
+  player's surroundings empty within a minute. `tools/npc-re/senu.sh` (resolution independent:
+  keys and relative mouse only), `senu-ab.sh`.
+- **A/B (t1 at 2560x1600, the user's ini, Senu circling R~70 m over the centre for 160 s; spawned
+  range, fps min / mean, worst frame, virtual TLS max, game RSS):**
+
+  | npc_units | spawned | fps | worst | vTLS | RSS |
+  |---|---|---|---|---|---|
+  | 1 | 292-690 | 79.8 / 81.7 (FG cap) | 19.6 ms | 0 | 5.8-6.1 GB |
+  | 8 | 1145-2089 | 49.2 / 61.6 | 32.5 ms | 1159 | 7.0-7.35 GB |
+  | 12 | 1709-2560 | 42.7 / 54.9 | 38.4 ms | 1646 | 7.8 GB |
+
+  Also straight flights / hovers at 768x480 and 2560x1600 (k=1, 8, 12; seven runs): no frame over
+  90 ms in flight. **The user's hitch did not reproduce.** VRAM 5.4-5.7 GB in all (k=8 +250 MB).
+- **Per-character cost.** Flying out of the city at k=8 the frame time falls 20.8 -> 12.6 ms as
+  spawned goes 1983 -> 1100 (where the FG auto cap holds it): ~9 us of frame time per spawned
+  character, which predicts ~30 ms at 3000 (the user's 30-38 fps hovering). The CPU profile
+  (`tools/npc-re/perfhot.py`, perf user-mode samples per thread / module / function start) is flat:
+  task threads saturated, top function 1.6%.
+- **Memory.** The game's RSS follows the most characters spawned at once and does not come back
+  when they despawn (cap lowered live: 1238 -> 553 spawned, RSS 7334 -> 7328 MB): ~0.9 MB per
+  character (k=1 6.0 GB, k=8 7.3 GB, k=12 7.8 GB over the same flight). The host journal has
+  "systemd-journald: Under memory pressure, flushing caches" at 17:31:59, 17:32:00, 17:32:17,
+  17:32:20, 17:32:22, inside the hitch window; none during any of the test runs (which never
+  hitched). 15 GB of zram swap were in use before the session started. Best explanation: host
+  memory pressure, with the k=8 crowd adding ~1.3-2.2 GB to the game. Not proven (inducing memory
+  pressure on the user's desktop was not tried).
+- **Reproducible hitch: mass unload after a long jump.** ~23 s after a 470 m debug teleport at
+  k=8/12 the old area is unloaded at once: 1760 -> 210 spawned in one step, one frame of 1147 /
+  1231 ms (k=8 / 12; virtual TLS 838 -> 16). Teleports only (fast travel hides it behind the
+  loading screen); scales with the number spawned.
+- **Not the cause:** split-lock traps (`x86/split lock detection` for ACOrigins.exe only at startup),
+  VRAM (5.5 of 8 GB), our MetaAI hook (0.3-1.2 ms avg in the user's hitch window), the per-frame
+  spawn rate (the SpawningManager's sources add up to ~160/s; despawn 1/frame).
+- **Fix (v13, `src/world/npc.cpp`):**
+  - `[world] npc_mem_floor` (MB, default 3072): when the host's free memory (Wine's
+    GlobalMemoryStatusEx; matched MemAvailable within 2%) drops below it, maxSpawned is held at the
+    peak spawned so far / 0.8; released 1 GB above the floor. Whenever the cap binds, the game's
+    budget pressure (spawn distance x0.9 from 0.8 x cap, x0.8 from 0.9 x cap) takes a standing crowd
+    to about half the cap (cap 1140: 1140 -> 562; 1380: 1240 -> 800; 1574: 1253 -> 770), so while
+    held the crowd thins to ~60% of its peak and never sets a new high-water mark; it refills within
+    5 s of release (768 -> 1118). An emergency brake: off unless memory is short.
+  - `[world] npc_senu_max` (default 0 = off): most characters while the camera is more than 18 m
+    from Bayek (Senu, or the camera far away for any reason; logged on each change). Applied as
+    maxSpawned = limit / 0.8 so the crowd settles near the number. The game evicts the farthest
+    first (cap 800 live: 0-40 m 60-76, 40-80 m 451-473 kept, 80-120 m 515 -> 17-23). Circling at
+    k=8 with 1500: 809-1449 spawned after take-off (unlimited: 1145-2089), fps min 50 / mean 63
+    (unlimited 49 / 62); a cap of exactly 1500 gave 716-1466, 55 / 69.
+  - The 10 s npc log line now has the game's working set and the host's free memory, so the next
+    report shows whether memory was short when it hitched.
+- **Strobing of actors / shadows ("when flying").** Captures (`tools/npc-re/strobe-ab.sh`:
+  framedump of 40 consecutive real frames, `tools/strobe.py`; FG present trace of real and
+  generated frames, `tools/fgstrobe.py`, `tools/fgbands.py`):
+  - real frames at k=8, render_scale 0.333, FG on: small actors and their long shadows move
+    smoothly frame to frame in flight (8-frame crops of walkers ~40-60 m below) and from a hover
+    (people region change 5.8-7.9 per frame, no alternation: animation is not stepped);
+  - generated frames: a generated frame that interpolates its neighbours cannot be brighter or
+    darker than both; on-off-on spikes in G presents were below those of R presents everywhere
+    (whole band k=8: R 14437 / G 12131 per MP; a window with walkers and their shadows on a wall:
+    R 0.30% / G 0.16% of pixels; k=1: R 3239 / G 1232; render_scale 0.6: R 15465 / G 11752);
+  - the flip count of real frames in flight is dominated by parallax (roof tiles) and frame rate,
+    so it does not compare across variants.
+  Not reproduced. The user's log shows them bisecting it themselves (F9 FG off 17:34:02, F10 game
+  TAA / DLSS twice 17:34:11-19, FG on again 17:34:20): what they saw in each state decides between
+  FG, DLSS Ultra Performance and the game.
+
 ### The Havok deadlock is a vanilla engine bug
 
 Same stack (TaskThread0 spinning in 0x2ffd9e4 <- 0x2e78f07 <- 0x2e16a8d <- 0x2dbf560 (Havok object
@@ -819,6 +895,10 @@ the walker (229-353 spawned, cap 600), no hang.
   - `jobq.py`: engine job scheduler queues, task-thread sleep counts, and the busy jobs of the frame
     graph with their prerequisites. `jobwhy.py <job>`: walks a job's unfinished prerequisites down
     to the stuck leaf.
+- Senu and crowds in the air: `senu.sh` (fly / circle / hover, samples spawned, virtual TLS,
+  fps), `senu-ab.sh`; `perfhot.py <perf.data> <pid>` (perf record -e cpu-clock:u of the game, by
+  thread, module and game function start); `strobe-ab.sh` with `tools/strobe.py` (framedumps),
+  `tools/fgstrobe.py` / `tools/fgbands.py` (FG present traces, real vs generated).
 - Static helpers on the image dump: `rel32.py` (all rel32 / `call [rip+x]` sites of many targets in
   one pass), `callsite.py` (the call before a return address and its function), `fstart.py`,
   `callargs.py` (immediates before each call), `ctorof.py` (TypeInfo records / tables using a
