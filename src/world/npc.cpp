@@ -231,6 +231,41 @@ unsigned tls_used() {
   return used;
 }
 constexpr unsigned kTlsSlots = 64 + 1024;
+
+// Free host memory (MB). Wine fills ullAvailPhys from the host's /proc/meminfo.
+uint64_t avail_mb() {
+  MEMORYSTATUSEX m{};
+  m.dwLength = sizeof(m);
+  return GlobalMemoryStatusEx(&m) ? m.ullAvailPhys >> 20 : 0;
+}
+
+// The game's working set (MB), through kernel32!K32GetProcessMemoryInfo (no psapi import).
+uint64_t working_set_mb() {
+  struct Pmc { DWORD cb, faults; SIZE_T peak_ws, ws, a, b, c, d, pagefile, peak_pagefile; } pmc{};
+  using Fn = BOOL(WINAPI*)(HANDLE, Pmc*, DWORD);
+  static Fn fn = reinterpret_cast<Fn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "K32GetProcessMemoryInfo"));
+  pmc.cb = sizeof(pmc);
+  return fn && fn(GetCurrentProcess(), &pmc, sizeof(pmc)) ? pmc.ws >> 20 : 0;
+}
+
+// Distance from the render camera to the player entity (-1 if unknown). On foot the camera is 2-5 m
+// from the player; with Senu (the eagle) it is 20+ m above and drifts hundreds of metres away, and
+// the spawning follows the camera (docs/ENGINE_NOTES.md, "Senu").
+constexpr uintptr_t kCameraRva = 0x49e86b8;      // [rva] -> render camera, position at +0x130
+constexpr uintptr_t kPlayerRootRva = 0x4c23c40;  // [[rva]] -> player entity, position at +0x50
+constexpr uintptr_t kEntityVtRva = 0x365e460;
+float camera_player_distance() {
+  uintptr_t c = load(g_base + kCameraRva);
+  uintptr_t e = load(load(g_base + kPlayerRootRva));
+  if (!c || !e || !readable(reinterpret_cast<void*>(c + 0x130), 12) || !readable(reinterpret_cast<void*>(e), 0x60) ||
+      load(e) != g_base + kEntityVtRva)
+    return -1;
+  const float* cp = reinterpret_cast<const float*>(c + 0x130);
+  const float* pp = reinterpret_cast<const float*>(e + 0x50);
+  float dx = cp[0] - pp[0], dy = cp[1] - pp[1], dz = cp[2] - pp[2];
+  float d = std::sqrt(dx * dx + dy * dy + dz * dz);
+  return std::isfinite(d) ? d : -1;
+}
 unsigned g_tls_min_free = kTlsSlots;
 
 } // namespace
@@ -282,6 +317,55 @@ void npc_on_present() {
     uint32_t ceiling = static_cast<uint32_t>(std::clamp(cfg.world_npc_spawn_ceiling, 100.0f, 5000.0f) / mult);
     if (want > ceiling && want > p.max_orig) want = std::max(ceiling, p.max_orig);
   }
+  // Memory: the game's memory grows with the most characters ever spawned at once (~0.9 MB each at
+  // 2560x1600; despawning does not give it back) and stalls for seconds when the host runs short
+  // (a Senu flight over Alexandria at k=8 hitched for 25 s while the host reported memory
+  // pressure). Below [world] npc_mem_floor MB free, hold the cap near the most characters spawned
+  // so far: refilling up to that reuses the game's pooled memory; much beyond it would not. The
+  // cap is that peak / 0.8: the game shortens its spawn distance from 0.8 x cap (x0.9) and again
+  // from 0.9 x cap (x0.8), and that pressure shrinks the crowd well below the cap (a cap at the
+  // count: 1140 -> 562; at peak / 0.9: 1240 -> 800). At most ~12% above the peak.
+  // Released once 1 GB more is free again.
+  static uint32_t hold = 0, peak = 0;
+  static ULONGLONG last_mem = 0;
+  uint32_t spawned_now = g_mgr ? spawned_count(g_mgr) : 0;
+  peak = std::max(peak, spawned_now);
+  if (cfg.world_npc_mem_floor > 0 && want > p.max_orig && now - last_mem >= 1000) {
+    last_mem = now;
+    uint64_t a = avail_mb();
+    if (a && a < cfg.world_npc_mem_floor) {
+      if (!hold) {
+        hold = std::max(p.max_orig, static_cast<uint32_t>(std::ceil(peak / 0.8 / mult)));
+        ACO_LOG("npc: host memory low (%llu MB free < npc_mem_floor %g): cap held at %u (%u spawned, peak %u)",
+                (unsigned long long)a, cfg.world_npc_mem_floor, static_cast<unsigned>(hold * mult), spawned_now, peak);
+      }
+    } else if (hold && a > cfg.world_npc_mem_floor + 1024) {
+      ACO_LOG("npc: host memory back (%llu MB free): cap released", (unsigned long long)a);
+      hold = 0;
+    }
+  } else if (cfg.world_npc_mem_floor <= 0) {
+    hold = 0;
+  }
+  if (hold && want > hold) want = hold;
+  // Senu: with the camera away from the player the spawning follows the camera over the whole city
+  // (2000 -> 3100 spawned at k=8 over Alexandria, 30-38 fps). [world] npc_senu_max limits the
+  // characters spawned then; the game evicts the farthest first, so the crowd under the bird stays.
+  static bool senu = false;
+  if (cfg.world_npc_senu_max > 0 && want > p.max_orig) {
+    float d = camera_player_distance();
+    bool away = d > 18.0f;
+    if (away != senu) {
+      senu = away;
+      ACO_LOG("npc: camera %s the player (%.0f m): %s", away ? "away from" : "back at", d,
+              away ? "npc_senu_max applies" : "npc_senu_max lifted");
+    }
+    // / 0.8: the budget pressure starts at 0.8 x cap, so the crowd settles near the number asked
+    // for (a cap of exactly 1500 gave 700-1424 over a lap of the centre)
+    uint32_t lim = std::max(p.max_orig, static_cast<uint32_t>(cfg.world_npc_senu_max / 0.8f / mult));
+    if (senu && want > lim) want = lim;
+  } else {
+    senu = false;
+  }
   if (k == 1.0f) want = p.max_orig;
   if (cur != want) max_spawned(s) = want;
   p.max_written = want == p.max_orig ? 0 : want;
@@ -295,8 +379,10 @@ void npc_on_present() {
     last_stat = now;
     unsigned tls_free = kTlsSlots - tls_used();
     g_tls_min_free = std::min(g_tls_min_free, tls_free);
-    ACO_LOG("npc: %u spawned, maxSpawned %u (x%.3g quality = cap %.0f), TLS slots free %u (min %u), virtual TLS %u",
-            spawned_count(g_mgr), max_spawned(s), mult, max_spawned(s) * mult, tls_free, g_tls_min_free, tlsext_virtual_in_use());
+    ACO_LOG("npc: %u spawned, maxSpawned %u (x%.3g quality = cap %.0f), TLS slots free %u (min %u), virtual TLS %u, "
+            "game %llu MB, host free %llu MB",
+            spawned_count(g_mgr), max_spawned(s), mult, max_spawned(s) * mult, tls_free, g_tls_min_free, tlsext_virtual_in_use(),
+            (unsigned long long)working_set_mb(), (unsigned long long)avail_mb());
   }
 }
 

@@ -2,7 +2,7 @@ format = 1
 surface = "aco-dlss"
 title = "Pharos"
 help = "DLSS 4.5 upscaling, NVIDIA Reflex and DLSS Frame Generation for AC Origins, plus crowd, draw distance and cloth tweaks."
-audited = "2026-11-17: adopted from Quiver's catalog (options/aco-dlss.toml, 43bcf78) into the Pharos repo; v12 crowd keys (npc_units_rural, npc_urban_threshold, npc_units_hostile) added from src/world/npc_units.cpp. Keys and help change in the same commit as dist/pharos.ini from here on."
+audited = "2026-11-17: adopted from Quiver's catalog (options/aco-dlss.toml, 43bcf78) into the Pharos repo; v12 crowd keys (npc_units_rural, npc_urban_threshold, npc_units_hostile) added from src/world/npc_units.cpp; v13 npc_mem_floor, npc_senu_max (src/world/npc.cpp). Keys and help change in the same commit as dist/pharos.ini from here on."
 
 # Shipped with the mod (dist/quiver-options.toml) from v12 on. Keep surface = "aco-dlss": Quiver
 # stores profile values under it. Lint: quiver mods origins options lint build/mod
@@ -62,7 +62,7 @@ id = "world"
 title = "World"
 options = ["world.lod_distance", "world.lod_mode", "world.npc_density", "world.npc_distance",
            "world.npc_units", "world.npc_units_rural", "world.npc_units_hostile", "world.npc_urban_threshold",
-           "world.tls_extend", "world.npc_spawn_ceiling", "world.npc_units_rate",
+           "world.npc_mem_floor", "world.npc_senu_max", "world.tls_extend", "world.npc_spawn_ceiling", "world.npc_units_rate",
            "world.npc_units_max"]
 
 [[page]]
@@ -981,6 +981,29 @@ step = 10
 level = "advanced"
 apply = "live"
 when = { "world.npc_units" = { min = 2 } }
+
+[option."world.npc_mem_floor"]
+type = "int"
+label = "Memory guard"
+help = "The game keeps the memory of the most characters ever spawned at once (about 0.9 MB each) and stalls for seconds when the computer runs short of memory. Below this many MB of free memory the crowd stops growing past its peak so far, until 1 GB more is free. 0 turns the guard off."
+min = 0
+max = 16384
+step = 256
+default = 3072
+unit = "MB"
+level = "advanced"
+apply = "live"
+
+[option."world.npc_senu_max"]
+type = "int"
+label = "Most people while flying Senu"
+help = "With the eagle the game spawns people under her across the whole city (2000 to 3000+ at 8x, each costing frame time). A limit here applies only while the camera is away from Bayek; the farthest people go first. 0 = no limit."
+min = 0
+max = 8000
+step = 100
+default = 0
+level = "advanced"
+apply = "live"
 
 # ---------------------------------------------------------------- presets
 
