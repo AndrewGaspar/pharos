@@ -5,7 +5,7 @@
 set -uo pipefail
 t=$1 mod=$2
 W=$(cd "$(dirname "$0")/../.." && pwd)
-L=/home/ajg/Games/aco-dlss-instances/$t/out/aco_dlss.log
+L=/home/ajg/Games/aco-dlss-instances/$t/out/pharos.log
 if "$W/tools/npc-re/userplaying.sh"; then echo "not launching: the user is playing"; exit 2; fi
 "$W/scripts/aco" kill-game "$t" >/dev/null 2>&1
 "$W/scripts/aco" fixture "$t" story-alexandria-port >/dev/null 2>&1

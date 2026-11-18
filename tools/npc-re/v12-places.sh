@@ -8,7 +8,7 @@ t=$1 mod=$2 tag=$3
 W=$(cd "$(dirname "$0")/../.." && pwd)
 A=$W/scripts/aco
 I=/home/ajg/Games/aco-dlss-instances/$t
-L=$I/out/aco_dlss.log
+L=$I/out/pharos.log
 SHOT=/tmp/claude-1000/-home-ajg-code-ac-dlss/249d0810-7bc6-42cc-9509-5599a9b80e14/scratchpad
 SD="$I/prefix/drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher/savegames/$(cat "$I/account_id")/3539"
 guard() { if "$W/tools/npc-re/userplaying.sh"; then echo "stopping: the user is playing"; "$A" kill-game "$t" >/dev/null 2>&1; exit 2; fi; }

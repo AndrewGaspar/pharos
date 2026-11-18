@@ -741,6 +741,39 @@ froze at 994 and ~1150-1220 spawned) with `pestack.py`, `jobq.py`, `jobwhy.py` (
   palette) and its place plus 1-4 m. Extras of one unit no longer start in a clump on one spot.
   Save safety is unchanged: an extra is still (spawner, an archetype that spawner lists,
   position), which is what the dead-unit records hold and what the loader matches.
+- **Hang during a jump; pause after one.** The first k=8 run of `tools/npc-re/v12-places.sh` hung
+  (main thread at 99%, log silent) during the debug teleport Memphis -> Faiyum farm (4.3 km), in the
+  middle of a burst of 200 extras created within 2 s of the jump, while the old area was streaming
+  out. Since then `step()` makes no units for 8 s after the player moves > 150 m between steps
+  (fast travel, respawn, teleport; logged as "player jump(s)"). The rerun passed every stage.
+  (Not proven to be our fault: instant teleports also trigger the vanilla Havok deadlock below; no
+  stack was taken.)
+- **Results (t1, 768x480, k=1 vs k=8, rural 2, hostile 1, `npc_density=40`, `tls_extend=1`;
+  spawned civilians per band 0-40 / 40-80 / 80-120 / 120-200 m, total):**
+
+  | place | k=1 | k=8 |
+  |---|---|---|
+  | Alexandria (spawn anchor) | 73/118/170/14, 375 | 295/533/458/18, 1304 |
+  | Memphis (fast travel) | 30/76/143/15, 264 | 81/365/561/31, 1038 |
+  | Faiyum farm (teleport) | 0/0/4/2, 6 | 0/0/6/0, 6 |
+  | Sinai (fast travel; rural) | 8/26/45/0, 79 | 9/36/54/0, 99 |
+  | Alexandria after travel | 28/88/171/18, 305 | 99/393/611/20, 1123 |
+  | quit to title + reload | 24/80/148/12, 264 | 92/236/542/46, 916 |
+
+  Every band up in the cities (x3-4 total), Sinai +25% at the rural value, the farm is empty
+  either way. 55-60 fps (cap 60) everywhere; native TLS slots went down to 64 free, virtual TLS
+  peaked at 421 indices (`tls_extend` is required at k=8). No hostile extras at the default 1.
+- **Spread and variety (k=8, Alexandria, `tools/npc-re/clump.py 80`):** 536 activated extras
+  within 80 m, 24 archetypes among them; nearest sibling (another extra of the same original)
+  median 33.9 m, 9% within 3 m (v11: every sibling started on the same spot). Nearest
+  same-archetype extra: median 2.8 m, 51% within 3 m: crowds are dense and a spawner's mix is a
+  few dozen archetypes. Side-by-side look (`samearch.py`, a same-archetype pair 1.3 m apart,
+  screenshot): two women of the same build in different dress colours (green / teal), so one
+  archetype is not one fixed look; at 768x480 that is a hint, not proof.
+- **Soak (k=8, `tools/npc-re/soak-roam.sh t1 build/mod-uncap 12`):** 12 minutes roaming
+  Alexandria (992 m), 1045-1692 spawned, 6.3-8.8k live extras, 0 failed, 53-60 fps, no hang.
+  Hook cost 0.16-0.25 ms avg per MetaAI update; one 10 s window at 2.4 ms avg / 40 ms max (that
+  window had only 174 MetaAI updates instead of ~600, i.e. the game itself stalled then too).
 
 ### The Havok deadlock is a vanilla engine bug
 

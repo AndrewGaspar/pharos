@@ -8,7 +8,7 @@ from live import Live
 
 L = Live()
 R = float(sys.argv[1]) if len(sys.argv) > 1 else 80
-log = '/home/ajg/Games/aco-dlss-instances/%s/out/aco_dlss.log' % os.environ['ACO_INST']
+log = '/home/ajg/Games/aco-dlss-instances/%s/out/pharos.log' % os.environ['ACO_INST']
 rows = [(int(m[1], 16), int(m[2], 16)) for m in re.finditer(r'npc_units: extra ([0-9a-fA-F]+) of ([0-9a-fA-F]+)', open(log, errors='replace').read())]
 pl = L.q(L.q(L.base + 0x4c23c40))
 px, py = struct.unpack('<ff', L.read(pl + 0x50, 8))
