@@ -411,7 +411,8 @@ void step(uintptr_t mgr) {
     made += augment_spawner(mgr, sp, k, px, py, g_rate.load() - made);
   }
   g_cursor = i;  // resume where this slice stopped
-  if (g_grid.empty() || now - g_last_prune > 60000) {
+  // An empty grid (new world, or nobody around yet) is rebuilt every 2 s rather than every step.
+  if (now - g_last_prune > (g_grid.empty() ? 2000u : 60000u)) {
     g_last_prune = now;
     prune(mgr);
   }
