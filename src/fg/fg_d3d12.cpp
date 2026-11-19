@@ -1353,6 +1353,7 @@ void join(size_t outstanding = 0) {
 // (3 s, 15 % margin). A step down that has to be undone within 6 s blocks further steps down for
 // 10 s, doubling up to 60 s.
 std::atomic<float> g_auto_cap{0};
+std::atomic<bool> g_fg_generating{false};  // fg12_generating()
 std::atomic<int> g_mult{2};
 
 // Presents per second to aim for: [fg] target_hz, else the display's refresh.
@@ -1392,6 +1393,7 @@ void pacing_update(bool fg_active) {
   mult_range(lo, hi);
   if (PC.mult < lo || PC.mult > hi) PC.mult = cfg.fg_count > 0 ? hi : lo;
   g_mult = PC.mult;
+  g_fg_generating = fg_active;
   if (!fg_active) {
     g_auto_cap = 0;
     PC.last = PC.since = 0;
@@ -1786,6 +1788,7 @@ void fg12_before_resize() {
 bool fg12_proxy_active() { return P.proxy == 1; }
 
 float fg12_auto_cap() { return g_auto_cap.load(); }
+bool fg12_generating() { return g_fg_generating.load(); }
 
 // The display's refresh rate for [fg] refresh_hz=0 / target_hz=0: the swapchain's fullscreen mode, else
 // the current display mode of the output the swapchain is on (under Wine: the X/Xwayland mode).

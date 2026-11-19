@@ -152,15 +152,25 @@ float effective_limit() {
   return l > 0 ? l : fg12_auto_cap();
 }
 
+// The limiter in effect. auto: our CPU wait while Frame Generation presents, else the driver's.
+// Under FG the present thread makes 2-4 DXVK presents per game frame; DXVK's Reflex tracker (dxvk
+// v3.1.1-174, GE-Proton11-12) expects one per marked app frame, resets on each unmarked present and
+// then drops every marker, so the driver's minimum interval stops holding (real fps ran 30% above
+// the auto cap, which then kept lowering itself). docs/FRAME_GENERATION.md, "Reflex markers under FG".
+bool cpu_limiter() {
+  const std::string& l = config().reflex_limiter;
+  return l == "cpu" || (l == "auto" && fg12_generating());
+}
+
 // (Re)applies the sleep mode when the config or the device changed.
 void apply_mode() {
   const Config& cfg = config();
   const float limit = effective_limit();
   if (S.stalled) return;
   if (S.applied_dev == S.dev && S.applied_mode == cfg.reflex && std::fabs(S.applied_limit - limit) < 0.5f &&
-      S.applied_optimize == cfg.reflex_optimize && S.applied_limiter == cfg.reflex_limiter)
+      S.applied_optimize == cfg.reflex_optimize && S.applied_limiter == (cpu_limiter() ? "cpu" : "driver"))
     return;
-  S.applied_limiter = cfg.reflex_limiter;
+  S.applied_limiter = cpu_limiter() ? "cpu" : "driver";
   S.applied_optimize = cfg.reflex_optimize;
   S.applied_dev = S.dev;
   S.applied_mode = cfg.reflex;
@@ -169,7 +179,7 @@ void apply_mode() {
   p.version = nv::kSetSleepModeVer;
   p.bLowLatencyMode = cfg.reflex == "on" || cfg.reflex == "boost";
   p.bLowLatencyBoost = cfg.reflex == "boost";
-  p.minimumIntervalUs = limit > 0 && cfg.reflex_limiter != "cpu" ? static_cast<nv::NvU32>(1e6 / limit) : 0;
+  p.minimumIntervalUs = limit > 0 && S.applied_limiter != "cpu" ? static_cast<nv::NvU32>(1e6 / limit) : 0;
   p.bUseMarkersToOptimize = cfg.reflex_optimize;
   nv::Status st = S.set_sleep_mode(S.dev, &p);
   S.sleeping = st == 0 && p.bLowLatencyMode;
@@ -362,10 +372,9 @@ void reflex_on_present_begin(IDXGISwapChain* sc) {
 std::atomic<uint64_t> g_wait_us{0};  // reflex_wait_us()
 
 void cpu_limit() {
-  const Config& cfg = config();
   const float limit = effective_limit();
   // limiter=driver needs Reflex sleeping; without it (mode=off, or not armed yet) we enforce the cap.
-  if ((cfg.reflex_limiter != "cpu" && S.sleeping) || limit <= 0) {
+  if ((!cpu_limiter() && S.sleeping) || limit <= 0) {
     S.cap_next = 0;
     return;
   }

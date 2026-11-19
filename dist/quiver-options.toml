@@ -259,6 +259,7 @@ type = "enum"
 label = "How the cap is enforced"
 help = "Applies to the frame rate cap and to frame generation's automatic cap."
 values = [
+  { value = "auto", label = "Automatic", help = "The mod's wait while Frame Generation runs (the driver's cap doesn't hold then under DXVK), else Reflex's." },
   { value = "driver", label = "Reflex (driver)", help = "Reflex's minimum frame interval; needs Reflex on." },
   { value = "cpu", label = "Mod (CPU wait)", help = "The mod waits on the render thread after Present; works with Reflex off too." },
 ]

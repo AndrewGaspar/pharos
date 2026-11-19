@@ -127,7 +127,7 @@ Config load() {
   c.reflex = read_str(L"mode", "on", L"reflex");
   c.reflex_fps_limit = read_float(L"fps_limit", 0.0f, L"reflex");
   c.reflex_probe = read_float(L"probe", 0.0f, L"reflex") != 0.0f;
-  c.reflex_limiter = read_str(L"limiter", "driver", L"reflex");
+  c.reflex_limiter = read_str(L"limiter", "auto", L"reflex");
   c.world_lod_distance = read_float(L"lod_distance", 1.0f, L"world");
   c.world_lod_skip = read_str(L"lod_skip", "", L"world");
   c.world_lod_mode = read_str(L"lod_mode", "far", L"world");

@@ -764,3 +764,26 @@ work that uses it lets DXVK destroy the VkImage while our command buffer is in f
 `VK_ERROR_DEVICE_LOST` a few seconds later (seen when the engine recreated render targets on a
 level load). Every submission now holds references to its textures until its fence signals, and
 image views are cached per D3D11 texture (holding a reference) and pruned when unused.
+
+### Reflex markers under FG, and `[reflex] limiter=auto` (2026-11-18)
+
+GE-Proton11-12 ships dxvk v3.1.1-174-gf86377680, whose D3D11 Reflex path goes through
+`DxvkReflexLatencyTrackerNv`. It assumes one DXVK present per app frame: every present calls
+`notifyCpuPresentBegin`, and a present with no pending PRESENT_START (FG's 2-4 presents per game
+frame) takes the "no latency markers" branch and `reset()`s, setting `m_nextValidFrameId` to
+UINT64_MAX. All markers are dropped from then on, SIMULATION_START included. Sleeps still reach
+`vkLatencySleepNV`. Quiver's Sight layer saw the marker count freeze when FG started, and PC latency
+stopped. DXVK master has removed the tracker.
+
+The driver's minimum interval still holds without the markers: t1, 2560x1600, the user's settings,
+A/B/A of `limiter` live. Driver: cap 55, 54.1 fps mean, worst frame per 2 s median 20.9 ms. CPU
+wait: 54.8 / 54.3 fps, 20.5 / 21.6 ms. The `real` in an `fg12: auto cap` line was measured under the
+previous line's cap. Read that way, the user's 16:11 session held the cap throughout. The 09:55
+session ran ~117 fps under caps of 79 down to 41 for about 10 s after FG started. The cause is unknown
+and we couldn't reproduce it.
+
+`limiter=auto` (the new default) uses our CPU wait while FG presents generated frames, and the driver
+otherwise, so the cap doesn't depend on the driver/DXVK marker path. In the same run, a host process
+took ~3 GB (host free 6.7 -> 3.6 GB). The game was paged out (working set 6.2 -> 1.8 GB) and ran at
+8-28 fps for ~90 s, under either limiter. `npc_mem_floor=3072` didn't trigger: free memory never went
+below 3.6 GB.

@@ -21,5 +21,7 @@ bool fg12_proxy_active();
 // [fg] auto_cap: the real-frame-rate cap Frame Generation currently wants (0 = none); enforced by the
 // [reflex] limiter.
 float fg12_auto_cap();
+// Frame Generation presented generated frames for the last game frame (mode=d3d12, toggled on, ready).
+bool fg12_generating();
 
 } // namespace aco
