@@ -12,6 +12,7 @@ set(DLSS_SDK ${CMAKE_SOURCE_DIR}/third_party/DLSS-310.9.16 CACHE PATH "NVIDIA DL
 # d3d11.dll proxy: loaded from the game directory, forwards to the system d3d11 (DXVK under Proton).
 add_library(aco_d3d11 SHARED
   src/core/log.cpp
+  src/core/lab.cpp
   src/core/hook.cpp
   src/core/vtidx.cpp
   src/core/shaders.cpp

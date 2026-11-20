@@ -2,9 +2,14 @@
 
 #include <windows.h>
 
+#include <atomic>
+#include <filesystem>
 #include <cstdlib>
+#include <fstream>
 #include <mutex>
+#include <sstream>
 
+#include "core/lab.h"
 #include "core/log.h"
 
 extern "C" IMAGE_DOS_HEADER __ImageBase;
@@ -17,6 +22,7 @@ bool g_fg_blocked = false;  // stereo has (or may have) run this session: no Fra
 Config g_file;    // as last read from the file
 std::mutex g_mutex;
 bool g_loaded = false;
+std::atomic<unsigned> g_generation{0};  // bumped by every reload that changed something
 
 // pharos.ini; an install that still only has the pre-rename aco_dlss.ini keeps working.
 std::wstring ini_path() {
@@ -218,6 +224,7 @@ bool config_reload() {
   // Compare against the file's previous contents, so runtime toggles survive until the file changes.
   bool changed = !g_loaded || !same(c, g_file);
   if (changed) {
+    g_generation.fetch_add(1);
     g_file = c;
     g_config = c;
     ACO_LOG("config: enabled=%d backend=%s preset=%s debug=%s jitter=(%g,%g) mv=(%g,%g) render_scale=%g mip_bias=%s%+g latency_log=%d reflex=%s fps_limit=%g",
@@ -226,6 +233,72 @@ bool config_reload() {
   }
   g_loaded = true;
   return changed;
+}
+
+namespace {
+std::string trim(std::string s) {
+  while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r')) s.pop_back();
+  size_t i = s.find_first_not_of(" \t");
+  return i == std::string::npos ? "" : s.substr(i);
+}
+
+// Reads (and with `value`, replaces) section.key in pharos.ini, editing only that line's value, like
+// `quiver lab set`. Returns false if the key isn't in the file.
+bool ini_line(const std::string& section, const std::string& key, const std::string* value, std::string& old) {
+  std::wstring path = ini_path();
+  std::ifstream in{std::filesystem::path(path), std::ios::binary};
+  if (!in) return false;
+  std::stringstream ss;
+  ss << in.rdbuf();
+  in.close();
+  std::string text = ss.str(), out, cur;
+  bool found = false;
+  size_t pos = 0;
+  while (pos < text.size()) {
+    size_t nl = text.find('\n', pos);
+    std::string line = text.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos);
+    pos = nl == std::string::npos ? text.size() : nl + 1;
+    std::string t = trim(line);
+    if (!t.empty() && t[0] == '[' && t.back() == ']') {
+      cur = t.substr(1, t.size() - 2);
+    } else if (!found && cur == section && t.find('=') != std::string::npos && trim(t.substr(0, t.find('='))) == key) {
+      found = true;
+      old = trim(t.substr(t.find('=') + 1));
+      if (value) line = key + "=" + *value + (line.size() && line.back() == '\r' ? "\r" : "");
+    }
+    out += line;
+    if (nl != std::string::npos) out += '\n';
+  }
+  if (!found || !value || *value == old) return found;
+  std::wstring tmp = path + L".tmp";
+  {
+    std::ofstream f(std::filesystem::path(tmp), std::ios::binary | std::ios::trunc);
+    f << out;
+  }
+  return MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
+}
+}  // namespace
+
+void config_register_lab() {
+  if (!lab_active()) return;
+  // `quiver lab call <i> cfg section.key [value]`: read, or set and wait for the reload (pharos.ini
+  // is re-read every 64 presents). The same file `quiver lab set <i> pharos:[section]key=value`
+  // edits.
+  lab_verb("cfg", [](const std::vector<std::string>& a, bool& ok) -> std::string {
+    if (a.empty() || a[0].find('.') == std::string::npos) return lab_error(ok, "usage: cfg section.key [value]");
+    std::string sec = a[0].substr(0, a[0].find('.')), key = a[0].substr(a[0].find('.') + 1), old;
+    if (a.size() < 2) {
+      if (!ini_line(sec, key, nullptr, old)) return lab_error(ok, "no " + a[0] + " in pharos.ini");
+      return "{\"key\":" + json_str(a[0]) + ",\"value\":" + json_str(old) + "}";
+    }
+    unsigned gen = g_generation.load();
+    if (!ini_line(sec, key, &a[1], old)) return lab_error(ok, "no " + a[0] + " in pharos.ini");
+    bool reloaded = false;
+    if (old != a[1])
+      for (int i = 0; i < 200 && !(reloaded = g_generation.load() != gen); ++i) Sleep(50);
+    return "{\"key\":" + json_str(a[0]) + ",\"value\":" + json_str(a[1]) + ",\"was\":" + json_str(old) +
+           ",\"reloaded\":" + (reloaded ? "true" : "false") + "}";
+  });
 }
 
 void config_toggle_upscaler() {

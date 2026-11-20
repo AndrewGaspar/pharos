@@ -13,6 +13,12 @@ namespace aco {
 //                     position and heading, render camera position, heading and pitch; degrees,
 //                     Z up, yaw 0 = +X, 90 = +Y) and deletes the trigger.
 // Checked from Present.
+//
+// In the Quiver lab the same is served through the lab channel (teleport_register): `quiver lab
+// where`, `quiver lab teleport <i> <location | x y z [yaw [pitch]]>` (the player only; tools/lab/camera
+// turns the camera from the host); and the lab state is kept (menu | in-world) for `quiver lab wait
+// <i> in-world`.
 void teleport_on_present();
+void teleport_register();
 
 } // namespace aco

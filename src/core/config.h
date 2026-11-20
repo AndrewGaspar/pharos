@@ -122,6 +122,8 @@ const Config& config();
 bool config_reload();
 // Stereo may run this session: Frame Generation stays off until the game restarts.
 void config_block_fg();
+// Lab channel verb `cfg section.key [value]` (core/lab.h); inert outside the lab.
+void config_register_lab();
 std::wstring module_dir();
 // Runtime toggle (hotkey) between DLSS and the game's TAA; reverts when the file changes.
 void config_toggle_upscaler();

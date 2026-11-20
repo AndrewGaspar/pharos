@@ -20,6 +20,7 @@ const std::wstring& out_dir() {
   if (g_out.empty()) {
     wchar_t buf[MAX_PATH];
     DWORD n = GetEnvironmentVariableW(L"ACO_DLSS_OUT", buf, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) n = GetEnvironmentVariableW(L"QUIVER_LAB_RUN_DIR", buf, MAX_PATH);
     if (n > 0 && n < MAX_PATH) {
       g_out = buf;
     } else {
@@ -37,6 +38,18 @@ void log_init() {
   if (g_file) return;
   std::wstring path = out_dir() + L"\\pharos.log";
   g_file = _wfopen(path.c_str(), L"w");
+  // In the Quiver lab the log is in this run's folder; %QUIVER_LAB%\pharos.log is a hard link to it,
+  // so the instance manifest's log_file (lab:pharos.log) always names the current run's log (for
+  // `quiver lab set --wait`, which can't name a run folder).
+  wchar_t lab[MAX_PATH];
+  DWORD n = GetEnvironmentVariableW(L"QUIVER_LAB", lab, MAX_PATH);
+  if (g_file && n > 0 && n < MAX_PATH) {
+    std::wstring link = std::wstring(lab, n) + L"\\pharos.log";
+    if (link != path) {
+      DeleteFileW(link.c_str());
+      CreateHardLinkW(link.c_str(), path.c_str(), nullptr);
+    }
+  }
 }
 
 void logf(const char* fmt, ...) {

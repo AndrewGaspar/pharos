@@ -2,12 +2,17 @@
 
 #include <windows.h>
 
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
+#include <vector>
 
+#include "core/lab.h"
 #include "core/log.h"
 
 namespace aco {
@@ -118,38 +123,89 @@ struct {
   float drop = 1.0f;  // placed this far above the requested point (see teleport_on_present)
   int frames = 0, places = 0;
   unsigned poll = 0;
+  bool from_file = true;  // requested through <out>\teleport.txt (else through the lab channel)
 } S;
+
+// The last finished teleport, for the lab verb (which waits for `g_done` to move).
+std::mutex g_result_mu;
+std::string g_result;  // JSON object
+std::atomic<unsigned> g_done{0};
 
 void finish(const char* status, uintptr_t e) {
   char buf[256];
   float p[3] = {};
   if (e) memcpy(p, pos_of(e), 12);
-  snprintf(buf, sizeof(buf), "%s %.3f %.3f %.3f %.1f writes=%d elapsed=%.2f\n", status, p[0], p[1], p[2],
-           e ? yaw_of(e) : 0.0f, S.places, now_s() - S.t_start);
-  write_file(L"teleport.done", buf);
+  float yaw = e ? yaw_of(e) : 0.0f;
+  double elapsed = now_s() - S.t_start;
+  snprintf(buf, sizeof(buf), "%s %.3f %.3f %.3f %.1f writes=%d elapsed=%.2f\n", status, p[0], p[1], p[2], yaw,
+           S.places, elapsed);
+  if (S.from_file) write_file(L"teleport.done", buf);
   ACO_LOG("teleport: %s", buf);
+  char js[320];
+  snprintf(js, sizeof(js), "{\"status\":\"%s\",\"player\":[%.3f,%.3f,%.3f],\"yaw\":%.1f,\"writes\":%d,\"elapsed\":%.2f}",
+           status, p[0], p[1], p[2], yaw, S.places, elapsed);
+  {
+    std::lock_guard lk(g_result_mu);
+    g_result = js;
+  }
+  g_done.fetch_add(1);
   S.phase = Phase::Idle;
+}
+
+// Starts a teleport (render thread). Returns false (and finishes with a failure) if it can't start.
+bool start(const float target[3], double hold, float drop, bool from_file) {
+  S = decltype(S){};
+  S.t_start = now_s();
+  S.from_file = from_file;
+  if (hold >= 0) S.watch = hold;
+  if (drop >= 0) S.drop = drop;
+  memcpy(S.target, target, sizeof(S.target));
+  uintptr_t e = find_player();
+  if (!e) {
+    finish("fail no-player", 0);
+    return false;
+  }
+  S.phase = Phase::Place;
+  return true;
+}
+
+// "x y z yaw camera cx cy cz cyaw cpitch" (as <out>\where.txt) and the same as JSON.
+void where_now(std::string* text, std::string* json) {
+  uintptr_t e = find_player();
+  float cam[5];
+  bool have_cam = read_camera(cam);
+  char buf[160], js[320];
+  if (e) {
+    const float* p = pos_of(e);
+    if (have_cam)
+      snprintf(buf, sizeof(buf), "%.3f %.3f %.3f %.1f camera %.3f %.3f %.3f %.2f %.2f\n", p[0], p[1], p[2], yaw_of(e),
+               cam[0], cam[1], cam[2], cam[3], cam[4]);
+    else
+      snprintf(buf, sizeof(buf), "%.3f %.3f %.3f %.1f\n", p[0], p[1], p[2], yaw_of(e));
+    snprintf(js, sizeof(js), "{\"player\":[%.3f,%.3f,%.3f],\"yaw\":%.1f", p[0], p[1], p[2], yaw_of(e));
+  } else {
+    snprintf(buf, sizeof(buf), "none\n");
+    snprintf(js, sizeof(js), "{\"player\":null");
+  }
+  std::string j = js;
+  if (have_cam) {
+    snprintf(js, sizeof(js), ",\"camera\":{\"pos\":[%.3f,%.3f,%.3f],\"yaw\":%.2f,\"pitch\":%.2f}", cam[0], cam[1],
+             cam[2], cam[3], cam[4]);
+    j += js;
+  }
+  j += "}";
+  if (text) *text = buf;
+  if (json) *json = j;
 }
 
 void poll_triggers() {
   std::wstring where = out_dir() + L"\\where";
   if (GetFileAttributesW(where.c_str()) != INVALID_FILE_ATTRIBUTES) {
     DeleteFileW(where.c_str());
-    uintptr_t e = find_player();
-    char buf[128];
-    if (e) {
-      const float* p = pos_of(e);
-      float cam[5];
-      if (read_camera(cam))
-        snprintf(buf, sizeof(buf), "%.3f %.3f %.3f %.1f camera %.3f %.3f %.3f %.2f %.2f\n", p[0], p[1], p[2], yaw_of(e),
-                 cam[0], cam[1], cam[2], cam[3], cam[4]);
-      else
-        snprintf(buf, sizeof(buf), "%.3f %.3f %.3f %.1f\n", p[0], p[1], p[2], yaw_of(e));
-    } else {
-      snprintf(buf, sizeof(buf), "none\n");
-    }
-    write_file(L"where.txt", buf);
-    ACO_LOG("teleport: where -> %s", buf);
+    std::string text;
+    where_now(&text, nullptr);
+    write_file(L"where.txt", text.c_str());
+    ACO_LOG("teleport: where -> %s", text.c_str());
   }
 
   std::wstring path = out_dir() + L"\\teleport.txt";
@@ -162,23 +218,132 @@ void poll_triggers() {
   DeleteFileW((out_dir() + L"\\teleport.done").c_str());
   ACO_LOG("teleport: request %s", line);
 
-  S = decltype(S){};
-  S.t_start = now_s();
+  float target[3] = {};
+  double hold = -1;
+  float drop = -1;
   int n = 0;
   for (char* tok = strtok(line, " \t\r\n"); tok; tok = strtok(nullptr, " \t\r\n")) {
-    if (!strncmp(tok, "hold=", 5)) S.watch = atof(tok + 5);
-    else if (!strncmp(tok, "drop=", 5)) S.drop = static_cast<float>(atof(tok + 5));
-    else if (n < 3) S.target[n++] = static_cast<float>(atof(tok));
+    if (!strncmp(tok, "hold=", 5)) hold = atof(tok + 5);
+    else if (!strncmp(tok, "drop=", 5)) drop = static_cast<float>(atof(tok + 5));
+    else if (n < 3) target[n++] = static_cast<float>(atof(tok));
   }
-  if (n < 3) return finish("fail bad-request", 0);
+  if (n < 3) {
+    S = decltype(S){};
+    S.t_start = now_s();
+    return finish("fail bad-request", 0);
+  }
+  start(target, hold, drop, true);
+}
+
+// Readiness for the lab (`quiver lab wait <i> in-world`), checked every 30 presents:
+//   menu      not in a world: no player entity, or one near z = 0 (the title and main menu keep a
+//             placeholder entity at (0, 1, 0.9); while a world loads the player waits in the Animus
+//             void near (-100, 33.5, 0.2));
+//   in-world  the player is in a world (two checks 30 presents apart agree).
+// Only written on a change.
+void world_state() {
+  static unsigned n = 0;
+  static std::string cur, pending;
+  if (++n % 30) return;
   uintptr_t e = find_player();
-  if (!e) return finish("fail no-player", 0);
-  S.phase = Phase::Place;
+  std::string st = !e ? "menu" : std::fabs(pos_of(e)[2]) < 5.0f ? "menu" : "in-world";
+  if (st == cur) {
+    pending.clear();
+    return;
+  }
+  if (st == "in-world" && pending != st) {  // confirm at the next check
+    pending = st;
+    return;
+  }
+  pending.clear();
+  cur = st;
+  std::vector<std::string> kv;
+  if (e) {
+    char b[96];
+    const float* p = pos_of(e);
+    snprintf(b, sizeof(b), "player=%.1f %.1f %.1f", p[0], p[1], p[2]);
+    kv.emplace_back(b);
+  }
+  char f[48];
+  snprintf(f, sizeof(f), "present=%llu", (unsigned long long)present_count());
+  kv.emplace_back(f);
+  lab_state(st, kv);
+}
+
+bool parse_float(const std::string& s, float& out) {
+  char* end = nullptr;
+  out = strtof(s.c_str(), &end);
+  return end && end != s.c_str() && *end == 0 && std::isfinite(out);
+}
+
+// `quiver lab teleport <i> <location | x y z [yaw [pitch]]> [hold=S] [drop=M]` (locations.txt rows
+// may carry a trailing "# comment", which arrives as arguments: ignored). Moves the player only:
+// the camera can't be turned from inside the game (SendInput mouse motion never reaches the game's
+// raw-input mouse-look under Wine; XTEST motion from the host does), so yaw/pitch are returned as
+// "want" for tools/lab/camera, which turns it with quiver lab mouse in a closed loop on `where`.
+std::string verb_teleport(const std::vector<std::string>& a, bool& ok) {
+  float v[5];
+  int n = 0;
+  double hold = -1;
+  float drop = -1;
+  for (const auto& t : a) {
+    if (t.rfind("#", 0) == 0) break;
+    if (t.rfind("hold=", 0) == 0) hold = atof(t.c_str() + 5);
+    else if (t.rfind("drop=", 0) == 0) drop = static_cast<float>(atof(t.c_str() + 5));
+    else if (n < 5 && parse_float(t, v[n])) n++;
+    else return lab_error(ok, "teleport: x y z [yaw [pitch]] [hold=S] [drop=M]; not a number: " + t);
+  }
+  if (n < 3) return lab_error(ok, "teleport: x y z [yaw [pitch]] [hold=S] [drop=M]");
+  unsigned seq = g_done.load();
+  bool started = false;
+  if (!on_present([&] {
+        if (S.phase != Phase::Idle) return;
+        started = true;
+        start(v, hold, drop, false);
+      }))
+    return lab_error(ok, "teleport: game not presenting");
+  if (!started) return lab_error(ok, "teleport: another teleport is running");
+  for (int i = 0; g_done.load() == seq; ++i) {
+    if (i > 1800) return lab_error(ok, "teleport: no result in 90 s");
+    Sleep(50);
+  }
+  std::string r;
+  {
+    std::lock_guard lk(g_result_mu);
+    r = g_result;
+  }
+  if (r.find("\"status\":\"ok\"") == std::string::npos) {
+    ok = false;
+    return json_str(r);
+  }
+  if (n >= 4) {
+    char w[96];
+    snprintf(w, sizeof(w), ",\"want\":{\"yaw\":%.2f%s", v[3], n >= 5 ? ",\"pitch\":" : "");
+    r = r.substr(0, r.size() - 1) + w;
+    if (n >= 5) {
+      snprintf(w, sizeof(w), "%.2f", v[4]);
+      r += w;
+    }
+    r += "}}";
+  }
+  return r;
 }
 
 } // namespace
 
+void teleport_register() {
+  if (!lab_active()) return;
+  // `quiver lab where <i>`: player position and heading, render camera (Z up, yaw 0 = +X, 90 = +Y).
+  lab_verb("where", [](const std::vector<std::string>&, bool& ok) -> std::string {
+    std::string j;
+    if (!on_present([&] { where_now(nullptr, &j); })) return lab_error(ok, "where: game not presenting");
+    return j;
+  });
+  lab_verb("teleport", verb_teleport);
+}
+
 void teleport_on_present() {
+  if (lab_active()) world_state();
   if (S.phase == Phase::Idle) {
     if (++S.poll % 8) return;
     poll_triggers();

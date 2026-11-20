@@ -12,6 +12,7 @@
 #include "core/quiver.h"
 #include "core/hook.h"
 #include "core/log.h"
+#include "core/lab.h"
 #include "core/vtidx.h"
 #include "core/config.h"
 #include "core/ctxhooks.h"
@@ -92,6 +93,7 @@ HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain* self, UINT sync, UINT flags
     peek_on_present();
     cloth_on_present();
     teleport_on_present();
+    lab_on_present();
   }
   LARGE_INTEGER a, b, f;
   QueryPerformanceCounter(&a);
@@ -317,6 +319,9 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
     ACO_LOG("Pharos loaded into %ls", exe);
     config_reload();
+    lab_init();
+    config_register_lab();
+    teleport_register();
     quiver_init();
     upscaler_preinit();
     fg_preinit();
