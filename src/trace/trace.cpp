@@ -114,18 +114,23 @@ void poll_skipdraw() {
   g_skip_hi.store(-1, std::memory_order_relaxed);
   g_skip_ctx.store(-1, std::memory_order_relaxed);
   if (!raw.empty() && raw[0] == '@') {
+    // Branch on ':' first: sscanf's conversion count alone can't tell "@0-9" from "@0:*".
     long a = -1, lo = -1, hi = -1;
-    if (sscanf(raw.c_str(), "@%ld:%ld-%ld", &a, &lo, &hi) == 3 && a >= 0 && lo >= 0 && hi > lo) {
-      g_skip_ctx.store(a, std::memory_order_relaxed);
-      g_skip_lo.store(lo, std::memory_order_relaxed);
-      g_skip_hi.store(hi, std::memory_order_relaxed);
-      g_skip_prefix = "@";  // marks active (never matches a hex hash)
-    } else if (sscanf(raw.c_str(), "@%ld:*", &a) == 1 && a >= 0) {
-      g_skip_ctx.store(a, std::memory_order_relaxed);
-      g_skip_lo.store(0, std::memory_order_relaxed);
-      g_skip_hi.store(1L << 40, std::memory_order_relaxed);
-      g_skip_prefix = "@";
-    } else if (sscanf(raw.c_str(), "@%ld-%ld", &lo, &hi) == 2 && lo >= 0 && hi > lo) {
+    int used = 0;
+    if (raw.find(':') != std::string::npos) {
+      if (sscanf(raw.c_str(), "@%ld:%ld-%ld%n", &a, &lo, &hi, &used) == 3 && a >= 0 && lo >= 0 && hi > lo) {
+        g_skip_ctx.store(a, std::memory_order_relaxed);
+        g_skip_lo.store(lo, std::memory_order_relaxed);
+        g_skip_hi.store(hi, std::memory_order_relaxed);
+        g_skip_prefix = "@";  // marks active (never matches a hex hash)
+      } else if (sscanf(raw.c_str(), "@%ld:*%n", &a, &used) == 1 && a >= 0 &&
+                 used == static_cast<int>(raw.size())) {
+        g_skip_ctx.store(a, std::memory_order_relaxed);
+        g_skip_lo.store(0, std::memory_order_relaxed);
+        g_skip_hi.store(2147483647L, std::memory_order_relaxed);
+        g_skip_prefix = "@";
+      }
+    } else if (sscanf(raw.c_str(), "@%ld-%ld%n", &lo, &hi, &used) == 2 && lo >= 0 && hi > lo) {
       g_skip_lo.store(lo, std::memory_order_relaxed);
       g_skip_hi.store(hi, std::memory_order_relaxed);
       g_skip_prefix = "@";
