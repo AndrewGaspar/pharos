@@ -69,6 +69,8 @@ void rec_clear_state();
 // Installs the recorder's own hooks on the immediate context (vtable of the immediate context's
 // class only, so deferred contexts are unaffected).
 void rec_install(ID3D11DeviceContext* imm);
+// The *SetConstantBuffers(1) hooks (camera redirection, stereo/camera.h) on any context.
+void rec_install_cb_hooks(ID3D11DeviceContext* ctx);
 
 // Frame control (render thread, from Present).
 struct RecFrame;

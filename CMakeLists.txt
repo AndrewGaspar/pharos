@@ -38,6 +38,7 @@ add_library(aco_d3d11 SHARED
   src/core/ctxhooks.cpp
   src/stereo/record.cpp
   src/stereo/stereo.cpp
+  src/stereo/camera.cpp
   src/dlss/ngx.cpp
   src/dlss/kernels.cpp
   src/dlss/upscaler.cpp

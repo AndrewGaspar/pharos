@@ -14,6 +14,7 @@
 #include "core/hook.h"
 #include "core/log.h"
 #include "core/vtidx.h"
+#include "stereo/camera.h"
 
 namespace aco {
 
@@ -265,14 +266,42 @@ bool upload_only(ID3D11Resource* res) {
 #define ORIGF(name) orig<decltype(hk_##name)>(self, Context_##name)
 #define ORIGF1(name) orig<decltype(hk_##name)>(self, Context1_##name)
 
+using Cb1Fn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext1*, UINT, UINT, ID3D11Buffer* const*, const UINT*,
+                                       const UINT*);
+
+// Rebinds the slots cam_filter redirected (bit i of mask) to the per-eye camera pool.
+template <typename SetCb1>
+void cam_rebind(ID3D11DeviceContext* self, SetCb1 set1, UINT s, unsigned mask, ID3D11Buffer** rb, UINT* rf, UINT* rn,
+                bool rec, void (ID3D11DeviceContext1::*m1)(UINT, UINT, ID3D11Buffer* const*, const UINT*, const UINT*)) {
+  for (UINT i = 0; mask; ++i, mask >>= 1) {
+    if (!(mask & 1)) continue;
+    set1(static_cast<ID3D11DeviceContext1*>(self), s + i, 1, &rb[i], &rf[i], &rn[i]);
+    if (rec) {
+      Ref<ID3D11Buffer> r(rb[i]);
+      UINT slot = s + i, f = rf[i], n = rn[i];
+      rec_push([r, slot, f, n, m1](ID3D11DeviceContext* c) {
+        ID3D11Buffer* b = r.p;
+        (static_cast<ID3D11DeviceContext1*>(c)->*m1)(slot, 1, &b, &f, &n);
+      });
+    }
+  }
+}
+
 #define REC_STAGE(S, Stage)                                                                                       \
   void STDMETHODCALLTYPE hk_##S##SetConstantBuffers(ID3D11DeviceContext* self, UINT s, UINT n,                       \
                                                     ID3D11Buffer* const* b) {                                       \
-    if (ACO_REC_WANT(self)) {                                                                                       \
+    ID3D11Buffer* rb[16];                                                                                           \
+    UINT rf[16], rn[16];                                                                                            \
+    unsigned mask = n <= 16 ? cam_filter(self, Stage, s, n, b, nullptr, rb, rf, rn) : 0;                           \
+    bool rec = ACO_REC_WANT(self);                                                                                  \
+    if (rec) {                                                                                                      \
       Refs<ID3D11Buffer> r(b, n);                                                                                   \
       rec_push([s, n, r](ID3D11DeviceContext* c) { c->S##SetConstantBuffers(s, n, r.data()); });                   \
     }                                                                                                               \
     ORIGF(S##SetConstantBuffers)(self, s, n, b);                                                                    \
+    if (mask)                                                                                                       \
+      cam_rebind(self, reinterpret_cast<Cb1Fn>(original(self, Context1_##S##SetConstantBuffers1)), s, mask, rb, rf, \
+                 rn, rec, &ID3D11DeviceContext1::S##SetConstantBuffers1);                                           \
   }                                                                                                                 \
   void STDMETHODCALLTYPE hk_##S##SetShaderResources(ID3D11DeviceContext* self, UINT s, UINT n,                       \
                                                     ID3D11ShaderResourceView* const* v) {                           \
@@ -292,7 +321,11 @@ bool upload_only(ID3D11Resource* res) {
   }                                                                                                                 \
   void STDMETHODCALLTYPE hk_##S##SetConstantBuffers1(ID3D11DeviceContext1* self, UINT s, UINT n,                     \
                                                      ID3D11Buffer* const* b, const UINT* f, const UINT* k) {        \
-    if (ACO_REC_WANT(self)) {                                                                                       \
+    ID3D11Buffer* rb[16];                                                                                           \
+    UINT rf[16], rn[16];                                                                                            \
+    unsigned mask = n <= 16 ? cam_filter(self, Stage, s, n, b, f, rb, rf, rn) : 0;                                 \
+    bool rec = ACO_REC_WANT(self);                                                                                  \
+    if (rec) {                                                                                                      \
       Refs<ID3D11Buffer> r(b, n);                                                                                   \
       auto fv = copy_array(f, n), kv = copy_array(k, n);                                                            \
       rec_push([s, n, r, fv, kv](ID3D11DeviceContext* c) {                                                          \
@@ -300,15 +333,17 @@ bool upload_only(ID3D11Resource* res) {
                                                                       ptr_or_null(kv));                             \
       });                                                                                                           \
     }                                                                                                               \
-    ORIGF1(S##SetConstantBuffers1)(self, s, n, b, f, k);                                                            \
+    auto set1 = ORIGF1(S##SetConstantBuffers1);                                                                     \
+    set1(self, s, n, b, f, k);                                                                                      \
+    if (mask) cam_rebind(self, set1, s, mask, rb, rf, rn, rec, &ID3D11DeviceContext1::S##SetConstantBuffers1);      \
   }
 
-REC_STAGE(VS, Vertex)
-REC_STAGE(PS, Pixel)
-REC_STAGE(GS, Geometry)
-REC_STAGE(HS, Hull)
-REC_STAGE(DS, Domain)
-REC_STAGE(CS, Compute)
+REC_STAGE(VS, kVS)
+REC_STAGE(PS, kPS)
+REC_STAGE(GS, kGS)
+REC_STAGE(HS, kHS)
+REC_STAGE(DS, kDS)
+REC_STAGE(CS, kCS)
 
 #define REC_SHADER(S, T)                                                                                            \
   void STDMETHODCALLTYPE hk_##S##SetShader(ID3D11DeviceContext* self, T* sh, ID3D11ClassInstance* const* ci,         \
@@ -971,6 +1006,25 @@ void rec_cs_set_shader(ID3D11ComputeShader* s, ID3D11ClassInstance* const*, UINT
 }
 void rec_clear_state() {
   rec_push([](ID3D11DeviceContext* c) { c->ClearState(); });
+}
+
+void rec_install_cb_hooks(ID3D11DeviceContext* ctx) {
+#define HC(name) hook_vtable(ctx, Context_##name, reinterpret_cast<void*>(hk_##name))
+#define HC1(name) hook_vtable(ctx, Context1_##name, reinterpret_cast<void*>(hk_##name))
+  HC(VSSetConstantBuffers);
+  HC(PSSetConstantBuffers);
+  HC(GSSetConstantBuffers);
+  HC(HSSetConstantBuffers);
+  HC(DSSetConstantBuffers);
+  HC(CSSetConstantBuffers);
+  HC1(VSSetConstantBuffers1);
+  HC1(PSSetConstantBuffers1);
+  HC1(GSSetConstantBuffers1);
+  HC1(HSSetConstantBuffers1);
+  HC1(DSSetConstantBuffers1);
+  HC1(CSSetConstantBuffers1);
+#undef HC1
+#undef HC
 }
 
 void rec_install(ID3D11DeviceContext* imm) {

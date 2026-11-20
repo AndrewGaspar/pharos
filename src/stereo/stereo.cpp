@@ -10,6 +10,7 @@
 #include "core/config.h"
 #include "core/log.h"
 #include "dlss/kernels.h"
+#include "stereo/camera.h"
 #include "stereo/record.h"
 
 namespace aco {
@@ -262,6 +263,7 @@ void stereo_init(ID3D11Device* dev, ID3D11DeviceContext* imm) {
   if (S.dev1)
     S.dev1->CreateDeviceContextState(0, &fl, 1, D3D11_SDK_VERSION, __uuidof(ID3D11Device1), nullptr, &S.own_state);
   rec_install(imm);
+  cam_init(dev, imm);
 }
 
 bool stereo_active() { return S.active; }
@@ -271,6 +273,7 @@ void stereo_on_present(IDXGISwapChain* sc) {
   const Config& cfg = config();
   bool want = cfg.stereo_mode == "sbs" && S.dev && S.imm1 && !S.failed;
   RecFrame* f = rec_stop();
+  cam_on_present(want);
   if (!want) {
     rec_free(f);
     if (S.active) ACO_LOG("stereo: off");

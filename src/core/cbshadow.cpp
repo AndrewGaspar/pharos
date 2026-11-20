@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "core/hook.h"
+#include "stereo/camera.h"
 #include "stereo/record.h"
 #include "core/log.h"
 #include "core/mapstats.h"
@@ -99,6 +100,7 @@ HRESULT STDMETHODCALLTYPE hk_Map(ID3D11DeviceContext* self, ID3D11Resource* res,
                                  D3D11_MAPPED_SUBRESOURCE* out) {
   HRESULT hr = orig<decltype(hk_Map)>(self, Context_Map)(self, res, sub, type, flags, out);
   if (SUCCEEDED(hr) && out && ACO_REC_WANT(self)) rec_map(res, sub, type, flags, out);
+  if (SUCCEEDED(hr) && out) cam_map(self, res, type, out);
   if (SUCCEEDED(hr) && out && (type == D3D11_MAP_WRITE_DISCARD || type == D3D11_MAP_WRITE_NO_OVERWRITE)) {
     mapstats_note(res, false);
     if (uint32_t size = shadow_size(res)) {
@@ -124,6 +126,7 @@ HRESULT STDMETHODCALLTYPE hk_Map(ID3D11DeviceContext* self, ID3D11Resource* res,
 }
 
 void STDMETHODCALLTYPE hk_Unmap(ID3D11DeviceContext* self, ID3D11Resource* res, UINT sub) {
+  cam_unmap(self, res);
   if (self == g_rec_imm) rec_unmap(res, sub);
   if (shadow_size(res)) {
     std::lock_guard lock(g_mutex);

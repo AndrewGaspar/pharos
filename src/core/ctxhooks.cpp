@@ -16,6 +16,7 @@
 #include "core/shaders.h"
 #include "core/vtidx.h"
 #include "dlss/upscaler.h"
+#include "stereo/camera.h"
 #include "stereo/record.h"
 #include "stereo/stereo.h"
 #include "trace/trace.h"
@@ -251,6 +252,7 @@ HRESULT STDMETHODCALLTYPE hk_FinishCommandList(ID3D11DeviceContext* self, BOOL r
       s->cs.store(ShaderClass::None, std::memory_order_relaxed);
     }
   if (SUCCEEDED(hr) && out && *out) {
+    cam_finish_command_list(self, *out);
     trace_finish_command_list(self, *out);
     upscaler_on_finish_command_list(self, *out);
   }
@@ -258,6 +260,7 @@ HRESULT STDMETHODCALLTYPE hk_FinishCommandList(ID3D11DeviceContext* self, BOOL r
 }
 void STDMETHODCALLTYPE hk_ExecuteCommandList(ID3D11DeviceContext* self, ID3D11CommandList* cl, BOOL restore) {
   if (ACO_REC_WANT(self)) rec_execute(cl, restore);
+  if (g_cam_on.load(std::memory_order_relaxed)) cam_before_execute(self, cl, stereo_eye());
   ctx_gate(self);
   trace_execute_command_list(self, cl);
   if (!upscaler_on_execute_command_list(self, cl, restore))
@@ -312,6 +315,7 @@ HRESULT STDMETHODCALLTYPE hk_CreateSamplerState(ID3D11Device* self, const D3D11_
 
 void ctxhooks_install_context(ID3D11DeviceContext* ctx) {
   cbshadow_install(ctx);
+  rec_install_cb_hooks(ctx);
   hook_vtable(ctx, Context_PSSetShader, reinterpret_cast<void*>(hk_PSSetShader));
   hook_vtable(ctx, Context_CSSetShader, reinterpret_cast<void*>(hk_CSSetShader));
   hook_vtable(ctx, Context_ClearState, reinterpret_cast<void*>(hk_ClearState));
