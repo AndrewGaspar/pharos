@@ -165,6 +165,7 @@ Config load() {
   c.stereo_diff_gain = read_float(L"diff_gain", 16.0f, L"stereo");
   c.stereo_swap = read_float(L"swap", 0.0f, L"stereo") != 0.0f;
   c.stereo_skip = read_str(L"skip", "", L"stereo");
+  c.stereo_copies = read_str(L"copies", "vp,ss2ws,pos", L"stereo");
   c.cloth_mode = read_str(L"mode", "game", L"cloth");
   c.cloth_scale = read_float(L"scale", 1.0f, L"cloth");
   return c;
@@ -180,7 +181,7 @@ bool same(const Config& a, const Config& b) {
          a.toggle_key == b.toggle_key && a.cloth_mode == b.cloth_mode && a.cloth_scale == b.cloth_scale &&
          a.stereo_mode == b.stereo_mode && a.stereo_output == b.stereo_output && a.stereo_separation == b.stereo_separation &&
          a.stereo_convergence == b.stereo_convergence && a.stereo_show == b.stereo_show &&
-         a.stereo_diff_gain == b.stereo_diff_gain && a.stereo_swap == b.stereo_swap && a.stereo_skip == b.stereo_skip &&
+         a.stereo_diff_gain == b.stereo_diff_gain && a.stereo_swap == b.stereo_swap && a.stereo_skip == b.stereo_skip && a.stereo_copies == b.stereo_copies &&
          a.world_lod_distance == b.world_lod_distance && a.world_lod_skip == b.world_lod_skip && a.world_lod_mode == b.world_lod_mode && a.world_npc_density == b.world_npc_density &&
          a.world_npc_distance == b.world_npc_distance && a.world_npc_spawn_ceiling == b.world_npc_spawn_ceiling && a.world_npc_units == b.world_npc_units &&
          a.world_npc_mem_floor == b.world_npc_mem_floor && a.world_npc_senu_max == b.world_npc_senu_max &&

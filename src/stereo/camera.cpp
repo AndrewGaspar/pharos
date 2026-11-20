@@ -24,6 +24,7 @@ namespace {
 constexpr UINT kPassParamsBytes = 2048;  // pool buffer size of PassParams (cb1)
 constexpr UINT kInstanceBytes = 512;     // pool buffer size of InstanceParams (cb3)
 constexpr UINT kPassSlot = 1, kInstanceSlot = 3;
+constexpr UINT kMaxScanBytes = 65536;  // constant buffers shadowed while stereo runs (one bind's maximum)
 
 // PassParams
 constexpr int kEyePos = 0, kEyePosPrev = 1, kViewToWorld = 4, kViewToWorldPrev = 8, kWorldToView = 12,
@@ -231,10 +232,17 @@ struct MainView {
   bool valid = false;
   F4 vp[4], vpp[4];  // mono viewProj / previous
   Eye eye[2];
+  // For finding copies of this camera in other constant buffers (mono, this frame / previous):
+  float pos[3], posp[3];      // camera position
+  float c0[3], c1[3], f[3];   // right / m00, up / m11, forward (the view's z axis)
+  float c0p[3], c1p[3], fp[3];
 };
 
 struct CamCtx {
   ID3D11DeviceContext* ctx = nullptr;
+  // The immediate context is used from several game threads (maps from task threads): every
+  // access to this state holds the lock (uncontended for deferred contexts).
+  std::mutex mutex;
   std::unordered_map<ID3D11Resource*, std::vector<uint8_t>> shadow;  // last written contents
   std::unordered_map<ID3D11Resource*, MapOpen> open;
   std::vector<std::shared_ptr<Chunk>> chunks;  // since the last FinishCommandList
@@ -267,14 +275,111 @@ bool shadow_size(ID3D11Resource* res, UINT* size) {
   D3D11_BUFFER_DESC d;
   static_cast<ID3D11Buffer*>(res)->GetDesc(&d);
   if (!(d.BindFlags & D3D11_BIND_CONSTANT_BUFFER)) return false;
-  if (d.ByteWidth != kPassParamsBytes && d.ByteWidth != kInstanceBytes) return false;
+  if (d.ByteWidth > kMaxScanBytes) return false;
   *size = d.ByteWidth;
   return true;
 }
 
+// ---- copies of the camera in other constant buffers ----------------------------------------------
+// Effects with their own constant buffers carry copies of the main camera (measured, cap at the
+// Alexandria harbour): SSR's worldToProj/prevWorldToProj and the sun flare's ViewProj (= viewProj
+// with a linear depth row), the fog's and shadow stabilisation's SSToWS/LastSSToWS (columns
+// right/m00, up/m11, -forward, camera position), the cloud composite's Proj2World (same columns,
+// -forward in .w: the sky's directions), and plain camera positions (fog EyePositionWS). Left
+// alone, both eyes use the same copy: reflections stick to the water's surface, the clouds land
+// near screen depth. Each copy found in a bound buffer is replaced with the eye's version.
+
+inline bool near3(const float* a, const float* b, float tol) {
+  return std::fabs(a[0] - b[0]) < tol && std::fabs(a[1] - b[1]) < tol && std::fabs(a[2] - b[2]) < tol;
+}
+
+// Screen-to-world matrix at c: columns 0 and 1 = c0/c1, a column in {2,3} = +-forward. Returns
+// that column (2 or 3), or -1; *sign = the forward column's sign. With -forward (the view ray of
+// NDC x is x*c0 - forward) the eye's NDC shift k moves it by -k*c0; with +forward (the ray is
+// negated, so x runs the other way: measured on the cloud composite) by +k*c0.
+int match_ss2ws(const F4* c, const float* c0, const float* c1, const float* f, float* sign) {
+  float m0[3] = {c[0].x, c[1].x, c[2].x}, m1[3] = {c[0].y, c[1].y, c[2].y};
+  if (!near3(m0, c0, 2e-3f) || !near3(m1, c1, 2e-3f)) return -1;
+  for (int col = 2; col < 4; ++col) {
+    float v[3] = {(&c[0].x)[col], (&c[1].x)[col], (&c[2].x)[col]};
+    float nf[3] = {-f[0], -f[1], -f[2]};
+    if (near3(v, f, 2e-3f)) {
+      *sign = 1.0f;
+      return col;
+    }
+    if (near3(v, nf, 2e-3f)) {
+      *sign = -1.0f;
+      return col;
+    }
+  }
+  return -1;
+}
+
+// viewProj-like matrix at c: rows 0, 1 and 3 equal vp's (row 2 may hold another depth mapping).
+bool match_vp(const F4* c, const F4* vp) {
+  return near3(&c[0].x, &vp[0].x, 2e-3f) && near3(&c[1].x, &vp[1].x, 2e-3f) && near3(&c[3].x, &vp[3].x, 2e-3f) &&
+         std::fabs(c[3].w - vp[3].w) < 0.05f;
+}
+
+// Finds camera copies in src (nreg float4 registers) and writes the eyes' versions into out[e].
+// Returns the number of copies found.
+int scan_other(const F4* src, UINT nreg, const MainView& mv, F4* out0, F4* out1, unsigned kinds) {
+  int found = 0;
+  F4* out[2] = {out0, out1};
+  for (UINT r = 0; r < nreg;) {
+    if (r + 4 <= nreg) {
+      bool cur = (kinds & 1) && match_vp(src + r, mv.vp), prev = (kinds & 1) && !cur && match_vp(src + r, mv.vpp);
+      if (cur || prev) {
+        for (int e = 0; e < 2; ++e) {
+          F4* m = out[e] + r;
+          const float* d = cur ? mv.eye[e].d : mv.eye[e].dp;
+          for (int i = 0; i < 4; ++i) m[i].w -= dot3(m[i], d);
+          add_row(m[0], m[3], mv.eye[e].k);
+        }
+        found++;
+        r += 4;
+        continue;
+      }
+      float fs = 0;
+      int fc = (kinds & 2) ? match_ss2ws(src + r, mv.c0, mv.c1, mv.f, &fs) : -1;
+      bool sprev = false;
+      if (fc < 0 && (kinds & 2)) {
+        fc = match_ss2ws(src + r, mv.c0p, mv.c1p, mv.fp, &fs);
+        sprev = fc >= 0;
+      }
+      if (fc >= 0) {
+        const float* pos = sprev ? mv.posp : mv.pos;
+        float t[3] = {src[r].w, src[r + 1].w, src[r + 2].w};
+        bool translated = fc == 2 && near3(t, pos, 0.02f);
+        for (int e = 0; e < 2; ++e) {
+          F4* m = out[e] + r;
+          const float* d = sprev ? mv.eye[e].dp : mv.eye[e].d;
+          for (int i = 0; i < 3; ++i) {
+            (&m[i].x)[fc] += fs * mv.eye[e].k * m[i].x;
+            if (translated) m[i].w += d[i];
+          }
+        }
+        found++;
+        r += 4;
+        continue;
+      }
+    }
+    bool pc = (kinds & 4) && near3(&src[r].x, mv.pos, 0.01f), pp = (kinds & 4) && !pc && near3(&src[r].x, mv.posp, 0.01f);
+    if (pc || pp) {
+      for (int e = 0; e < 2; ++e) {
+        const float* d = pc ? mv.eye[e].d : mv.eye[e].dp;
+        for (int i = 0; i < 3; ++i) (&out[e][r].x)[i] += d[i];
+      }
+      found++;
+    }
+    ++r;
+  }
+  return found;
+}
+
 // ---- statistics --------------------------------------------------------------------------------
 
-std::atomic<uint64_t> st_pass_main{0}, st_pass_screen{0}, st_pass_other{0}, st_inst_main{0}, st_inst_other{0}, st_nodata{0},
+std::atomic<uint64_t> st_other_cb{0}, st_pass_main{0}, st_pass_screen{0}, st_pass_other{0}, st_inst_main{0}, st_inst_other{0}, st_nodata{0},
     st_uploads{0}, st_upload_bytes{0};
 
 // Copies the slot data into a chunk of this context (new chunk if full). Returns the pool offset.
@@ -326,6 +431,7 @@ void cam_map(ID3D11DeviceContext* ctx, ID3D11Resource* res, D3D11_MAP type, D3D1
   if (!shadow_size(res, &size)) return;
   CamCtx* cs = ctx_state(ctx);
   if (!cs) return;
+  std::lock_guard lock(cs->mutex);
   auto& s = cs->shadow[res];
   s.resize(size);
   cs->open[res] = MapOpen{m->pData, size};
@@ -335,6 +441,7 @@ void cam_map(ID3D11DeviceContext* ctx, ID3D11Resource* res, D3D11_MAP type, D3D1
 void cam_unmap(ID3D11DeviceContext* ctx, ID3D11Resource* res) {
   CamCtx* cs = ctx_state(ctx);
   if (!cs) return;
+  std::lock_guard lock(cs->mutex);
   auto it = cs->open.find(res);
   if (it == cs->open.end()) return;
   memcpy(it->second.real, cs->shadow[res].data(), it->second.size);
@@ -345,18 +452,24 @@ unsigned cam_filter(ID3D11DeviceContext* ctx, CamStage stage, UINT start, UINT n
                     const UINT* first, ID3D11Buffer** out_buf, UINT* out_first, UINT* out_num) {
   (void)stage;
   if (!g_cam_on.load(std::memory_order_relaxed) || !bufs || !g_pool || g_pool_failed) return 0;
-  if (start > kInstanceSlot || start + n <= kPassSlot) return 0;
-  CamCtx* cs = nullptr;
+  if (start + n <= kPassSlot) return 0;
+  CamCtx* cs = ctx_state(ctx);
+  if (!cs) return 0;
+  std::lock_guard cs_lock(cs->mutex);
   unsigned mask = 0;
   const Config& cfg = config();
   for (UINT i = 0; i < n; ++i) {
     UINT slot = start + i;
-    if (slot != kPassSlot && slot != kInstanceSlot) continue;
+    // cb0 (FrameParams) and cb2 (MaterialParams) are bound for every draw and hold no camera.
+    if (slot == 0 || slot == 2) continue;
     ID3D11Buffer* b = bufs[i];
     if (!b) continue;
     UINT size;
     if (!shadow_size(b, &size)) continue;
-    if ((slot == kPassSlot) != (size == kPassParamsBytes)) continue;
+    bool other = slot != kPassSlot && slot != kInstanceSlot;
+    if (!other && (slot == kPassSlot) != (size == kPassParamsBytes)) continue;
+    if (other && !cs && !(cs = ctx_state(ctx))) return mask;
+    if (other && !cs->main.valid) continue;
     if (!cs && !(cs = ctx_state(ctx))) return mask;
     auto it = cs->shadow.find(b);
     if (it == cs->shadow.end()) {
@@ -366,9 +479,23 @@ unsigned cam_filter(ID3D11DeviceContext* ctx, CamStage stage, UINT start, UINT n
     UINT off = first ? first[i] * 16 : 0;
     if (off + size > it->second.size()) continue;
     const F4* src = reinterpret_cast<const F4*>(it->second.data() + off);
-    alignas(16) F4 l[kPassParamsBytes / 16], r[kPassParamsBytes / 16];
+    thread_local std::vector<F4> lbuf, rbuf;
     UINT nreg = size / 16;
-    if (slot == kPassSlot) {
+    if (lbuf.size() < nreg) {
+      lbuf.resize(nreg);
+      rbuf.resize(nreg);
+    }
+    F4* l = lbuf.data();
+    F4* r = rbuf.data();
+    if (other) {
+      memcpy(l, src, size);
+      memcpy(r, src, size);
+      unsigned kinds = (cfg.stereo_copies.find("vp") != std::string::npos ? 1u : 0u) |
+                       (cfg.stereo_copies.find("ss2ws") != std::string::npos ? 2u : 0u) |
+                       (cfg.stereo_copies.find("pos") != std::string::npos ? 4u : 0u);
+      if (!kinds || !scan_other(src, nreg, cs->main, l, r, kinds)) continue;
+      st_other_cb.fetch_add(1, std::memory_order_relaxed);
+    } else if (slot == kPassSlot) {
       float sep = cfg.stereo_separation * 0.001f;
       if (!is_main_view(src)) {
         cs->main.valid = false;
@@ -393,6 +520,21 @@ unsigned cam_filter(ID3D11DeviceContext* ctx, CamStage stage, UINT start, UINT n
       note_main(src);
       MainView& mv = cs->main;
       mv.valid = true;
+      {
+        float m00 = src[kProj].x, m11 = src[kProj + 1].y;
+        for (int i = 0; i < 3; ++i) {
+          const F4& v = src[kViewToWorld + i];
+          const F4& w = src[kViewToWorldPrev + i];
+          mv.pos[i] = v.w;
+          mv.posp[i] = w.w;
+          mv.c0[i] = v.x / m00;
+          mv.c1[i] = v.y / m11;
+          mv.f[i] = v.z;
+          mv.c0p[i] = w.x / m00;
+          mv.c1p[i] = w.y / m11;
+          mv.fp[i] = w.z;
+        }
+      }
       memcpy(mv.vp, src + kViewProj, sizeof(mv.vp));
       memcpy(mv.vpp, src + kViewProjPrev, sizeof(mv.vpp));
       for (int e = 0; e < 2; ++e) eye_params(src, sep, cfg.stereo_convergence, e, &mv.eye[e]);
@@ -484,7 +626,9 @@ unsigned cam_filter(ID3D11DeviceContext* ctx, CamStage stage, UINT start, UINT n
 
 void cam_finish_command_list(ID3D11DeviceContext* ctx, ID3D11CommandList* cl) {
   CamCtx* cs = ctx_state(ctx);
-  if (!cs || cs->chunks.empty()) return;
+  if (!cs) return;
+  std::lock_guard lock(cs->mutex);
+  if (cs->chunks.empty()) return;
   auto* h = new ClChunks;
   h->chunks = std::move(cs->chunks);
   cs->chunks.clear();
@@ -509,9 +653,9 @@ void cam_on_present(bool stereo_on) {
   static uint64_t frames = 0;
   if (!stereo_on) return;
   if (++frames % 300 == 0 || frames == 60) {
-    ACO_LOG("stereo: camera binds/frame: PassParams main %.0f screen %.0f other %.0f, InstanceParams main %.0f other %.0f, no data %.0f; uploads %.0f (%.2f MB)",
+    ACO_LOG("stereo: camera binds/frame: PassParams main %.0f screen %.0f other %.0f, InstanceParams main %.0f other %.0f, no data %.0f, other buffers with camera copies %.0f; uploads %.0f (%.2f MB)",
             st_pass_main.exchange(0) / 300.0, st_pass_screen.exchange(0) / 300.0, st_pass_other.exchange(0) / 300.0, st_inst_main.exchange(0) / 300.0,
-            st_inst_other.exchange(0) / 300.0, st_nodata.exchange(0) / 300.0, st_uploads.exchange(0) / 300.0,
+            st_inst_other.exchange(0) / 300.0, st_nodata.exchange(0) / 300.0, st_other_cb.exchange(0) / 300.0, st_uploads.exchange(0) / 300.0,
             st_upload_bytes.exchange(0) / 300.0 / 1048576.0);
   }
 }

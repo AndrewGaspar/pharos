@@ -111,6 +111,7 @@ struct Config {
   std::string stereo_show = "sbs";      // [stereo] show: sbs | left | right | diff (debug views)
   float stereo_diff_gain = 16.0f;       // [stereo] diff_gain: show=diff amplification
   bool stereo_swap = false;             // [stereo] swap: exchange the eyes
+  std::string stereo_copies = "vp,ss2ws,pos";  // [stereo] copies (debugging): kinds of camera copies shifted in effect buffers
   std::string stereo_skip;              // [stereo] skip (debugging): kinds of recorded calls left out of the replay
   std::string cloth_mode = "game";  // [cloth] mode: game | render | scale (see cloth/cloth.h)
   float cloth_scale = 1.0f;         // [cloth] scale (mode=scale, diagnostics)
