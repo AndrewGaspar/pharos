@@ -119,6 +119,8 @@ struct Config {
 const Config& config();
 // Re-reads the file; returns true if anything changed.
 bool config_reload();
+// Stereo may run this session: Frame Generation stays off until the game restarts.
+void config_block_fg();
 std::wstring module_dir();
 // Runtime toggle (hotkey) between DLSS and the game's TAA; reverts when the file changes.
 void config_toggle_upscaler();

@@ -240,6 +240,12 @@ void cam_init(ID3D11Device* dev, ID3D11DeviceContext* imm) {
   g_imm = imm;
   if (g_pool) g_pool->Release();
   g_pool = nullptr;
+  g_pool_failed = false;
+}
+
+namespace {
+void create_pool() {
+  ID3D11Device* dev = g_dev;
   D3D11_BUFFER_DESC d{};
   d.ByteWidth = kPoolBytes;
   d.Usage = D3D11_USAGE_DEFAULT;
@@ -248,6 +254,7 @@ void cam_init(ID3D11Device* dev, ID3D11DeviceContext* imm) {
   g_pool_failed = FAILED(hr);
   ACO_LOG("stereo: camera constant pool %u MB: 0x%08lx", kPoolBytes >> 20, hr);
 }
+}  // namespace
 
 void cam_map(ID3D11DeviceContext* ctx, ID3D11Resource* res, D3D11_MAP type, D3D11_MAPPED_SUBRESOURCE* m) {
   if (!g_cam_on.load(std::memory_order_relaxed) || type != D3D11_MAP_WRITE_DISCARD || !m || !m->pData) return;
@@ -416,6 +423,7 @@ void cam_before_execute(ID3D11DeviceContext* imm, ID3D11CommandList* cl, int eye
 }
 
 void cam_on_present(bool stereo_on) {
+  if (stereo_on && !g_pool && !g_pool_failed && g_dev) create_pool();  // only once stereo runs
   g_cam_on.store(stereo_on && g_pool && !g_pool_failed, std::memory_order_relaxed);
   static uint64_t frames = 0;
   if (!stereo_on) return;

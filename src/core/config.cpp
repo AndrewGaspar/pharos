@@ -13,6 +13,7 @@ namespace aco {
 
 namespace {
 Config g_config;  // effective (file + runtime toggles)
+bool g_fg_blocked = false;  // stereo has (or may have) run this session: no Frame Generation
 Config g_file;    // as last read from the file
 std::mutex g_mutex;
 bool g_loaded = false;
@@ -153,10 +154,11 @@ Config load() {
   c.stereo_output = read_str(L"output", "auto", L"stereo");
   // Stereo presents its own composition; Frame Generation (which presents generated frames from
   // its own back buffer) is off whenever stereo is configured.
-  // Once set, for the whole session: Frame Generation can't start mid-session cleanly.
-  static bool stereo_seen = false;
-  if (c.stereo_mode != "off") stereo_seen = true;
-  if (stereo_seen) c.fg_mode = "off";
+  // Once set, for the whole session: Frame Generation can't start mid-session cleanly. mode=auto
+  // blocks it only when the display is a stereo one when the game creates its swapchain
+  // (config_block_fg, from stereo).
+  if (c.stereo_mode == "sbs") g_fg_blocked = true;
+  if (g_fg_blocked) c.fg_mode = "off";
   c.stereo_separation = read_float(L"separation", 32.5f, L"stereo");
   c.stereo_convergence = read_float(L"convergence", 4.0f, L"stereo");
   c.stereo_show = read_str(L"show", "sbs", L"stereo");
@@ -194,6 +196,14 @@ std::wstring module_dir() {
   GetModuleFileNameW(reinterpret_cast<HMODULE>(&__ImageBase), buf, MAX_PATH);
   std::wstring s(buf);
   return s.substr(0, s.find_last_of(L"\\/"));
+}
+
+void config_block_fg() {
+  std::lock_guard lock(g_mutex);
+  if (g_fg_blocked) return;
+  g_fg_blocked = true;
+  g_config.fg_mode = g_file.fg_mode = "off";
+  ACO_LOG("config: Frame Generation off for this session (stereo)");
 }
 
 const Config& config() {

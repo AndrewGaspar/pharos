@@ -288,6 +288,14 @@ int stereo_eye() { return g_eye.load(std::memory_order_relaxed); }
 UINT stereo_swapchain_scale() {
   const Config& cfg = config();
   if (cfg.stereo_mode == "off") return 1;
+  // mode=auto: decide now (before Frame Generation sets up its back buffer at the first GetBuffer)
+  // whether this session may show stereo.
+  if (cfg.stereo_mode == "auto") {
+    int ds = hypr_display_stereo_now();
+    ACO_LOG("stereo: mode=auto, display at swapchain creation: %s", ds == 1 ? "stereo" : ds == 0 ? "mono" : "unknown");
+    if (ds != 1) return 1;
+    config_block_fg();
+  }
   // auto = hsbs under DXVK: a 2x swapchain needs Wine to allow a Vulkan swapchain larger than the
   // window AND the D3D layer to create it at the buffer size; DXVK follows the surface's
   // currentExtent (the window) and would scale the 2x buffer down to the window (a filtered half
