@@ -12,6 +12,7 @@
 #include "dlss/kernels.h"
 #include "stereo/camera.h"
 #include "stereo/record.h"
+#include "stereo/temporal.h"
 
 namespace aco {
 
@@ -264,6 +265,7 @@ void stereo_init(ID3D11Device* dev, ID3D11DeviceContext* imm) {
     S.dev1->CreateDeviceContextState(0, &fl, 1, D3D11_SDK_VERSION, __uuidof(ID3D11Device1), nullptr, &S.own_state);
   rec_install(imm);
   cam_init(dev, imm);
+  tmp_init(dev, imm);
 }
 
 bool stereo_active() { return S.active; }
@@ -275,6 +277,7 @@ void stereo_on_present(IDXGISwapChain* sc) {
   RecFrame* f = rec_stop();
   cam_on_present(want);
   if (!want) {
+    tmp_frame_end(false, nullptr, 0);
     rec_free(f);
     if (S.active) ACO_LOG("stereo: off");
     S.active = false;
@@ -291,6 +294,7 @@ void stereo_on_present(IDXGISwapChain* sc) {
       SUCCEEDED(sc->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&bb))) && ensure_targets(bb)) {
     double t0 = now_ms();
     S.imm->CopyResource(S.eye[0], bb);
+    tmp_before_right(S.imm);
     double t_copy = now_ms();
     g_eye.store(1, std::memory_order_relaxed);
     unsigned skip = 0;
@@ -304,6 +308,7 @@ void stereo_on_present(IDXGISwapChain* sc) {
     rec_replay(f, S.imm, skip);
     g_eye.store(0, std::memory_order_relaxed);
     S.imm->CopyResource(S.eye[1], bb);
+    tmp_after_right(S.imm);
     double t_replay = now_ms();
     compose(bb, S.frames % 30 == 0);
     S.replay_ms += now_ms() - t0;
@@ -317,6 +322,7 @@ void stereo_on_present(IDXGISwapChain* sc) {
     ACO_LOG("stereo: frame not replayed: %s", why);
     S.last_bad = why;
   }
+  tmp_frame_end(true, bb, rec_frame_size(f));
   if (bb) bb->Release();
   if (S.frames <= 3 || S.frames % 300 == 0) rec_log_uploads(f);
   rec_free(f);

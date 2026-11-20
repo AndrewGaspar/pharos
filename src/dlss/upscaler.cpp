@@ -1,4 +1,5 @@
 #include "dlss/upscaler.h"
+#include "stereo/stereo.h"
 #include "core/ctxgate.h"
 
 #include <windows.h>
@@ -185,12 +186,16 @@ struct State {
   uint32_t out_w = 0, out_h = 0;
   std::unordered_map<ID3D11Resource*, ID3D11ShaderResourceView*> srv_cache;
   ngx::Params create_params, eval_params;
-  NVSDK_NGX_Handle* feature = nullptr;
-  uint32_t feat_rw = 0, feat_rh = 0, feat_dw = 0, feat_dh = 0;
-  std::string feat_preset;
+  // One DLSS feature (history) per eye; [1] is only used by stereo's second pass.
+  struct Feature {
+    NVSDK_NGX_Handle* handle = nullptr;
+    uint32_t rw = 0, rh = 0, dw = 0, dh = 0;
+    std::string preset;
+    bool reset_next = true;
+    uint64_t last_job_frame = 0;
+    LARGE_INTEGER last_eval_time{};
+  } feat[2];
   bool ngx_tried = false, ngx_ok = false;
-  bool reset_next = true;
-  uint64_t last_job_frame = 0;
   // Last job executed (for Frame Generation).
   ID3D11Resource* fg_depth = nullptr;
   uint32_t fg_rw = 0, fg_rh = 0;
@@ -198,7 +203,6 @@ struct State {
   uint64_t fg_frame = 0;
   FgCamera fg_cam;
   int eval_failures = 0;
-  LARGE_INTEGER last_eval_time{};
 
   GpuTimer gpu_timer;
   LARGE_INTEGER perf_last{};
@@ -336,14 +340,14 @@ int perf_quality_for(float ratio) {
   return NVSDK_NGX_PerfQuality_Value_UltraPerformance;
 }
 
-bool ensure_feature(uint32_t rw, uint32_t rh, uint32_t dw, uint32_t dh) {
+bool ensure_feature(int eye, uint32_t rw, uint32_t rh, uint32_t dw, uint32_t dh) {
   const Config& cfg = config();
-  if (S.feature && S.feat_rw == rw && S.feat_rh == rh && S.feat_dw == dw && S.feat_dh == dh &&
-      S.feat_preset == cfg.preset)
+  auto& F = S.feat[eye];
+  if (F.handle && F.rw == rw && F.rh == rh && F.dw == dw && F.dh == dh && F.preset == cfg.preset)
     return true;
-  if (S.feature) {
-    ngx::release_feature(S.feature);
-    S.feature = nullptr;
+  if (F.handle) {
+    ngx::release_feature(F.handle);
+    F.handle = nullptr;
   }
   ngx::Params& p = S.create_params;
   if (!p) p = ngx::alloc_params();
@@ -364,16 +368,16 @@ bool ensure_feature(uint32_t rw, uint32_t rh, uint32_t dw, uint32_t dh) {
         NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance,
         NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraQuality})
     p.set(key, preset);
-  S.feature = ngx::create_feature(S.imm, NVSDK_NGX_Feature_SuperSampling, p);
-  ACO_LOG("upscaler: DLSS feature %ux%u -> %ux%u preset=%s flags=0x%x: %s", rw, rh, dw, dh, cfg.preset.c_str(), flags,
-          S.feature ? "ok" : "FAILED");
-  S.feat_rw = rw;
-  S.feat_rh = rh;
-  S.feat_dw = dw;
-  S.feat_dh = dh;
-  S.feat_preset = cfg.preset;
-  S.reset_next = true;
-  return S.feature != nullptr;
+  F.handle = ngx::create_feature(S.imm, NVSDK_NGX_Feature_SuperSampling, p);
+  ACO_LOG("upscaler: DLSS feature (eye %d) %ux%u -> %ux%u preset=%s flags=0x%x: %s", eye, rw, rh, dw, dh,
+          cfg.preset.c_str(), flags, F.handle ? "ok" : "FAILED");
+  F.rw = rw;
+  F.rh = rh;
+  F.dw = dw;
+  F.dh = dh;
+  F.preset = cfg.preset;
+  F.reset_next = true;
+  return F.handle != nullptr;
 }
 
 bool evaluate_dlss(const Job& job) {
@@ -382,7 +386,9 @@ bool evaluate_dlss(const Job& job) {
     S.ngx_ok = ngx::init(S.dev, out_dir()) && ngx::dlss_available();
   }
   if (!S.ngx_ok || !job.depth) return false;
-  if (!ensure_feature(job.render_w, job.render_h, S.out_w, S.out_h)) return false;
+  int eye = stereo_eye();
+  auto& F = S.feat[eye];
+  if (!ensure_feature(eye, job.render_w, job.render_h, S.out_w, S.out_h)) return false;
   const Config& cfg = config();
   ngx::Params& p = S.eval_params;
   if (!p) p = ngx::alloc_params();
@@ -391,11 +397,11 @@ bool evaluate_dlss(const Job& job) {
   LARGE_INTEGER now, freq;
   QueryPerformanceCounter(&now);
   QueryPerformanceFrequency(&freq);
-  float dt_ms = S.last_eval_time.QuadPart ? 1000.0f * (now.QuadPart - S.last_eval_time.QuadPart) / freq.QuadPart : 16.6f;
-  S.last_eval_time = now;
-  bool reset = S.reset_next || job.frame > S.last_job_frame + 2;
-  S.reset_next = false;
-  S.last_job_frame = job.frame;
+  float dt_ms = F.last_eval_time.QuadPart ? 1000.0f * (now.QuadPart - F.last_eval_time.QuadPart) / freq.QuadPart : 16.6f;
+  F.last_eval_time = now;
+  bool reset = F.reset_next || job.frame > F.last_job_frame + 2;
+  F.reset_next = false;
+  F.last_job_frame = job.frame;
 
   p.set(NVSDK_NGX_Parameter_Color, job.color);
   p.set(NVSDK_NGX_Parameter_Output, static_cast<ID3D11Resource*>(S.out));
@@ -424,7 +430,7 @@ bool evaluate_dlss(const Job& job) {
   p.set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, job.render_h);
   p.set(NVSDK_NGX_Parameter_FrameTimeDeltaInMsec, dt_ms);
 
-  NVSDK_NGX_Result r = ngx::evaluate(S.imm, S.feature, p);
+  NVSDK_NGX_Result r = ngx::evaluate(S.imm, F.handle, p);
   if (NVSDK_NGX_FAILED(r)) {
     if (S.eval_failures++ < 10) ACO_LOG("upscaler: DLSS evaluate failed: %s", ngx::result_str(r));
     return false;
