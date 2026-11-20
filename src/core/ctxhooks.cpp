@@ -148,9 +148,20 @@ void STDMETHODCALLTYPE hk_ClearState(ID3D11DeviceContext* self) {
   ORIG(decltype(hk_ClearState), Context_ClearState)(self);
 }
 
+// skipdraw experiment (trace/skipdraw.txt): drop draws matching a pixel-shader hash prefix.
+inline bool skip_this_draw(ID3D11DeviceContext* self, UINT count) {
+  if (!skipdraw_active()) return false;
+  ID3D11PixelShader* ps = nullptr;
+  self->PSGetShader(&ps, nullptr, nullptr);
+  bool hit = ps && skipdraw_match(shader_hash(ps), count);
+  if (ps) ps->Release();
+  return hit;
+}
+
 // Common draw path: trace, then let the upscaler intercept classified passes.
 template <typename F>
 inline void draw_common(ID3D11DeviceContext* self, const char* op, const char* args, F&& issue) {
+  if (skipdraw_range_hit(self)) return;  // range-form experiment (counts every draw)
   ctx_gate(self);
   tmp_on_draw(self);
   trace_draw(self, op, args);
@@ -161,6 +172,7 @@ inline void draw_common(ID3D11DeviceContext* self, const char* op, const char* a
 }
 
 void STDMETHODCALLTYPE hk_Draw(ID3D11DeviceContext* self, UINT a, UINT b) {
+  if (skip_this_draw(self, a)) return;
   if (ACO_REC_WANT(self)) rec_draw(a, b);
   geo_count(a, false);
   char args[64] = "";
@@ -168,6 +180,7 @@ void STDMETHODCALLTYPE hk_Draw(ID3D11DeviceContext* self, UINT a, UINT b) {
   draw_common(self, "Draw", args, [&] { ORIG(decltype(hk_Draw), Context_Draw)(self, a, b); });
 }
 void STDMETHODCALLTYPE hk_DrawIndexed(ID3D11DeviceContext* self, UINT a, UINT b, INT c) {
+  if (skip_this_draw(self, a)) return;
   if (ACO_REC_WANT(self)) rec_draw_indexed(a, b, c);
   geo_count(a, false);
   char args[64] = "";
@@ -175,6 +188,7 @@ void STDMETHODCALLTYPE hk_DrawIndexed(ID3D11DeviceContext* self, UINT a, UINT b,
   draw_common(self, "DrawIndexed", args, [&] { ORIG(decltype(hk_DrawIndexed), Context_DrawIndexed)(self, a, b, c); });
 }
 void STDMETHODCALLTYPE hk_DrawInstanced(ID3D11DeviceContext* self, UINT a, UINT b, UINT c, UINT d) {
+  if (skip_this_draw(self, b)) return;
   if (ACO_REC_WANT(self)) rec_draw_instanced(a, b, c, d);
   geo_count(uint64_t(a) * b, false);
   char args[64] = "";
@@ -183,6 +197,7 @@ void STDMETHODCALLTYPE hk_DrawInstanced(ID3D11DeviceContext* self, UINT a, UINT 
               [&] { ORIG(decltype(hk_DrawInstanced), Context_DrawInstanced)(self, a, b, c, d); });
 }
 void STDMETHODCALLTYPE hk_DrawIndexedInstanced(ID3D11DeviceContext* self, UINT a, UINT b, UINT c, INT d, UINT e) {
+  if (skip_this_draw(self, b)) return;
   if (ACO_REC_WANT(self)) rec_draw_indexed_instanced(a, b, c, d, e);
   geo_count(uint64_t(a) * b, false);
   char args[80] = "";
@@ -287,6 +302,7 @@ void STDMETHODCALLTYPE hk_ClearUAVUint(ID3D11DeviceContext* self, ID3D11Unordere
 }
 HRESULT STDMETHODCALLTYPE hk_FinishCommandList(ID3D11DeviceContext* self, BOOL restore, ID3D11CommandList** out) {
   HRESULT hr = ORIG(decltype(hk_FinishCommandList), Context_FinishCommandList)(self, restore, out);
+  skipdraw_reset_ctx(self);
   if (!restore)
     if (CtxState* s = state_for(self)) {
       s->ps.store(ShaderClass::None, std::memory_order_relaxed);

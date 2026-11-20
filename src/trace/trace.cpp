@@ -64,6 +64,84 @@ void load_cb_watch() {
 
 bool capturing() { return g_capture_left.load(std::memory_order_relaxed) > 0; }
 
+// skipdraw experiment (see trace.h): spec guarded by its own mutex, polled every 30 frames.
+std::atomic<bool> g_skip_on{false};
+std::atomic<long> g_skip_lo{-1}, g_skip_hi{-1};   // range form (@lo-hi); lo < 0 = shader form
+std::atomic<long> g_skip_ctx{-1};                 // per-context form (@ctx:...); -1 = all contexts
+std::atomic<unsigned long long> g_skip_n{0};      // draws since Present (all-context range form)
+struct SkipCtx {
+  std::atomic<ID3D11DeviceContext*> ctx{nullptr};
+  std::atomic<unsigned long long> n{0};
+};
+SkipCtx g_skip_ctxs[64];  // first-seen order = the @ctx: ids
+std::mutex g_skip_mutex;
+
+int skip_ctx_id(ID3D11DeviceContext* ctx) {
+  for (int i = 0; i < 64; ++i) {
+    ID3D11DeviceContext* c = g_skip_ctxs[i].ctx.load(std::memory_order_acquire);
+    if (c == ctx) return i;
+    if (!c) break;
+  }
+  std::lock_guard lock(g_skip_mutex);
+  for (int i = 0; i < 64; ++i) {
+    ID3D11DeviceContext* c = g_skip_ctxs[i].ctx.load();
+    if (c == ctx) return i;
+    if (!c) {
+      g_skip_ctxs[i].ctx.store(ctx, std::memory_order_release);
+      return i;
+    }
+  }
+  return -1;
+}
+std::string g_skip_prefix;   // pixel-shader hash prefix (hex); empty = off
+long g_skip_count = -1;      // vertex/index/instance count to match, -1 = any
+std::string g_skip_raw;      // last file content seen (log on change only)
+
+void poll_skipdraw() {
+  std::string raw;
+  if (FILE* f = _wfopen((out_dir() + L"\\skipdraw.txt").c_str(), L"r")) {
+    char line[128] = "";
+    if (fgets(line, sizeof(line), f)) raw = line;
+    fclose(f);
+  }
+  while (!raw.empty() && (raw.back() == '\n' || raw.back() == '\r' || raw.back() == ' ')) raw.pop_back();
+  std::lock_guard lock(g_skip_mutex);
+  if (raw == g_skip_raw) return;
+  g_skip_raw = raw;
+  g_skip_prefix.clear();
+  g_skip_count = -1;
+  g_skip_lo.store(-1, std::memory_order_relaxed);
+  g_skip_hi.store(-1, std::memory_order_relaxed);
+  g_skip_ctx.store(-1, std::memory_order_relaxed);
+  if (!raw.empty() && raw[0] == '@') {
+    long a = -1, lo = -1, hi = -1;
+    if (sscanf(raw.c_str(), "@%ld:%ld-%ld", &a, &lo, &hi) == 3 && a >= 0 && lo >= 0 && hi > lo) {
+      g_skip_ctx.store(a, std::memory_order_relaxed);
+      g_skip_lo.store(lo, std::memory_order_relaxed);
+      g_skip_hi.store(hi, std::memory_order_relaxed);
+      g_skip_prefix = "@";  // marks active (never matches a hex hash)
+    } else if (sscanf(raw.c_str(), "@%ld:*", &a) == 1 && a >= 0) {
+      g_skip_ctx.store(a, std::memory_order_relaxed);
+      g_skip_lo.store(0, std::memory_order_relaxed);
+      g_skip_hi.store(1L << 40, std::memory_order_relaxed);
+      g_skip_prefix = "@";
+    } else if (sscanf(raw.c_str(), "@%ld-%ld", &lo, &hi) == 2 && lo >= 0 && hi > lo) {
+      g_skip_lo.store(lo, std::memory_order_relaxed);
+      g_skip_hi.store(hi, std::memory_order_relaxed);
+      g_skip_prefix = "@";
+    }
+  } else if (!raw.empty()) {
+    char pfx[64] = "";
+    long n = -1;
+    if (sscanf(raw.c_str(), "%63s %ld", pfx, &n) >= 1) {
+      g_skip_prefix = pfx;
+      g_skip_count = n;
+    }
+  }
+  g_skip_on.store(!g_skip_prefix.empty(), std::memory_order_relaxed);
+  ACO_LOG("skipdraw: %s", g_skip_prefix.empty() ? "off" : raw.c_str());
+}
+
 void appendf(std::string& s, const char* fmt, ...) __attribute__((format(gnu_printf, 2, 3)));
 void appendf(std::string& s, const char* fmt, ...) {
   char buf[1024];
@@ -311,6 +389,38 @@ void finish_capture() {
 } // namespace
 
 bool trace_capturing() { return capturing(); }
+
+bool skipdraw_active() { return g_skip_on.load(std::memory_order_relaxed); }
+
+void skipdraw_reset_ctx(ID3D11DeviceContext* ctx) {
+  int id = skip_ctx_id(ctx);
+  if (id >= 0) g_skip_ctxs[id].n.store(0, std::memory_order_relaxed);
+}
+
+bool skipdraw_range_hit(ID3D11DeviceContext* ctx) {
+  long lo = g_skip_lo.load(std::memory_order_relaxed);
+  if (lo < 0) return false;
+  long want = g_skip_ctx.load(std::memory_order_relaxed);
+  unsigned long long n;
+  if (want >= 0) {
+    int id = skip_ctx_id(ctx);
+    if (id < 0) return false;
+    n = g_skip_ctxs[id].n.fetch_add(1, std::memory_order_relaxed);
+    if (id != want) return false;
+  } else {
+    n = g_skip_n.fetch_add(1, std::memory_order_relaxed);
+  }
+  return n >= static_cast<unsigned long long>(lo) &&
+         n < static_cast<unsigned long long>(g_skip_hi.load(std::memory_order_relaxed));
+}
+
+bool skipdraw_match(unsigned long long ps_hash, unsigned count) {
+  std::lock_guard lock(g_skip_mutex);
+  if (g_skip_prefix.empty()) return false;
+  if (g_skip_count >= 0 && count != static_cast<unsigned>(g_skip_count)) return false;
+  std::string h = hex64(ps_hash);
+  return h.compare(0, g_skip_prefix.size(), g_skip_prefix) == 0;
+}
 void trace_set_immediate(ID3D11DeviceContext* ctx) { g_immediate = ctx; }
 
 void trace_draw(ID3D11DeviceContext* ctx, const char* op, const char* args) {
@@ -404,6 +514,8 @@ void trace_execute_command_list(ID3D11DeviceContext* ctx, ID3D11CommandList* cl)
 }
 
 void trace_on_present(IDXGISwapChain* sc) {
+  g_skip_n.store(0, std::memory_order_relaxed);
+  if (g_immediate) skipdraw_reset_ctx(g_immediate);  // deferred ctxs reset at FinishCommandList
   uint64_t frame = g_frame.fetch_add(1) + 1;
   if (g_preroll) {
     g_preroll = false;
@@ -428,6 +540,7 @@ void trace_on_present(IDXGISwapChain* sc) {
   }
   // Poll for the trigger file every 30 frames.
   if (frame % 30 == 0) {
+    poll_skipdraw();
     std::wstring trig = out_dir() + L"\\capture";
     if (GetFileAttributesW(trig.c_str()) != INVALID_FILE_ATTRIBUTES) {
       g_capture_frames = kCaptureFrames;

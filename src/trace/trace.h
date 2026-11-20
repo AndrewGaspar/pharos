@@ -11,6 +11,15 @@ namespace aco {
 // capture of the next frames into <out>\cap-<n>\events.jsonl (+ shaders\*.dxbc/.asm for every
 // referenced shader). <out>\cbwatch.txt lists shader-hash prefixes whose constant buffer contents
 // are dumped with each draw.
+// Experiment aid: while <out>\skipdraw.txt exists, matching draws are dropped in core/ctxhooks.
+// Forms: "<ps-hash-prefix> [count]" (pixel-shader hash prefix, optional vertex/index/instance
+// count), "@<lo>-<hi>" (per-frame draw index range, all contexts), or "@<ctx>:<lo>-<hi>" /
+// "@<ctx>:*" (per-context draw indices from Present; ctx ids are assigned in first-seen order).
+// For bisecting a frame to one draw. Re-read with the capture trigger poll; delete to stop.
+bool skipdraw_active();
+bool skipdraw_match(unsigned long long ps_hash, unsigned count);
+bool skipdraw_range_hit(ID3D11DeviceContext* ctx);  // once per draw: counts it, true = drop
+void skipdraw_reset_ctx(ID3D11DeviceContext* ctx);  // per-context counter restart (command list end)
 bool trace_capturing();
 void trace_set_immediate(ID3D11DeviceContext* ctx);
 void trace_draw(ID3D11DeviceContext* ctx, const char* op, const char* args);
