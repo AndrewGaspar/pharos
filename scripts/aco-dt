@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# DEPRECATED (2026-11-20): the podman harness (aco-t* containers) is retired; use tools/lab/dt. See docs/ENGINE_NOTES.md, Tools.
 # aco-dt <instance> [--story] [location] — drive a freshly launched game (aco game ...) into
 # Discovery Tour free roam; with a location (tools/teleport <inst> list), teleport there afterwards.
 # --story: continue the story instead (main menu > Play > first profile, which loads its latest

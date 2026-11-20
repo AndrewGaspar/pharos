@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# DEPRECATED (2026-11-20): the podman harness (aco-t* containers) is retired; use quiver lab teleport / tools/lab/teleport. See docs/ENGINE_NOTES.md, Tools.
 # teleport <instance> <location | x y z [cam_yaw [cam_pitch]]> [--hold S] [--settle S] [--shot FILE]
 #
 # Moves the player (Discovery Tour or story mode, in the world) to a named location from

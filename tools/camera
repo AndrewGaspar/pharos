@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# DEPRECATED (2026-11-20): the podman harness (aco-t* containers) is retired; use tools/lab/camera. See docs/ENGINE_NOTES.md, Tools.
 # camera <instance> <yaw_deg> [pitch_deg]: turn the game camera to a heading (yaw 0 = +X, 90 = +Y;
 # pitch < 0 looks down) by injecting relative mouse-look motion until tools/where reports it within
 # 0.5 deg. Closed loop, so mouse sensitivity/smoothing don't matter. Prints the final camera.

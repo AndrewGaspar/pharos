@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# tools/lab/teleport [--instance N] <location | x y z [yaw [pitch]]> [--settle S] [--shot FILE]
+# quiver lab teleport (the mod moves the player; named locations from the lab's locations.txt,
+# copied there from tools/locations.txt by tools/lab/setup), then turns the camera to the location's
+# heading (tools/lab/camera), lets the picture settle for S seconds of streaming (default 0: none),
+# and with --shot takes a screenshot.
+#   tools/lab/teleport giza-sphinx --settle 5 --shot build/giza.png
+#   tools/lab/teleport -749.7 3574.2 207.8 90 -5
+set -euo pipefail
+here=$(cd "$(dirname "$0")/../.." && pwd)
+name=${LAB_INSTANCE:-origins}
+[[ ${1:-} == --instance ]] && { name=$2; shift 2; }
+src=${QUIVER_SOURCE:-agent:pharos-lab}
+q() { quiver lab --source "$src" "$@"; }
+settle=0 shot="" args=()
+while (($#)); do
+  case $1 in
+    --settle) settle=$2; shift 2;;
+    --shot) shot=$2; shift 2;;
+    *) args+=("$1"); shift;;
+  esac
+done
+((${#args[@]})) || { echo "teleport: need a location (quiver lab teleport $name list) or x y z [yaw [pitch]]" >&2; exit 1; }
+res=$(q teleport "$name" "${args[@]}")
+echo "teleport: $res"
+read -r yaw pitch < <(python3 -I -c 'import json,sys; w=json.loads(sys.argv[1]).get("want") or {}; print(w.get("yaw",""), w.get("pitch",""))' "$res")
+if [[ -n $yaw ]]; then "$here/tools/lab/camera" --instance "$name" "$yaw" ${pitch:+"$pitch"}; fi
+if [[ -n $shot ]]; then
+  q shot "$name" "$shot" --settle "$settle"
+elif [[ $settle != 0 ]]; then
+  q wait "$name" frame --stable 3 --timeout "$settle" >/dev/null 2>&1 || true
+fi

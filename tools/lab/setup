@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# tools/lab/setup [instance] — configure a Quiver lab instance of AC Origins for Pharos (idempotent).
+#
+#   quiver lab create ubisoft:3539 --name origins --display 1280x720@60   # once (if it doesn't exist)
+#   tools/lab/setup origins
+#   quiver lab down origins; quiver lab up origins                        # display/clock changes need a reboot
+#
+# What it sets (quiver lab show origins prints the result):
+#   dll.d3d11=n,b                 Pharos is a d3d11.dll proxy in the game folder
+#   mod_dir=build/mod             every launch copies build/mod over the install (originals put back)
+#   file.pharos / file.aco        aliases for quiver lab set: pharos:[reflex]fps_limit=30, aco:[Graphics]...
+#   reload_pattern / log_file     quiver lab set --wait waits for pharos.log's "config:" line
+#                                 (lab:pharos.log is a hard link Pharos makes to the run's log)
+#   throttle                      what quiver lab gpu applies to this instance while another one measures
+#   graphics=lab                  profile applied at every launch (tools/lab/profiles/lab.set: Ultra High
+#                                 at the display size, Reflex cap 30 fps)
+# and copies tools/lab/profiles/*.set and tools/locations.txt (quiver lab teleport names) into the lab.
+set -euo pipefail
+name=${1:-origins}
+here=$(cd "$(dirname "$0")/../.." && pwd)
+src=${QUIVER_SOURCE:-agent:pharos-lab}
+root=${QUIVER_LAB_ROOT:-$HOME/Games/quiver-lab}
+q() { quiver lab --source "$src" "$@"; }
+
+q show "$name" >/dev/null || { echo "setup: no instance $name (quiver lab create ubisoft:3539 --name $name --display 1280x720@60)" >&2; exit 1; }
+mkdir -p "$root/profiles/3539" "$root/fixtures/3539"
+cp "$here"/tools/lab/profiles/*.set "$root/profiles/3539/"
+cp "$here/tools/locations.txt" "$root/fixtures/3539/locations.txt"
+q edit "$name" \
+  dll.d3d11=n,b \
+  "mod_dir=$here/build/mod" \
+  file.pharos=install:pharos.ini \
+  "file.aco=drive_c/users/steamuser/Documents/Assassin's Creed Origins/ACO.ini" \
+  'reload_pattern=config: enabled=' \
+  log_file=lab:pharos.log \
+  throttle= \
+  'throttle+=pharos:[reflex]fps_limit=5' \
+  graphics=lab
+q show "$name" | sed -n '/^\[/,$p' | sed '/^# state:/,$d'

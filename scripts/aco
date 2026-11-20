@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# DEPRECATED (2026-11-20): the podman harness (aco-t* containers) is retired; use quiver lab (tools/lab/setup configures the origins instance). See docs/ENGINE_NOTES.md, Tools.
 # aco — headless AC Origins instances in podman.
 #
 # Model: an instance is a reflink clone of a "gold" prefix. `aco up` boots a long-lived container

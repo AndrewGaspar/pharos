@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# tools/lab/launch [--instance N] [--mod DIR] [--clock C] [--dt [LOCATION]] [section.key=value ...]
+#
+# A fresh game launch in the Quiver lab with a Pharos build (default build/mod) and pharos.ini
+# overrides, then optionally into Discovery Tour (tools/lab/dt, and a teleport to LOCATION).
+# Replaces tools/fg-launch (scripts/aco game + aco-dt).
+#
+#   tools/lab/launch --dt                                  # build/mod, lab defaults, into Discovery Tour
+#   tools/lab/launch --dt giza-sphinx stereo.mode=sbs      # stereo from the first frame, then Giza
+#   tools/lab/launch fg.mode=off reflex.fps_limit=0        # overrides (keys must exist in pharos.ini)
+#
+# Overrides are written into a copy of the mod folder's pharos.ini, which quiver lab launch copies
+# over the install, so they hold from the game's first frame (keys read at swapchain creation too).
+# The instance's graphics profile (tools/lab/profiles/lab.set) is applied after the mod files and
+# sets pharos:[reflex]fps_limit=30; an override of a key the profile also sets is re-applied with
+# quiver lab set --wait once the game presents.
+#
+# Refuses to launch while the user plays AC Origins themselves (tools/npc-re/userplaying.sh).
+set -euo pipefail
+here=$(cd "$(dirname "$0")/../.." && pwd)
+name=${LAB_INSTANCE:-origins} mod=$here/build/mod clock="" dt=0 location="" overrides=()
+while (($#)); do
+  case $1 in
+    --instance) name=$2; shift 2;;
+    --mod) mod=$(realpath "$2"); shift 2;;
+    --clock) clock=$2; shift 2;;
+    --dt) dt=1; shift
+          if [[ ${1:-} && $1 != -* && $1 != *=* ]]; then location=$1; shift; fi;;
+    *=*) overrides+=("$1"); shift;;
+    *) echo "launch: unknown argument $1" >&2; exit 2;;
+  esac
+done
+src=${QUIVER_SOURCE:-agent:pharos-lab}
+q() { quiver lab --source "$src" "$@"; }
+
+if pid=$("$here/tools/npc-re/userplaying.sh"); then echo "launch: the user is playing ($pid); not launching" >&2; exit 3; fi
+
+tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+cp -a "$mod/." "$tmp/"
+late=()
+profile=$(q show "$name" | sed -n 's/^graphics = "\(.*\)"/\1/p')
+pfile=${QUIVER_LAB_ROOT:-$HOME/Games/quiver-lab}/profiles/3539/$profile.set
+for kv in "${overrides[@]}"; do
+  sec=${kv%%.*}; rest=${kv#*.}; key=${rest%%=*}; val=${rest#*=}
+  python3 -I - "$tmp/pharos.ini" "$sec" "$key" "$val" <<'PY'
+import sys
+p, sec, key, val = sys.argv[1:]
+lines = open(p).read().split("\n"); cur = None; done = False
+for i, l in enumerate(lines):
+    s = l.strip()
+    if s.startswith("["): cur = s[1:-1]
+    elif cur == sec and s.split("=")[0] == key: lines[i] = f"{key}={val}"; done = True
+if not done: sys.exit(f"no {sec}.{key} in {p}")
+open(p, "w").write("\n".join(lines))
+PY
+  if [[ -n $profile && -f $pfile ]] && grep -q "^pharos:\[$sec\]$key=" "$pfile"; then late+=("pharos:[$sec]$key=$val"); fi
+done
+
+q launch "$name" --mod "$tmp" ${clock:+--clock "$clock"} --wait frame | tail -2
+if ((${#late[@]})); then q set "$name" "${late[@]}" --wait; fi
+if ((dt)); then "$here/tools/lab/dt" --instance "$name" ${location:+"$location"}; fi

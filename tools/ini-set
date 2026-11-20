@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# DEPRECATED (2026-11-20): the podman harness (aco-t* containers) is retired; use quiver lab set origins 'pharos:[section]key=value' --wait. See docs/ENGINE_NOTES.md, Tools.
 # ini-set <instance> section.key=value ...
 # Edits the running instance's live pharos.ini (most settings are reloaded within ~1 s).
 set -euo pipefail

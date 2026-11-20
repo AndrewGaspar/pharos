@@ -183,7 +183,7 @@ cull an instance whose projected bounds don't straddle a pixel centre at that re
 objects below ~1 render pixel (2 display pixels at Performance). That is the only screen-size test
 and it only affects sub-pixel objects; it is not what hid the planters.
 
-## Player entity, camera and teleport (`src/world/teleport.cpp`, `tools/teleport`)
+## Player entity, camera and teleport (`src/world/teleport.cpp`, `quiver lab teleport`, `tools/lab/teleport`)
 
 World coordinates are metres, **Z up**; Alexandria is around (-700, 3570), Giza (900, 160), Memphis
 (1470, -1130), Siwa (-6400, -260), Cyrene (-5780, 3720). Heading convention used by the tools:
@@ -223,16 +223,18 @@ yaw 0 = +X, 90 = +Y.
   named location, which a teleport does), 5/6 Discovery Tour state (~40 KB, written on exit).
   There is no manual save on PC. Loading puts the player at the region's spawn anchor (Alexandria:
   -749.7 3574.2, the same point Discovery Tour starts at), not the exact saved position.
-  `scripts/aco fixture-save` / `scripts/aco fixture` archive and install all six;
-  `scripts/aco-dt <inst> --story [location]` continues the first profile (and teleports).
+  `quiver lab fixture save|install` archive and install them (the old harness's fixtures are still
+  in `~/Games/aco-dlss-instances/fixtures`); `tools/lab/dt --story [location]` continues the first
+  profile (and teleports).
 - **Arrival**: the player hangs at the target while collision streams in (about 1 s across the
   map), then falls the 1 m. Textures/LODs are complete within ~5 s at 768x480. NPCs keep spawning
   for longer (compare with the same place after the game's own fast travel).
 - **Render camera**: global pointers at RVA **0x49e86b8** and 0x49f39d8 (object vtable RVA
   0x36afd88): position at +0x130, unit forward vector at +0x140, then the view rotation; this is what
   `PassParams.viewToWorld` is built from. The camera controller's yaw/pitch were not found as plain
-  floats (no stored heading vector either), so `tools/camera` turns the camera with injected
-  relative mouse motion in a closed loop on this readout (~0.1 deg/px yaw, ~0.07 deg/px pitch,
+  floats (no stored heading vector either), so `tools/lab/camera` turns the camera with injected
+  relative mouse motion (XTEST from the host, `quiver lab mouse`; SendInput from inside the game
+  doesn't reach its raw-input mouse-look under Wine, tested live in the lab) in a closed loop on this readout (~0.1 deg/px yaw, ~0.07 deg/px pitch,
   with smoothing; converges to 0.5 deg in 2-4 iterations).
 - Game-side alternatives seen in the strings (not used): `FastTravelManager`, `FastTravelCommand`,
   `TeleportEvent`, `ActionPlayerTeleportAndRespawn`, `DiscoveryModeTeleportToTourEvent`.
@@ -879,6 +881,62 @@ the walker (229-353 spawned, cap 600), no hang.
   +0x60, four 1.0 multipliers) has no live instances in Discovery Tour (Siwa, Alexandria).
 
 ### Tools
+
+**Test harness: the Quiver lab** (`quiver lab`, design/LAB.md in the Quiver repo; replaces the
+podman containers of `scripts/aco`, now deprecated). The instance is `origins`, configured for
+Pharos by `tools/lab/setup` (d3d11=n,b, build/mod as the mod, `pharos`/`aco` file aliases, the
+reload pattern, the `lab` graphics profile, locations). Pharos serves the lab channel
+(`src/core/lab.cpp`, inert outside the lab): its log and debug outputs (captures, framedumps,
+memtool, `where`/`teleport` trigger files) go to the run folder (`QUIVER_LAB_RUN_DIR`, or
+`ACO_DLSS_OUT` if set; `%QUIVER_LAB%\pharos.log` is a hard link to the current run's log), it
+reports the state `menu` / `in-world`, and answers the verbs `where`, `teleport`, `cfg`, `ping`.
+
+```sh
+tools/npc-re/userplaying.sh && echo "the user is playing: launch nothing"   # before every launch
+scripts/package
+tools/lab/launch --dt giza-sphinx [section.key=value ...]   # build/mod + overrides, into Discovery Tour, teleport
+quiver lab wait origins in-world                    # Pharos's state (menu | in-world)
+quiver lab where origins                            # {"player":[x,y,z],"yaw":..,"camera":{"pos":..,"yaw":..,"pitch":..}}
+quiver lab teleport origins memphis-temple          # the player only (named: quiver lab teleport origins list)
+tools/lab/teleport memphis-temple --settle 5 --shot m.png   # ... plus the location's camera heading
+tools/lab/camera 90 -8                              # camera heading (closed loop over quiver lab mouse)
+quiver lab set origins 'pharos:[reflex]fps_limit=60' --wait   # live ini edit, waits for the reload line
+quiver lab call origins cfg stereo.separation [value]          # read / set one key, waits for the reload
+quiver lab shot origins out.png --settle 2          # screenshot (full display resolution)
+quiver lab logs origins                             # the run folder: pharos.log, game.log, DXVK, bridge
+quiver lab gpu --for origins -- CMD ...            # exclusive GPU (other instances throttled via their throttle lines)
+quiver lab kill origins && quiver lab down origins
+```
+
+- **Defaults:** 1280x720@60, Ultra High, DLSS Balanced (PixelDensity 0.58, in the cloned
+  ACO.ini), and a 30 fps cap from Pharos (`[reflex] fps_limit=30`, set by the profile
+  `tools/lab/profiles/lab.set`). Measured in the lab (r3): the game's own `MaxFPS` doesn't hold
+  (set to 30 in ACO.ini before launch, the game wrote 0 back at startup and ran 85 fps with Frame
+  Generation off); `fps_limit=30` held at 30.0 fps. With the shipped `[fg] mode=d3d12`, Frame
+  Generation paces presents to the display (60 Hz), so the game runs 30 real + 30 generated.
+- **Measurements at 1920x1080, uncapped** (stereo cost, performance): `quiver lab edit origins
+  display=1920x1080@60 graphics=measure`, `quiver lab down origins && quiver lab up origins`, measure
+  under `quiver lab gpu --for origins -- ...`; back with `display=1280x720@60 graphics=lab`.
+- **Menus:** `tools/lab/dt` recognises the title and main menu with `tools/lab/screen` (the
+  2560x1600 crops in `tools/ref/` scaled by H/1600 and searched near their place, so any 16:9 or
+  16:10 size works, and the left eye of hsbs stereo too), clicks Discovery Tour, then waits on
+  Pharos's `in-world` state. ~80 s from launch to in the world at 1280x720.
+- **Virtual clock** (`clock=virtual:62.5`): not usable with Pharos yet. Denuvo didn't object: the
+  game booted, reached Discovery Tour (Alexandria) at 3.2-8x real time with no real-time escapes,
+  but the clock DLL re-hooks the DXGI factory's CreateSwapChain slot after Pharos's d3d11 proxy has
+  hooked it (it patches the game's `D3D11CreateDevice` import and hooks the device's factory
+  again on return), replacing Pharos's hook and calling DXVK directly, so Pharos never sees the
+  swapchain or Present (no DLSS, no lab state). Quiver issue; until it's fixed keep `clock=real`.
+- **Not ported yet:** the experiment scripts that drive `scripts/aco` or read
+  `~/Games/aco-dlss-instances/<inst>/out` (`tools/bench`, `abtest`, `latency*`, `fg-*`, `cloth-*`,
+  `npc-re/*.sh`, `lod-re/*.sh`) still use the old harness's paths: port each to `quiver lab` (run
+  folder from `quiver lab logs`, `set --wait`, `shot`, `gpu`) when it's next needed. The replaced
+  tools (`scripts/aco`, `aco-dt`, `fg-launch`, `ini-set`, `teleport`, `camera`, `where`,
+  `gpu-exclusive`) are marked deprecated in their headers.
+- `tools/lab/setup` re-applies the instance configuration (and copies `tools/lab/profiles/*.set`
+  and `tools/locations.txt` into the lab); `quiver lab show origins` prints it.
+
+**Analysis and RE tools:**
 
 - `tools/npc-re/live.py` (host-side reads of the game's memory, `ACO_INST=t1|t3`), `hist.py`
   (heap objects per class, from `vtnames.json` built by `vtnames.py` from the TypeInfo records),

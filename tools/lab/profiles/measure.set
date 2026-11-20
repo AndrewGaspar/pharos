@@ -1,0 +1,33 @@
+# Pharos measurements (ac-dlss tools/lab/profiles/measure.set): Ultra High at the instance's display size, uncapped.
+# Use with display=1920x1080@60 (quiver lab edit origins display=1920x1080@60 graphics=measure; down/up).
+aco:[Graphics]WindowMode=3
+aco:[Graphics]FullscreenWidth={width}
+aco:[Graphics]FullscreenHeight={height}
+aco:[Graphics]VSyncMode=0
+aco:[Graphics]MaxFPS=0
+aco:[Graphics]AdaptiveQuality=0
+aco:[Graphics]Antialiasing=3
+aco:[Graphics]Bloom=1
+aco:[Graphics]Character=5
+aco:[Graphics]CharacterTexture=3
+aco:[Graphics]Cloud=1
+aco:[Graphics]Clutter=4
+aco:[Graphics]CrowdDensity=0
+aco:[Graphics]Culling=0
+aco:[Graphics]DOF=1
+aco:[Graphics]Environment=5
+aco:[Graphics]Fog=2
+aco:[Graphics]Lighting=0
+aco:[Graphics]Particle=0
+aco:[Graphics]PostEffect=0
+aco:[Graphics]Reflection=2
+aco:[Graphics]Shadow=5
+aco:[Graphics]SSAO=2
+aco:[Graphics]Terrain=1
+aco:[Graphics]Tessellation=3
+aco:[Graphics]Texture=3
+aco:[Graphics]TextureFiltering=2
+aco:[Graphics]Water=3
+aco:[Graphics]Wind=0
+aco:[Graphics]RefreshRate={refresh}
+pharos:[reflex]fps_limit=0

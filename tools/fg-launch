@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# DEPRECATED (2026-11-20): the podman harness (aco-t* containers) is retired; use tools/lab/launch. See docs/ENGINE_NOTES.md, Tools.
 # fg-launch <instance> [section.key=value ...]
 # Frame Generation dev loop: fresh game launch with build/mod plus ini overrides, waits until the
 # mod's Frame Generation is running (new log only), then drives the menus into Discovery Tour.

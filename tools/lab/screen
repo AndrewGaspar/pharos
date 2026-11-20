@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# tools/lab/screen <shot.png> — which AC Origins screen a screenshot shows, at any resolution.
+# Prints "<state> <score> <cx> <cy>" (state title | menu | unknown; cx, cy: the match's centre as
+# fractions of the frame, for quiver lab click).
+#
+# The reference crops (tools/ref/*.png) were cut from a 2560x1600 display. The game's UI scales with
+# the frame height, so each reference is scaled by H/1600 and searched (ImageMagick subimage search,
+# RMSE) in a band around where it should be: the title's "Press any key" is centred horizontally,
+# the main menu's "Discovery Tour" item is on the left. A match below 0.1 RMSE counts (a dark frame
+# scores ~0.18).
+# Half side-by-side stereo ([stereo] mode=sbs, output=hsbs) squeezes each eye into half the width:
+# if the whole frame matches nothing, the left eye stretched back to full width is tried (the game's
+# input is still in full-frame coordinates, which that matches, so the centre stays clickable).
+set -euo pipefail
+shot=${1:?shot.png}
+ref=$(cd "$(dirname "$0")/.." && pwd)/ref
+tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+read -r W H < <(magick identify -format '%w %h\n' "$shot")
+best_state=unknown best=1 bx=0 by=0
+for view in full left-eye; do
+if [[ $view == full ]]; then
+  magick "$shot" -colorspace gray "$tmp/g.png"
+else
+  magick "$shot" -crop "$((W / 2))x${H}+0+0" +repage -resize "${W}x${H}!" -colorspace gray "$tmp/g.png"
+fi
+
+# name | ref file | ref geometry at 2560x1600 (w h x y) | anchor (center: x relative to the centre)
+for row in "title|title.png|400 60 1080 1412|center" "menu|menu.png|600 110 205 537|left"; do
+  IFS='|' read -r st file geo anchor <<< "$row"
+  read -r rw rh rx ry <<< "$geo"
+  # Scaled reference and the search band (the expected place, padded).
+  read -r sw sh x y pw ph < <(awk -v W="$W" -v H="$H" -v rw="$rw" -v rh="$rh" -v rx="$rx" -v ry="$ry" -v a="$anchor" 'BEGIN {
+    s = H / 1600; sw = int(rw * s + 0.5); sh = int(rh * s + 0.5)
+    x = (a == "center") ? W / 2 + (rx - 1280) * s : rx * s
+    pad = int(40 * s + 0.5)
+    if (a == "left") { padx = int(W * 0.06) } else { padx = pad }
+    x0 = int(x - padx); y0 = int(ry * s - pad); if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0
+    print sw, sh, x0, y0, sw + 2 * padx, sh + 2 * pad }')
+  magick "$ref/$file" -resize "${sw}x${sh}!" "$tmp/r.png"
+  magick "$tmp/g.png" -crop "${pw}x${ph}+${x}+${y}" +repage "$tmp/c.png"
+  out=$(magick compare -metric RMSE -subimage-search "$tmp/c.png" "$tmp/r.png" null: 2>&1 | head -1 || true)
+  score=$(sed -n 's/.*(\([0-9.e-]*\)).*/\1/p' <<< "$out")
+  mx=$(sed -n 's/.*@ \([0-9]*\),\([0-9]*\).*/\1/p' <<< "$out"); my=$(sed -n 's/.*@ \([0-9]*\),\([0-9]*\).*/\2/p' <<< "$out")
+  [[ -n $score && -n $mx ]] || continue
+  if awk -v s="$score" -v b="$best" 'BEGIN { exit !(s < b) }'; then
+    best=$score best_state=$st
+    bx=$(awk -v x="$x" -v m="$mx" -v w="$sw" -v W="$W" 'BEGIN { printf "%.4f", (x + m + w / 2) / W }')
+    by=$(awk -v y="$y" -v m="$my" -v h="$sh" -v H="$H" 'BEGIN { printf "%.4f", (y + m + h / 2) / H }')
+  fi
+done
+awk -v b="$best" 'BEGIN { exit !(b < 0.1) }' && break
+done
+awk -v b="$best" 'BEGIN { exit !(b < 0.1) }' || best_state=unknown
+echo "$best_state $best $bx $by"

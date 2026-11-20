@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# tools/lab/dt [--instance N] [--story] [location] — drive a freshly launched game (quiver lab launch, or
+# tools/lab/launch) from the title through the main menu into Discovery Tour free roam, and wait
+# until the player is in the world (Pharos's lab state "in-world"). With a location (quiver lab
+# teleport <i> list), teleport there afterwards.
+# --story: continue the story instead (main menu > Play > first profile, which loads its latest
+# save; e.g. a fixture installed with `quiver lab fixture install`).
+#
+# Screens are recognised by tools/lab/screen (reference crops scaled to the display, any size), and
+# input is only sent when a screen is positively recognised, so Return is never pressed on an
+# unknown screen (which could e.g. load a story save). Once the game is loading the world, the
+# mod's state is the signal (quiver lab wait <i> in-world), not the screen.
+set -euo pipefail
+name=${LAB_INSTANCE:-origins} story=0 location=
+while (($#)); do
+  case $1 in
+    --instance) name=$2; shift 2;;
+    --story) story=1; shift;;
+    -*) echo "dt: unknown option $1" >&2; exit 2;;
+    *) location=$1; shift;;
+  esac
+done
+here=$(cd "$(dirname "$0")/../.." && pwd)
+src=${QUIVER_SOURCE:-agent:pharos-lab}
+q() { quiver lab --source "$src" "$@"; }
+tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+
+mod_state() { q status "$name" --json 2>/dev/null | python3 -I -c 'import json,sys; r=json.load(sys.stdin)["state"].get("run") or {}; print((r.get("mod_state") or {}).get("state",""))' 2>/dev/null || true; }
+
+t0=$SECONDS
+deadline=$((SECONDS + 300))
+selected=0
+while ((SECONDS < deadline)); do
+  [[ $(mod_state) == in-world ]] && break
+  if ((selected)); then
+    q wait "$name" in-world --timeout 240 >/dev/null && break
+    echo "dt: not in the world 240 s after selecting it" >&2; exit 1
+  fi
+  q shot "$name" "$tmp/s.png" --settle 0 >/dev/null
+  read -r st score cx cy < <("$here/tools/lab/screen" "$tmp/s.png")
+  case $st in
+    title) echo "dt: title ($score) -> Return"; q key "$name" Return >/dev/null;;
+    menu)
+      if ((story)); then
+        # Play and the first profile, placed relative to the Discovery Tour item (2560x1600 layout:
+        # Discovery Tour centre (505, 592), Play (507, 263), first profile (533, 400)).
+        read -r W H < <(magick identify -format '%w %h\n' "$tmp/s.png")
+        s=$(awk -v h="$H" 'BEGIN { print h / 1600 }')
+        px=$(awk -v c="$cx" -v s="$s" -v W="$W" 'BEGIN { printf "%.4f", c + 2 * s / W }')
+        py=$(awk -v c="$cy" -v s="$s" -v H="$H" 'BEGIN { printf "%.4f", c - 329 * s / H }')
+        echo "dt: main menu ($score) -> Play -> first profile (continue story)"
+        q click "$name" "$px" "$py" --expect-change >/dev/null
+        q wait "$name" frame --stable --timeout 30 >/dev/null || true
+        fx=$(awk -v c="$cx" -v s="$s" -v W="$W" 'BEGIN { printf "%.4f", c + 28 * s / W }')
+        fy=$(awk -v c="$cy" -v s="$s" -v H="$H" 'BEGIN { printf "%.4f", c - 192 * s / H }')
+        q click "$name" "$fx" "$fy" --expect-change >/dev/null
+      else
+        echo "dt: main menu ($score) -> Discovery Tour"
+        q click "$name" "$cx" "$cy" --expect-change >/dev/null
+      fi
+      selected=1;;
+    *) ;;
+  esac
+  # Poll the next screen once the game has shown a stable frame (menus animate in).
+  q wait "$name" frame --stable --timeout 20 >/dev/null 2>&1 || true
+done
+[[ $(mod_state) == in-world ]] || { cp "$tmp/s.png" "$here/build/dt-timeout.png" 2>/dev/null || true; echo "dt: timed out (last frame: build/dt-timeout.png)" >&2; exit 1; }
+# Let streaming settle: the frame stops changing much (NPCs keep moving, hence the loose bound).
+q wait "$name" in-world --stable 4 --timeout 60 >/dev/null 2>&1 || true
+echo "dt: in $( ((story)) && echo story mode || echo Discovery Tour) ($((SECONDS - t0)) s)"
+if [[ -n $location ]]; then "$here/tools/lab/teleport" --instance "$name" "$location"; fi

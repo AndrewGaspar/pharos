@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# DEPRECATED (2026-11-20): the podman harness (aco-t* containers) is retired; use quiver lab gpu --for origins -- CMD. See docs/ENGINE_NOTES.md, Tools.
 # gpu-exclusive <instance> <command...>
 # Runs a measurement with the GPU (nearly) to itself: takes a lock (so measurements from parallel
 # workstreams queue up instead of overlapping), throttles every other running instance's game to

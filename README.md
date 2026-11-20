@@ -112,28 +112,21 @@ Set the render resolution with the game's *Resolution Scale* option (or `render_
 
 ## Development workflow (headless, Linux)
 
-`scripts/aco` runs the game in podman containers (gamescope headless, NVIDIA via CDI) on
-copy-on-write clones of the Ubisoft Connect prefix:
+Tests run in a Quiver lab instance (`quiver lab`, a disposable headless clone of the installed game
+in podman with gamescope and the GPU, licensed through quiverd; see `CLAUDE.md` and
+docs/ENGINE_NOTES.md, Tools):
 
 ```sh
-scripts/aco gold                 # snapshot the Lutris Connect prefix (credentials stripped)
-scripts/aco create t1            # reflink clone (free on btrfs)
-scripts/aco up t1                # boot Connect; logs in itself (see CREDS_FILE in the script)
-scripts/package && scripts/aco game t1 --mod build/mod
-scripts/aco-dt t1                # drive menus into Discovery Tour
-scripts/aco-dt t1 giza-sphinx    # ... and teleport to a named place (tools/teleport t1 list)
-tools/teleport t1 memphis-temple --settle 5 --shot m.png   # move the player (DT or story)
-tools/where t1                   # player x y z yaw + camera position/yaw/pitch
-tools/camera t1 90 -8            # turn the camera to a fixed heading (closed loop, mouse-look)
-scripts/aco shot t1 out.png      # screenshot; scripts/aco keys t1 <xdotool args> for input
-touch ~/Games/aco-dlss-instances/t1/out/capture   # frame capture -> out/cap-NNN/
-tools/passes.py <cap-dir>        # pass-level view of a capture; tools/capsum.py for per-draw
-tools/bench t1 "label" 0.5 enabled=1 backend=dlss
-tools/abtest t1 <crop> "a=key:val" "b=key:val"     # live A/B of pharos.ini settings
+tools/lab/setup origins            # once: configure the instance for Pharos (d3d11=n,b, build/mod, aliases)
+scripts/package
+tools/lab/launch --dt giza-sphinx  # launch with build/mod, into Discovery Tour, teleport to Giza
+quiver lab where origins           # player and camera
+quiver lab set origins 'pharos:[reflex]fps_limit=60' --wait   # live pharos.ini edit
+quiver lab shot origins out.png --settle 2
+quiver lab logs origins            # the run folder: pharos.log, captures, DXVK and game logs
 ```
 
-Ubisoft login tokens are single-use with reuse detection (reusing one logs out every holder), so
-instances never share tokens: each logs in with the stored password once and keeps its own chain.
+The old podman harness (`scripts/aco`, `aco-t*` containers) is deprecated.
 
 ## Roadmap
 

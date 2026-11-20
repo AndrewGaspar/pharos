@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# DEPRECATED (2026-11-20): the podman harness (aco-t* containers) is retired; use quiver lab where origins. See docs/ENGINE_NOTES.md, Tools.
 # where <instance>: print the player's position and heading ("x y z yaw_deg"; Z up, yaw 0 = +X,
 # 90 = +Y). Needs the mod running in the game (src/world/teleport.cpp answers <out>/where).
 set -euo pipefail
