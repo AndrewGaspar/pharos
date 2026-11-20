@@ -206,6 +206,7 @@ void STDMETHODCALLTYPE hk_DrawIndexedInstanced(ID3D11DeviceContext* self, UINT a
               [&] { ORIG(decltype(hk_DrawIndexedInstanced), Context_DrawIndexedInstanced)(self, a, b, c, d, e); });
 }
 void STDMETHODCALLTYPE hk_DrawIndexedInstancedIndirect(ID3D11DeviceContext* self, ID3D11Buffer* buf, UINT off) {
+  if (skip_this_draw(self, off)) return;
   if (ACO_REC_WANT(self)) rec_draw_indexed_instanced_indirect(buf, off);
   geo_count(0, true);
   char args[64] = "";
@@ -215,6 +216,7 @@ void STDMETHODCALLTYPE hk_DrawIndexedInstancedIndirect(ID3D11DeviceContext* self
   });
 }
 void STDMETHODCALLTYPE hk_DrawInstancedIndirect(ID3D11DeviceContext* self, ID3D11Buffer* buf, UINT off) {
+  if (skip_this_draw(self, off)) return;
   if (ACO_REC_WANT(self)) rec_draw_instanced_indirect(buf, off);
   char args[64] = "";
   if (trace_capturing()) snprintf(args, sizeof(args), "\"%p\",%u", static_cast<void*>(buf), off);

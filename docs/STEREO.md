@@ -255,6 +255,15 @@ about half of the 2560x1600 numbers per eye, so 1080p60 at DLSS Performance hold
   culling constants aren't redirected, so objects at the right edge of the right eye could be culled
   early. Not seen yet.
 - **The HUD and menus sit at screen depth in both eyes.** That's the same as torchbearer.
+- **Map cursor depth (in progress, measured live in the lab, runs r9-r15):** the map's white
+  arrow is drawn into the backbuffer (present in framedump PPMs, not a compositor cursor) and
+  follows relative mouse motion 1:1 px. It is drawn by one DrawIndexedInstancedIndirect in the
+  late UI pass into the display-resolution target the UICompositing pass samples as t86:
+  vertex shader `12b61097a3a0b0e7`, pixel shader `068233d2886bf2c8`, indirect-args offset 340
+  in that frame's batch (found by dropping draws with the skipdraw experiment tool, then
+  narrowing by shader, then by offset; dropping it removes only the arrow). Still open: a
+  discriminator stabler than the batch offset, where its position lives (per-draw constants
+  vs instance data), hiding it, and drawing a per-eye substitute at the scene depth under it.
 - **Quiver's HUD isn't told the layout.** Pharos doesn't use the Quiver SDK
   (`quiver_set_stereo_layout`).
 - **Learning hitch:** ~300 ms, once per scene change.
