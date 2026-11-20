@@ -4,6 +4,7 @@
 # mod's Frame Generation is running (new log only), then drives the menus into Discovery Tour.
 # ACO_PROFILE=<tools/profiles name> picks the graphics profile (default ultra-high).
 # ACO_MOD=<dir> launches another build instead of build/mod.
+# ACO_FPS=<n> caps the game's frame rate (its MaxFPS, via aco game --fps).
 set -euo pipefail
 name=$1; shift
 here=$(cd "$(dirname "$0")/.." && pwd)
@@ -25,6 +26,6 @@ PY
 done
 "$here/scripts/aco" kill-game "$name" >/dev/null 2>&1 || true
 rm -f "$I/out/pharos.log" "$I"/out/nvngx*.log
-"$here/scripts/aco" game "$name" --mod "$mod" --profile "${ACO_PROFILE:-ultra-high}" >/dev/null
+"$here/scripts/aco" game "$name" --mod "$mod" --profile "${ACO_PROFILE:-ultra-high}" ${ACO_FPS:+--fps "$ACO_FPS"} >/dev/null
 rm -rf "$mod"
 "$here/scripts/aco-dt" "$name"
