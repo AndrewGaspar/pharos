@@ -71,6 +71,15 @@ title = "Cloth"
 options = ["cloth.mode", "cloth.scale"]
 
 [[page]]
+id = "stereo"
+title = "Stereo 3D"
+options = ["stereo.mode", "stereo.output", "stereo.separation", "stereo.convergence", "stereo.swap"]
+
+[[page.group]]
+title = "Debugging"
+options = ["stereo.show", "stereo.diff_gain", "stereo.skip"]
+
+[[page]]
 id = "diagnostics"
 title = "Diagnostics"
 options = ["upscaler.latency_log", "reflex.probe", "fg.ngx_log", "fg.trace_cu", "fg.verify",
@@ -1167,3 +1176,95 @@ reason = "Frame Generation presents two frames per game frame; DXVK's limiter wo
 mech = "layer:limiter"
 when = { "fg.mode" = "d3d12" }
 reason = "Frame Generation presents two frames per game frame; a present-time cap would cap generated frames."
+
+# ---------------------------------------------------------------- [stereo]
+
+[option."stereo.mode"]
+type = "enum"
+label = "Stereo 3D"
+help = "Both eyes drawn from the same game frame and shown side by side (experimental). The frame is drawn twice, so expect a bit over half the frame rate; Frame Generation stays off for the session."
+values = [
+  { value = "off", label = "Off" },
+  { value = "auto", label = "On stereo displays", help = "When the game's display is a HypXRland side-by-side stereo output (XREAL glasses in 3D mode)." },
+  { value = "sbs", label = "Always" },
+]
+level = "basic"
+apply = "live"
+
+[option."stereo.output"]
+type = "enum"
+label = "Packing"
+help = "How the two eyes reach the display."
+values = [
+  { value = "auto", label = "Automatic", help = "Half side by side." },
+  { value = "hsbs", label = "Half side by side", help = "Each eye squeezed into half the window; HypXRland stretches it back." },
+  { value = "sbs", label = "Full side by side", help = "A swapchain twice the window's width, each eye at full resolution. Needs a Proton whose DXVK makes a Vulkan swapchain larger than the window; with stock DXVK it is scaled down like half side by side." },
+]
+level = "basic"
+apply = "at"
+at = "swapchain creation (game start)"
+
+[option."stereo.separation"]
+type = "float"
+label = "Eye separation"
+help = "Each eye's offset from the centre (32.5 mm = 65 mm between the eyes). Larger makes depth stronger."
+min = 0.0
+max = 100.0
+step = 0.5
+precision = 1
+unit = "mm"
+marks = [{ value = 32.5, label = "Typical" }]
+level = "basic"
+apply = "live"
+
+[option."stereo.convergence"]
+type = "float"
+label = "Screen distance"
+help = "What sits this far away appears at screen depth; closer comes out of the screen. 0 = parallel eyes."
+min = 0.0
+max = 50.0
+step = 0.25
+precision = 2
+unit = "m"
+level = "basic"
+apply = "live"
+
+[option."stereo.swap"]
+type = "bool"
+label = "Swap eyes"
+help = "Left eye on the right (cross-eyed viewing)."
+level = "advanced"
+apply = "live"
+
+[option."stereo.show"]
+type = "enum"
+label = "View"
+help = "Debug views of half side by side."
+values = [
+  { value = "sbs", label = "Both eyes" },
+  { value = "left", label = "Left eye" },
+  { value = "right", label = "Right eye" },
+  { value = "diff", label = "Difference" },
+]
+level = "debug"
+apply = "live"
+
+[option."stereo.diff_gain"]
+type = "float"
+label = "Difference gain"
+help = "Amplification of the Difference view."
+min = 1.0
+max = 128.0
+step = 1.0
+precision = 0
+unit = "×"
+when = { "stereo.show" = "diff" }
+level = "debug"
+apply = "live"
+
+[option."stereo.skip"]
+type = "string"
+label = "Replay skip"
+help = "Kinds of recorded calls left out of the right eye's pass (draw, dispatch, copy, clear, upload, execute), for bisecting."
+level = "debug"
+apply = "live"

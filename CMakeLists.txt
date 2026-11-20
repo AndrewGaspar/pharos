@@ -40,6 +40,7 @@ add_library(aco_d3d11 SHARED
   src/stereo/stereo.cpp
   src/stereo/camera.cpp
   src/stereo/temporal.cpp
+  src/core/hyprland.cpp
   src/dlss/ngx.cpp
   src/dlss/kernels.cpp
   src/dlss/upscaler.cpp
@@ -52,4 +53,4 @@ target_include_directories(aco_d3d11 PRIVATE src ${DLSS_SDK}/include ${VULKAN_HE
 target_compile_definitions(aco_d3d11 PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE __USE_MINGW_ANSI_STDIO=1)
 target_compile_options(aco_d3d11 PRIVATE -Wall -Wno-unknown-pragmas -fno-strict-aliasing)
 target_link_options(aco_d3d11 PRIVATE -static -static-libgcc -static-libstdc++ -Wl,--enable-stdcall-fixup)
-target_link_libraries(aco_d3d11 PRIVATE dxguid uuid ole32 shell32 advapi32)
+target_link_libraries(aco_d3d11 PRIVATE dxguid uuid ole32 shell32 advapi32 ws2_32)

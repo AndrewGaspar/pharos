@@ -104,7 +104,8 @@ struct Config {
   float world_lod_distance = 1.0f;        // [world] lod_distance
   std::string world_lod_mode = "far";      // [world] lod_mode: far (patched culling shaders, LOD range max only) | all (old: scale every range)
   std::string world_lod_skip;             // [world] lod_skip (diagnostics): culling shader hash prefixes left unpatched
-  std::string stereo_mode = "off";      // [stereo] mode: off | sbs (both eyes from one game frame, side by side)
+  std::string stereo_mode = "off";      // [stereo] mode: off | sbs (both eyes, side by side) | auto (sbs on a HypXRland stereo display)
+  std::string stereo_output = "auto";   // [stereo] output (at swapchain creation): auto | hsbs (eyes squeezed into the window) | sbs (2x wide swapchain, each eye 1:1)
   float stereo_separation = 32.5f;      // [stereo] separation: eye offset from the centre, mm (each eye)
   float stereo_convergence = 4.0f;      // [stereo] convergence: distance of zero disparity, m (0 = parallel)
   std::string stereo_show = "sbs";      // [stereo] show: sbs | left | right | diff (debug views)

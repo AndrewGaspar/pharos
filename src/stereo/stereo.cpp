@@ -6,8 +6,11 @@
 
 #include <atomic>
 #include <cstring>
+#include <string>
 
 #include "core/config.h"
+#include "core/hyprland.h"
+#include "fg/fg_d3d12.h"
 #include "core/log.h"
 #include "dlss/kernels.h"
 #include "stereo/camera.h"
@@ -99,6 +102,14 @@ struct State {
   ID3D11Buffer* stats_read[4] = {};
   uint64_t stats_frame[4] = {};
   int stats_slot = 0;
+
+  // Full side by side (output = sbs): the swapchain is twice the game's width; the game draws one
+  // eye into `proxy` (what GetBuffer returns), and each eye is copied 1:1 into its half.
+  IDXGISwapChain* wide_sc = nullptr;
+  UINT game_w = 0, game_h = 0;
+  ID3D11Texture2D* proxy = nullptr;
+  std::string tag;  // Hyprland window tag applied
+  PFN_GetBuffer real_get_buffer = nullptr;
 
   bool active = false;
   uint64_t frames = 0, replays = 0;
@@ -269,11 +280,93 @@ void stereo_init(ID3D11Device* dev, ID3D11DeviceContext* imm) {
 }
 
 bool stereo_active() { return S.active; }
+bool stereo_wide(IDXGISwapChain* sc) { return sc && sc == S.wide_sc; }
 int stereo_eye() { return g_eye.load(std::memory_order_relaxed); }
 
-void stereo_on_present(IDXGISwapChain* sc) {
+// ---- swapchain layout --------------------------------------------------------------------------
+
+UINT stereo_swapchain_scale() {
   const Config& cfg = config();
-  bool want = cfg.stereo_mode == "sbs" && S.dev && S.imm1 && !S.failed;
+  if (cfg.stereo_mode == "off") return 1;
+  // auto = hsbs under DXVK: a 2x swapchain needs Wine to allow a Vulkan swapchain larger than the
+  // window AND the D3D layer to create it at the buffer size; DXVK follows the surface's
+  // currentExtent (the window) and would scale the 2x buffer down to the window (a filtered half
+  // side by side). See docs/STEREO.md.
+  return cfg.stereo_output == "sbs" ? 2 : 1;
+}
+
+void stereo_swapchain_created(IDXGISwapChain* sc, UINT game_w, UINT game_h) {
+  release(S.proxy);
+  S.wide_sc = sc;
+  S.game_w = game_w;
+  S.game_h = game_h;
+  ACO_LOG("stereo: full side-by-side swapchain %ux%u (game sees %ux%u)", game_w * 2, game_h, game_w, game_h);
+}
+
+void stereo_swapchain_resized(IDXGISwapChain* sc, UINT game_w, UINT game_h) {
+  if (sc != S.wide_sc) return;
+  release(S.proxy);
+  S.game_w = game_w;
+  S.game_h = game_h;
+  ACO_LOG("stereo: swapchain resized, game sees %ux%u", game_w, game_h);
+}
+
+void stereo_adjust_desc(IDXGISwapChain* sc, UINT* width) {
+  if (sc == S.wide_sc && width && *width) *width /= 2;
+}
+
+bool stereo_get_buffer(IDXGISwapChain* sc, UINT index, REFIID riid, void** out, PFN_GetBuffer real) {
+  if (sc != S.wide_sc || index != 0) return false;
+  if (!S.proxy) {
+    ID3D11Texture2D* bb = nullptr;
+    if (FAILED(real(sc, 0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&bb)))) return false;
+    D3D11_TEXTURE2D_DESC d;
+    bb->GetDesc(&d);
+    ID3D11Device* dev = nullptr;
+    bb->GetDevice(&dev);
+    bb->Release();
+    d.Width = S.game_w ? S.game_w : d.Width / 2;
+    d.Height = S.game_h ? S.game_h : d.Height;
+    d.BindFlags |= D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    d.MiscFlags = 0;
+    d.CPUAccessFlags = 0;
+    d.Usage = D3D11_USAGE_DEFAULT;
+    HRESULT hr = dev ? dev->CreateTexture2D(&d, nullptr, &S.proxy) : E_FAIL;
+    if (dev) dev->Release();
+    ACO_LOG("stereo: game back buffer %ux%u fmt %d: 0x%08lx", d.Width, d.Height, d.Format, hr);
+    if (FAILED(hr)) return false;
+  }
+  return SUCCEEDED(S.proxy->QueryInterface(riid, out));
+}
+
+namespace {
+
+void set_tag(const char* tag) {
+  if (S.tag == tag) return;
+  S.tag = tag;
+  hypr_set_window_tag(tag);
+}
+
+// output = sbs: each eye into its half of the real back buffer (or the game's image into both).
+void compose_wide(IDXGISwapChain* sc, ID3D11Texture2D* left, ID3D11Texture2D* right) {
+  ID3D11Texture2D* bb = nullptr;
+  if (FAILED(S.real_get_buffer(sc, 0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&bb)))) return;
+  D3D11_BOX box{0, 0, 0, S.game_w, S.game_h, 1};
+  S.imm->CopySubresourceRegion(bb, 0, 0, 0, 0, left, 0, &box);
+  S.imm->CopySubresourceRegion(bb, 0, S.game_w, 0, 0, right, 0, &box);
+  bb->Release();
+}
+
+}  // namespace
+
+void stereo_on_present(IDXGISwapChain* sc, PFN_GetBuffer real_get_buffer) {
+  const Config& cfg = config();
+  S.real_get_buffer = real_get_buffer;
+  if (cfg.stereo_mode != "off") hypr_start();
+  bool display_stereo = hypr_display_stereo() == 1;
+  bool want = (cfg.stereo_mode == "sbs" || (cfg.stereo_mode == "auto" && display_stereo)) && S.dev && S.imm1 &&
+              !S.failed && !fg12_proxy_on();
+  bool wide = sc == S.wide_sc;
   RecFrame* f = rec_stop();
   cam_on_present(want);
   if (!want) {
@@ -281,17 +374,31 @@ void stereo_on_present(IDXGISwapChain* sc) {
     rec_free(f);
     if (S.active) ACO_LOG("stereo: off");
     S.active = false;
+    if (wide && S.proxy) compose_wide(sc, S.proxy, S.proxy);  // 2D: the same image in both halves
+    set_tag(wide ? "stereo-sbs" : "");
     return;
   }
-  if (!S.active) ACO_LOG("stereo: on (separation %.1f mm, convergence %.2f m)", cfg.stereo_separation, cfg.stereo_convergence);
+  if (!S.active)
+    ACO_LOG("stereo: on (separation %.1f mm, convergence %.2f m, output %s)", cfg.stereo_separation,
+            cfg.stereo_convergence, wide ? "sbs" : "hsbs");
   S.active = true;
+  set_tag(wide ? "stereo-sbs" : "stereo-hsbs");
   ++S.frames;
   read_stats();
 
   const char* why = nullptr;
-  ID3D11Texture2D* bb = nullptr;
-  if (rec_frame_ok(f, &why) && ensure_device_objects() &&
-      SUCCEEDED(sc->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&bb))) && ensure_targets(bb)) {
+  ID3D11Texture2D* bb = nullptr;  // the image the game drew
+  bool got = false;
+  if (wide) {
+    if (S.proxy) {
+      bb = S.proxy;
+      bb->AddRef();
+      got = true;
+    }
+  } else {
+    got = SUCCEEDED(sc->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&bb)));
+  }
+  if (rec_frame_ok(f, &why) && ensure_device_objects() && got && ensure_targets(bb)) {
     double t0 = now_ms();
     S.imm->CopyResource(S.eye[0], bb);
     tmp_before_right(S.imm);
@@ -310,7 +417,12 @@ void stereo_on_present(IDXGISwapChain* sc) {
     S.imm->CopyResource(S.eye[1], bb);
     tmp_after_right(S.imm);
     double t_replay = now_ms();
-    compose(bb, S.frames % 30 == 0);
+    if (wide) {
+      bool sw = cfg.stereo_swap;
+      compose_wide(sc, S.eye[sw ? 1 : 0], S.eye[sw ? 0 : 1]);
+    } else {
+      compose(bb, S.frames % 30 == 0);
+    }
     S.replay_ms += now_ms() - t0;
     if (S.frames <= 3 || S.frames % 300 == 0)
       ACO_LOG("stereo: frame %llu: copy %.2f ms, replay %.2f ms, compose %.2f ms (%zu calls)", (unsigned long long)S.frames,
@@ -318,9 +430,12 @@ void stereo_on_present(IDXGISwapChain* sc) {
     ++S.replays;
     S.cmds_sum += rec_frame_size(f);
     S.bytes_sum += rec_frame_bytes(f);
-  } else if (why && why != S.last_bad) {
-    ACO_LOG("stereo: frame not replayed: %s", why);
-    S.last_bad = why;
+  } else {
+    if (why && why != S.last_bad) {
+      ACO_LOG("stereo: frame not replayed: %s", why);
+      S.last_bad = why;
+    }
+    if (wide && S.proxy) compose_wide(sc, S.proxy, S.proxy);
   }
   tmp_frame_end(true, bb, rec_frame_size(f));
   if (bb) bb->Release();

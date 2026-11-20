@@ -1713,6 +1713,8 @@ void trace_poll(ID3D11Texture2D* bb) {
 
 } // namespace
 
+bool fg12_proxy_on() { return P.proxy > 0; }
+
 HRESULT fg12_get_buffer(IDXGISwapChain* sc, UINT index, const _GUID& riid, void** out, PFN_GetBuffer real) {
   P.real_get_buffer = real;
   if (P.proxy < 0) {

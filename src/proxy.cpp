@@ -70,9 +70,11 @@ T real_proc(const char* name) {
 double g_present_ms = 0;
 int g_present_n = 0;
 
+HRESULT STDMETHODCALLTYPE hk_GetBuffer(IDXGISwapChain* self, UINT index, REFIID riid, void** out);
+
 HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain* self, UINT sync, UINT flags) {
   if (!(flags & DXGI_PRESENT_TEST)) {
-    stereo_on_present(self);
+    stereo_on_present(self, orig<decltype(hk_GetBuffer)>(self, SwapChain_GetBuffer));
     trace_on_present(self);
     upscaler_on_present(self);
     latency_on_present_begin(self);
@@ -94,7 +96,7 @@ HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain* self, UINT sync, UINT flags
   QueryPerformanceCounter(&a);
   auto real_present = orig<decltype(hk_Present)>(self, SwapChain_Present);
   HRESULT hr = S_OK;
-  if ((flags & DXGI_PRESENT_TEST) || stereo_active() || !fg_present(self, sync, flags, real_present, &hr))
+  if ((flags & DXGI_PRESENT_TEST) || stereo_active() || stereo_wide(self) || !fg_present(self, sync, flags, real_present, &hr))
     hr = real_present(self, sync, flags);
   QueryPerformanceCounter(&b);
   if (!(flags & DXGI_PRESENT_TEST)) {
@@ -125,14 +127,39 @@ HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1* self, UINT sync, UINT fla
   return hr;
 }
 HRESULT STDMETHODCALLTYPE hk_GetBuffer(IDXGISwapChain* self, UINT index, REFIID riid, void** out) {
+  if (stereo_get_buffer(self, index, riid, out, orig<decltype(hk_GetBuffer)>(self, SwapChain_GetBuffer))) return S_OK;
   return fg12_get_buffer(self, index, riid, out, orig<decltype(hk_GetBuffer)>(self, SwapChain_GetBuffer));
 }
+HRESULT STDMETHODCALLTYPE hk_GetDesc(IDXGISwapChain* self, DXGI_SWAP_CHAIN_DESC* d);
 HRESULT STDMETHODCALLTYPE hk_ResizeBuffers(IDXGISwapChain* self, UINT n, UINT w, UINT h, DXGI_FORMAT f, UINT fl) {
   if (n && config().fg_mode == "d3d12" && config().fg_buffers > 0 && n < UINT(config().fg_buffers)) n = config().fg_buffers;
   ACO_LOG("ResizeBuffers %ux%u fmt=%d n=%u", w, h, f, n);
   reflex_on_resize();
   fg12_before_resize();
+  if (stereo_wide(self)) {
+    UINT gw = w, gh = h;
+    if (!gw || !gh) {  // window size
+      DXGI_SWAP_CHAIN_DESC d;
+      orig<decltype(hk_GetDesc)>(self, SwapChain_GetDesc)(self, &d);
+      RECT r{};
+      GetClientRect(d.OutputWindow, &r);
+      if (!gw) gw = UINT(r.right - r.left);
+      if (!gh) gh = UINT(r.bottom - r.top);
+    }
+    stereo_swapchain_resized(self, gw, gh);
+    return orig<decltype(hk_ResizeBuffers)>(self, SwapChain_ResizeBuffers)(self, n, gw * 2, gh, f, fl);
+  }
   return orig<decltype(hk_ResizeBuffers)>(self, SwapChain_ResizeBuffers)(self, n, w, h, f, fl);
+}
+HRESULT STDMETHODCALLTYPE hk_GetDesc(IDXGISwapChain* self, DXGI_SWAP_CHAIN_DESC* d) {
+  HRESULT hr = orig<decltype(hk_GetDesc)>(self, SwapChain_GetDesc)(self, d);
+  if (SUCCEEDED(hr) && d) stereo_adjust_desc(self, &d->BufferDesc.Width);
+  return hr;
+}
+HRESULT STDMETHODCALLTYPE hk_GetDesc1(IDXGISwapChain1* self, DXGI_SWAP_CHAIN_DESC1* d) {
+  HRESULT hr = orig<decltype(hk_GetDesc1)>(self, SwapChain1_GetDesc1)(self, d);
+  if (SUCCEEDED(hr) && d) stereo_adjust_desc(self, &d->Width);
+  return hr;
 }
 
 void install_swapchain(IDXGISwapChain* sc) {
@@ -143,9 +170,11 @@ void install_swapchain(IDXGISwapChain* sc) {
   hook_vtable(sc, SwapChain_Present, reinterpret_cast<void*>(hk_Present));
   hook_vtable(sc, SwapChain_ResizeBuffers, reinterpret_cast<void*>(hk_ResizeBuffers));
   hook_vtable(sc, SwapChain_GetBuffer, reinterpret_cast<void*>(hk_GetBuffer));
+  hook_vtable(sc, SwapChain_GetDesc, reinterpret_cast<void*>(hk_GetDesc));
   IDXGISwapChain1* sc1 = nullptr;
   if (SUCCEEDED(sc->QueryInterface(__uuidof(IDXGISwapChain1), reinterpret_cast<void**>(&sc1)))) {
     hook_vtable(sc1, SwapChain1_Present1, reinterpret_cast<void*>(hk_Present1));
+    hook_vtable(sc1, SwapChain1_GetDesc1, reinterpret_cast<void*>(hk_GetDesc1));
     sc1->Release();
   }
 }
@@ -155,14 +184,50 @@ HRESULT STDMETHODCALLTYPE hk_CreateSwapChain(IDXGIFactory* self, IUnknown* dev, 
     ACO_LOG("fg: swapchain buffer count %u -> %d", desc->BufferCount, config().fg_buffers);
     desc->BufferCount = config().fg_buffers;
   }
+  UINT scale = desc ? stereo_swapchain_scale() : 1, gw = 0, gh = 0;
+  if (scale > 1) {
+    gw = desc->BufferDesc.Width;
+    gh = desc->BufferDesc.Height;
+    if (!gw || !gh) {
+      RECT r{};
+      GetClientRect(desc->OutputWindow, &r);
+      if (!gw) gw = UINT(r.right - r.left);
+      if (!gh) gh = UINT(r.bottom - r.top);
+    }
+    desc->BufferDesc.Width = gw * scale;
+    desc->BufferDesc.Height = gh;
+  }
   HRESULT hr = orig<decltype(hk_CreateSwapChain)>(self, Factory_CreateSwapChain)(self, dev, desc, out);
-  if (SUCCEEDED(hr) && out && *out) install_swapchain(*out);
+  if (scale > 1) desc->BufferDesc.Width = gw;
+  if (SUCCEEDED(hr) && out && *out) {
+    install_swapchain(*out);
+    if (scale > 1) stereo_swapchain_created(*out, gw, gh);
+  }
   return hr;
 }
 HRESULT STDMETHODCALLTYPE hk_CreateSwapChainForHwnd(IDXGIFactory2* self, IUnknown* dev, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc,
                                                     const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fs, IDXGIOutput* o, IDXGISwapChain1** out) {
+  UINT scale = desc ? stereo_swapchain_scale() : 1, gw = 0, gh = 0;
+  DXGI_SWAP_CHAIN_DESC1 d1{};
+  if (scale > 1) {
+    d1 = *desc;
+    gw = d1.Width;
+    gh = d1.Height;
+    if (!gw || !gh) {
+      RECT r{};
+      GetClientRect(hwnd, &r);
+      if (!gw) gw = UINT(r.right - r.left);
+      if (!gh) gh = UINT(r.bottom - r.top);
+    }
+    d1.Width = gw * scale;
+    d1.Height = gh;
+    desc = &d1;
+  }
   HRESULT hr = orig<decltype(hk_CreateSwapChainForHwnd)>(self, Factory2_CreateSwapChainForHwnd)(self, dev, hwnd, desc, fs, o, out);
-  if (SUCCEEDED(hr) && out && *out) install_swapchain(*out);
+  if (SUCCEEDED(hr) && out && *out) {
+    install_swapchain(*out);
+    if (scale > 1) stereo_swapchain_created(*out, gw, gh);
+  }
   return hr;
 }
 

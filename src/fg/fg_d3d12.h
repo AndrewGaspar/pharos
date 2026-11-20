@@ -15,6 +15,8 @@ bool fg12_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent rea
 // IDXGISwapChain::GetBuffer hook: with [fg] mode=d3d12 and present_thread=1 (decided at the first
 // call) the game renders into a backbuffer of ours instead of the swapchain's.
 using PFN_GetBuffer = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, const _GUID&, void**);
+// Frame Generation's proxy back buffer + present thread is in use (decided at the first GetBuffer).
+bool fg12_proxy_on();
 HRESULT fg12_get_buffer(IDXGISwapChain* sc, UINT index, const _GUID& riid, void** out, PFN_GetBuffer real);
 void fg12_before_resize();
 bool fg12_proxy_active();
