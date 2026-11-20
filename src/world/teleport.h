@@ -15,8 +15,9 @@ namespace aco {
 // Checked from Present.
 //
 // In the Quiver lab the same is served through the lab channel (teleport_register): `quiver lab
-// where`, `quiver lab teleport <i> <location | x y z [yaw [pitch]]>` (the player only; tools/lab/camera
-// turns the camera from the host); and the lab state is kept (menu | in-world) for `quiver lab wait
+// where`, `quiver lab teleport <i> <location | x y z [yaw [pitch]]>` (the player only; quiver lab
+// turns the camera to the reply's "want" from the host); and the lab state is kept (menu | in-world)
+// for `quiver lab wait
 // <i> in-world`.
 void teleport_on_present();
 void teleport_register();

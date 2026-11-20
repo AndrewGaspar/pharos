@@ -15,7 +15,7 @@ Quiver mod with an options surface (`dist/quiver-options.toml`, surface `aco-dls
 - `dist/`: `pharos.ini` (shipped defaults) and `quiver-options.toml`. **Change them together** and
   lint: `quiver mods origins options lint build/mod`.
 - `docs/`: ENGINE_NOTES.md (engine RE and the Tools section), STEREO.md, FRAME_GENERATION.md.
-- `tools/lab/`: the lab harness (setup, launch, dt, screen, teleport, camera, profiles).
+- `tools/lab/`: the lab harness (setup, launch, dt, screen, teleport, profiles).
 
 ## Build and run (Quiver lab)
 
@@ -25,7 +25,7 @@ scripts/package                            # mingw-w64 -> build/mod/{d3d11.dll,n
 tools/lab/launch --dt giza-sphinx [section.key=value ...]   # launch build/mod + ini overrides, menus -> Discovery Tour, teleport
 quiver lab wait origins in-world           # Pharos's lab state: menu | in-world
 quiver lab where origins                   # player and camera
-quiver lab teleport origins <location>     # quiver lab teleport origins list; tools/lab/teleport also turns the camera
+quiver lab teleport origins <location>     # moves the player and turns the camera (list: ... teleport origins list); quiver lab turn origins <yaw> [pitch]
 quiver lab set origins 'pharos:[stereo]mode=sbs' --wait     # live config change (waits for the reload line)
 quiver lab call origins cfg section.key [value]             # read / set one key through the mod
 quiver lab shot origins out.png --settle 2
@@ -40,11 +40,13 @@ user's real prefix or install, never sign in to stores or read credential files,
 Connect. Don't change the user's lab limits, Quiver settings, profiles or mods, or other sessions'
 instances (Alan Wake agents use the lab too: check `quiver lab host` before heavy runs).
 
-The instance `origins` runs **1280x720@60 with a 30 fps cap** (Pharos `[reflex] fps_limit=30`
-from the `lab` graphics profile; the game's own MaxFPS doesn't hold) unless a test needs
-otherwise; for stereo/performance numbers use `display=1920x1080@60 graphics=measure` (see
-ENGINE_NOTES, Tools) under `quiver lab gpu`. `tools/lab/setup` re-applies the instance config.
-The virtual clock (`clock=virtual:...`) currently breaks Pharos's hooks: keep `clock=real`.
+The instance `origins` runs **1280x720@60**; with a real clock it has a 30 fps cap (Pharos
+`[reflex] fps_limit=30` from the `lab` graphics profile; the game's own MaxFPS doesn't hold).
+`tools/lab/launch` defaults to the virtual clock (`virtual:62.5`, verified live with Pharos's
+hooks: DLSS/stereo run, pause/step stills are exact) and lifts the cap under it; use
+`--clock real` for performance work, and `display=1920x1080@60 graphics=measure` (see
+ENGINE_NOTES, Tools) under `quiver lab gpu` for stereo/performance numbers. `tools/lab/setup`
+re-applies the instance config. Story saves are lab fixtures (`quiver lab fixture list origins`).
 
 ## Conventions
 

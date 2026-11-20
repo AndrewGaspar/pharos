@@ -10,7 +10,7 @@
 #   mod_dir=build/mod             every launch copies build/mod over the install (originals put back)
 #   file.pharos / file.aco        aliases for quiver lab set: pharos:[reflex]fps_limit=30, aco:[Graphics]...
 #   reload_pattern / log_file     quiver lab set --wait waits for pharos.log's "config:" line
-#                                 (lab:pharos.log is a hard link Pharos makes to the run's log)
+#                                 (run:pharos.log resolves to the current run's log)
 #   throttle                      what quiver lab gpu applies to this instance while another one measures
 #   graphics=lab                  profile applied at every launch (tools/lab/profiles/lab.set: Ultra High
 #                                 at the display size, Reflex cap 30 fps)
@@ -32,7 +32,7 @@ q edit "$name" \
   file.pharos=install:pharos.ini \
   "file.aco=drive_c/users/steamuser/Documents/Assassin's Creed Origins/ACO.ini" \
   'reload_pattern=config: enabled=' \
-  log_file=lab:pharos.log \
+  log_file=run:pharos.log \
   throttle= \
   'throttle+=pharos:[reflex]fps_limit=5' \
   graphics=lab

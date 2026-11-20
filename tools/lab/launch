@@ -8,6 +8,12 @@
 #   tools/lab/launch --dt                                  # build/mod, lab defaults, into Discovery Tour
 #   tools/lab/launch --dt giza-sphinx stereo.mode=sbs      # stereo from the first frame, then Giza
 #   tools/lab/launch fg.mode=off reflex.fps_limit=0        # overrides (keys must exist in pharos.ini)
+#   tools/lab/launch --clock real ...                      # real clock (performance measurements)
+#
+# The default clock is the lab's virtual clock (virtual:62.5): faster through menus/loading and
+# pause/step stills (quiver lab clock). With it, reflex.fps_limit defaults to 0 here (a 30 fps cap
+# would cancel the speed-up); pass reflex.fps_limit=N to cap anyway. With --clock real the graphics
+# profile's 30 fps cap applies as before.
 #
 # Overrides are written into a copy of the mod folder's pharos.ini, which quiver lab launch copies
 # over the install, so they hold from the game's first frame (keys read at swapchain creation too).
@@ -18,7 +24,7 @@
 # Refuses to launch while the user plays AC Origins themselves (tools/npc-re/userplaying.sh).
 set -euo pipefail
 here=$(cd "$(dirname "$0")/../.." && pwd)
-name=${LAB_INSTANCE:-origins} mod=$here/build/mod clock="" dt=0 location="" overrides=()
+name=${LAB_INSTANCE:-origins} mod=$here/build/mod clock="virtual:62.5" dt=0 location="" overrides=()
 while (($#)); do
   case $1 in
     --instance) name=$2; shift 2;;
@@ -30,6 +36,10 @@ while (($#)); do
     *) echo "launch: unknown argument $1" >&2; exit 2;;
   esac
 done
+if [[ $clock == virtual:* ]]; then
+  capped=0; for kv in "${overrides[@]}"; do [[ $kv == reflex.fps_limit=* ]] && capped=1; done
+  ((capped)) || overrides=(reflex.fps_limit=0 "${overrides[@]}")
+fi
 src=${QUIVER_SOURCE:-agent:pharos-lab}
 q() { quiver lab --source "$src" "$@"; }
 

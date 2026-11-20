@@ -276,18 +276,17 @@ bool parse_float(const std::string& s, float& out) {
   return end && end != s.c_str() && *end == 0 && std::isfinite(out);
 }
 
-// `quiver lab teleport <i> <location | x y z [yaw [pitch]]> [hold=S] [drop=M]` (locations.txt rows
-// may carry a trailing "# comment", which arrives as arguments: ignored). Moves the player only:
-// the camera can't be turned from inside the game (SendInput mouse motion never reaches the game's
-// raw-input mouse-look under Wine; XTEST motion from the host does), so yaw/pitch are returned as
-// "want" for tools/lab/camera, which turns it with quiver lab mouse in a closed loop on `where`.
+// `quiver lab teleport <i> <location | x y z [yaw [pitch]]> [hold=S] [drop=M]` (Quiver strips
+// locations.txt's "# comments"). Moves the player only: the camera can't be turned from inside the
+// game (SendInput mouse motion never reaches the game's raw-input mouse-look under Wine; XTEST
+// motion from the host does), so yaw/pitch are returned as "want", and quiver lab teleport turns
+// the camera there with mouse-look in a closed loop on `where` (as quiver lab turn).
 std::string verb_teleport(const std::vector<std::string>& a, bool& ok) {
   float v[5];
   int n = 0;
   double hold = -1;
   float drop = -1;
   for (const auto& t : a) {
-    if (t.rfind("#", 0) == 0) break;
     if (t.rfind("hold=", 0) == 0) hold = atof(t.c_str() + 5);
     else if (t.rfind("drop=", 0) == 0) drop = static_cast<float>(atof(t.c_str() + 5));
     else if (n < 5 && parse_float(t, v[n])) n++;
