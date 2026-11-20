@@ -92,6 +92,8 @@ void main(uint2 id : SV_DispatchThreadID)
 using PFN_D3DCompile = HRESULT(WINAPI*)(const void*, SIZE_T, const char*, const D3D_SHADER_MACRO*, ID3DInclude*,
                                         const char*, const char*, UINT, UINT, ID3DBlob**, ID3DBlob**);
 
+}  // namespace
+
 ID3D11ComputeShader* compile(ID3D11Device* dev, const char* src, size_t len, const char* name) {
   static PFN_D3DCompile d3d_compile = [] {
     HMODULE m = LoadLibraryW(L"d3dcompiler_47.dll");
@@ -118,7 +120,6 @@ ID3D11ComputeShader* compile(ID3D11Device* dev, const char* src, size_t len, con
   return cs;
 }
 
-} // namespace
 
 bool create(ID3D11Device* dev, Kernels& k) {
   k.motion = compile(dev, kMotionHlsl, sizeof(kMotionHlsl) - 1, "aco_motion.hlsl");

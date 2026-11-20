@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "core/hook.h"
+#include "stereo/record.h"
 #include "core/log.h"
 #include "core/mapstats.h"
 #include "core/vtidx.h"
@@ -97,6 +98,7 @@ uint32_t shadow_size(ID3D11Resource* res) {
 HRESULT STDMETHODCALLTYPE hk_Map(ID3D11DeviceContext* self, ID3D11Resource* res, UINT sub, D3D11_MAP type, UINT flags,
                                  D3D11_MAPPED_SUBRESOURCE* out) {
   HRESULT hr = orig<decltype(hk_Map)>(self, Context_Map)(self, res, sub, type, flags, out);
+  if (SUCCEEDED(hr) && out && ACO_REC_WANT(self)) rec_map(res, sub, type, flags, out);
   if (SUCCEEDED(hr) && out && (type == D3D11_MAP_WRITE_DISCARD || type == D3D11_MAP_WRITE_NO_OVERWRITE)) {
     mapstats_note(res, false);
     if (uint32_t size = shadow_size(res)) {
@@ -122,6 +124,7 @@ HRESULT STDMETHODCALLTYPE hk_Map(ID3D11DeviceContext* self, ID3D11Resource* res,
 }
 
 void STDMETHODCALLTYPE hk_Unmap(ID3D11DeviceContext* self, ID3D11Resource* res, UINT sub) {
+  if (self == g_rec_imm) rec_unmap(res, sub);
   if (shadow_size(res)) {
     std::lock_guard lock(g_mutex);
     auto it = g_shadows.find({self, res});
@@ -136,6 +139,7 @@ void STDMETHODCALLTYPE hk_Unmap(ID3D11DeviceContext* self, ID3D11Resource* res, 
 
 void STDMETHODCALLTYPE hk_UpdateSubresource(ID3D11DeviceContext* self, ID3D11Resource* res, UINT sub, const D3D11_BOX* box,
                                             const void* data, UINT rowpitch, UINT depthpitch) {
+  if (ACO_REC_WANT(self)) rec_update(res, sub, box, data, rowpitch, depthpitch, 0, false);
   if (data) {
     mapstats_note(res, true);
     if (uint32_t size = shadow_size(res)) {

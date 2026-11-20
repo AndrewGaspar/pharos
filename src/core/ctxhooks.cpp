@@ -16,6 +16,8 @@
 #include "core/shaders.h"
 #include "core/vtidx.h"
 #include "dlss/upscaler.h"
+#include "stereo/record.h"
+#include "stereo/stereo.h"
 #include "trace/trace.h"
 
 namespace aco {
@@ -83,6 +85,7 @@ inline ShaderClass ps_class(ID3D11DeviceContext* ctx) {
 // ---- context hooks ---------------------------------------------------------------------------
 
 void STDMETHODCALLTYPE hk_PSSetShader(ID3D11DeviceContext* self, ID3D11PixelShader* ps, ID3D11ClassInstance* const* ci, UINT n) {
+  if (ACO_REC_WANT(self)) rec_ps_set_shader(ps, ci, n);
   ctx_gate(self);
   if (CtxState* s = state_for(self)) s->ps.store(shader_class_fast(ps), std::memory_order_relaxed);
   ORIG(decltype(hk_PSSetShader), Context_PSSetShader)(self, ps, ci, n);
@@ -90,6 +93,7 @@ void STDMETHODCALLTYPE hk_PSSetShader(ID3D11DeviceContext* self, ID3D11PixelShad
 
 void STDMETHODCALLTYPE hk_CSSetShader(ID3D11DeviceContext* self, ID3D11ComputeShader* cs, ID3D11ClassInstance* const* ci,
                                       UINT n) {
+  if (ACO_REC_WANT(self)) rec_cs_set_shader(cs, ci, n);
   ctx_gate(self);
   if (CtxState* s = state_for(self)) s->cs.store(shader_class_fast(cs), std::memory_order_relaxed);
   ORIG(decltype(hk_CSSetShader), Context_CSSetShader)(self, cs, ci, n);
@@ -106,6 +110,7 @@ inline bool culling_cs(ID3D11DeviceContext* ctx) {
 }
 
 void STDMETHODCALLTYPE hk_ClearState(ID3D11DeviceContext* self) {
+  if (ACO_REC_WANT(self)) rec_clear_state();
   ctx_gate(self);
   if (CtxState* s = state_for(self)) {
     s->ps.store(ShaderClass::None, std::memory_order_relaxed);
@@ -125,18 +130,21 @@ inline void draw_common(ID3D11DeviceContext* self, const char* op, const char* a
 }
 
 void STDMETHODCALLTYPE hk_Draw(ID3D11DeviceContext* self, UINT a, UINT b) {
+  if (ACO_REC_WANT(self)) rec_draw(a, b);
   geo_count(a, false);
   char args[64] = "";
   if (trace_capturing()) snprintf(args, sizeof(args), "%u,%u", a, b);
   draw_common(self, "Draw", args, [&] { ORIG(decltype(hk_Draw), Context_Draw)(self, a, b); });
 }
 void STDMETHODCALLTYPE hk_DrawIndexed(ID3D11DeviceContext* self, UINT a, UINT b, INT c) {
+  if (ACO_REC_WANT(self)) rec_draw_indexed(a, b, c);
   geo_count(a, false);
   char args[64] = "";
   if (trace_capturing()) snprintf(args, sizeof(args), "%u,%u,%d", a, b, c);
   draw_common(self, "DrawIndexed", args, [&] { ORIG(decltype(hk_DrawIndexed), Context_DrawIndexed)(self, a, b, c); });
 }
 void STDMETHODCALLTYPE hk_DrawInstanced(ID3D11DeviceContext* self, UINT a, UINT b, UINT c, UINT d) {
+  if (ACO_REC_WANT(self)) rec_draw_instanced(a, b, c, d);
   geo_count(uint64_t(a) * b, false);
   char args[64] = "";
   if (trace_capturing()) snprintf(args, sizeof(args), "%u,%u,%u,%u", a, b, c, d);
@@ -144,6 +152,7 @@ void STDMETHODCALLTYPE hk_DrawInstanced(ID3D11DeviceContext* self, UINT a, UINT 
               [&] { ORIG(decltype(hk_DrawInstanced), Context_DrawInstanced)(self, a, b, c, d); });
 }
 void STDMETHODCALLTYPE hk_DrawIndexedInstanced(ID3D11DeviceContext* self, UINT a, UINT b, UINT c, INT d, UINT e) {
+  if (ACO_REC_WANT(self)) rec_draw_indexed_instanced(a, b, c, d, e);
   geo_count(uint64_t(a) * b, false);
   char args[80] = "";
   if (trace_capturing()) snprintf(args, sizeof(args), "%u,%u,%u,%d,%u", a, b, c, d, e);
@@ -151,6 +160,7 @@ void STDMETHODCALLTYPE hk_DrawIndexedInstanced(ID3D11DeviceContext* self, UINT a
               [&] { ORIG(decltype(hk_DrawIndexedInstanced), Context_DrawIndexedInstanced)(self, a, b, c, d, e); });
 }
 void STDMETHODCALLTYPE hk_DrawIndexedInstancedIndirect(ID3D11DeviceContext* self, ID3D11Buffer* buf, UINT off) {
+  if (ACO_REC_WANT(self)) rec_draw_indexed_instanced_indirect(buf, off);
   geo_count(0, true);
   char args[64] = "";
   if (trace_capturing()) snprintf(args, sizeof(args), "\"%p\",%u", static_cast<void*>(buf), off);
@@ -159,12 +169,14 @@ void STDMETHODCALLTYPE hk_DrawIndexedInstancedIndirect(ID3D11DeviceContext* self
   });
 }
 void STDMETHODCALLTYPE hk_DrawInstancedIndirect(ID3D11DeviceContext* self, ID3D11Buffer* buf, UINT off) {
+  if (ACO_REC_WANT(self)) rec_draw_instanced_indirect(buf, off);
   char args[64] = "";
   if (trace_capturing()) snprintf(args, sizeof(args), "\"%p\",%u", static_cast<void*>(buf), off);
   draw_common(self, "DrawInstancedIndirect", args,
               [&] { ORIG(decltype(hk_DrawInstancedIndirect), Context_DrawInstancedIndirect)(self, buf, off); });
 }
 void STDMETHODCALLTYPE hk_Dispatch(ID3D11DeviceContext* self, UINT x, UINT y, UINT z) {
+  if (ACO_REC_WANT(self)) rec_dispatch(x, y, z);
   ctx_gate(self);
   if (trace_capturing()) {
     char args[64];
@@ -181,6 +193,7 @@ void STDMETHODCALLTYPE hk_Dispatch(ID3D11DeviceContext* self, UINT x, UINT y, UI
   ORIG(decltype(hk_Dispatch), Context_Dispatch)(self, x, y, z);
 }
 void STDMETHODCALLTYPE hk_DispatchIndirect(ID3D11DeviceContext* self, ID3D11Buffer* buf, UINT off) {
+  if (ACO_REC_WANT(self)) rec_dispatch_indirect(buf, off);
   ctx_gate(self);
   char args[64] = "";
   if (trace_capturing()) snprintf(args, sizeof(args), "\"%p\",%u", static_cast<void*>(buf), off);
@@ -193,33 +206,39 @@ void STDMETHODCALLTYPE hk_DispatchIndirect(ID3D11DeviceContext* self, ID3D11Buff
   ORIG(decltype(hk_DispatchIndirect), Context_DispatchIndirect)(self, buf, off);
 }
 void STDMETHODCALLTYPE hk_CopyResource(ID3D11DeviceContext* self, ID3D11Resource* dst, ID3D11Resource* src) {
+  if (ACO_REC_WANT(self)) rec_copy_resource(dst, src);
   ctx_gate(self);
   trace_copy_resource(self, dst, src);
   ORIG(decltype(hk_CopyResource), Context_CopyResource)(self, dst, src);
 }
 void STDMETHODCALLTYPE hk_CopySubresourceRegion(ID3D11DeviceContext* self, ID3D11Resource* dst, UINT dsub, UINT x, UINT y,
                                                 UINT z, ID3D11Resource* src, UINT ssub, const D3D11_BOX* box) {
+  if (ACO_REC_WANT(self)) rec_copy_subresource(dst, dsub, x, y, z, src, ssub, box);
   ctx_gate(self);
   trace_copy_subresource(self, dst, dsub, x, y, z, src, ssub, box);
   ORIG(decltype(hk_CopySubresourceRegion), Context_CopySubresourceRegion)(self, dst, dsub, x, y, z, src, ssub, box);
 }
 void STDMETHODCALLTYPE hk_ClearRenderTargetView(ID3D11DeviceContext* self, ID3D11RenderTargetView* v, const FLOAT c[4]) {
+  if (ACO_REC_WANT(self)) rec_clear_rtv(v, c);
   ctx_gate(self);
   trace_clear_rtv(self, v, c);
   ORIG(decltype(hk_ClearRenderTargetView), Context_ClearRenderTargetView)(self, v, c);
 }
 void STDMETHODCALLTYPE hk_ClearDepthStencilView(ID3D11DeviceContext* self, ID3D11DepthStencilView* v, UINT f, FLOAT d,
                                                 UINT8 st) {
+  if (ACO_REC_WANT(self)) rec_clear_dsv(v, f, d, st);
   ctx_gate(self);
   trace_clear_dsv(self, v, f, d, st);
   ORIG(decltype(hk_ClearDepthStencilView), Context_ClearDepthStencilView)(self, v, f, d, st);
 }
 void STDMETHODCALLTYPE hk_ClearUAVFloat(ID3D11DeviceContext* self, ID3D11UnorderedAccessView* v, const FLOAT c[4]) {
+  if (ACO_REC_WANT(self)) rec_clear_uav_float(v, c);
   ctx_gate(self);
   trace_clear_uav(self, v, true);
   ORIG(decltype(hk_ClearUAVFloat), Context_ClearUnorderedAccessViewFloat)(self, v, c);
 }
 void STDMETHODCALLTYPE hk_ClearUAVUint(ID3D11DeviceContext* self, ID3D11UnorderedAccessView* v, const UINT c[4]) {
+  if (ACO_REC_WANT(self)) rec_clear_uav_uint(v, c);
   ctx_gate(self);
   trace_clear_uav(self, v, false);
   ORIG(decltype(hk_ClearUAVUint), Context_ClearUnorderedAccessViewUint)(self, v, c);
@@ -238,6 +257,7 @@ HRESULT STDMETHODCALLTYPE hk_FinishCommandList(ID3D11DeviceContext* self, BOOL r
   return hr;
 }
 void STDMETHODCALLTYPE hk_ExecuteCommandList(ID3D11DeviceContext* self, ID3D11CommandList* cl, BOOL restore) {
+  if (ACO_REC_WANT(self)) rec_execute(cl, restore);
   ctx_gate(self);
   trace_execute_command_list(self, cl);
   if (!upscaler_on_execute_command_list(self, cl, restore))
@@ -324,6 +344,7 @@ void ctxhooks_install_device(ID3D11Device* dev) {
   g_immediate = imm;
   trace_set_immediate(imm);
   ctxhooks_install_context(imm);
+  stereo_init(dev, imm);
   upscaler_init(dev, imm);
   imm->Release();
 }

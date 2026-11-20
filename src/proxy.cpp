@@ -8,6 +8,7 @@
 #include <atomic>
 #include <string>
 
+#include "stereo/stereo.h"
 #include "core/hook.h"
 #include "core/log.h"
 #include "core/vtidx.h"
@@ -71,6 +72,7 @@ int g_present_n = 0;
 
 HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain* self, UINT sync, UINT flags) {
   if (!(flags & DXGI_PRESENT_TEST)) {
+    stereo_on_present(self);
     trace_on_present(self);
     upscaler_on_present(self);
     latency_on_present_begin(self);
@@ -92,7 +94,7 @@ HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain* self, UINT sync, UINT flags
   QueryPerformanceCounter(&a);
   auto real_present = orig<decltype(hk_Present)>(self, SwapChain_Present);
   HRESULT hr = S_OK;
-  if ((flags & DXGI_PRESENT_TEST) || !fg_present(self, sync, flags, real_present, &hr))
+  if ((flags & DXGI_PRESENT_TEST) || stereo_active() || !fg_present(self, sync, flags, real_present, &hr))
     hr = real_present(self, sync, flags);
   QueryPerformanceCounter(&b);
   if (!(flags & DXGI_PRESENT_TEST)) {

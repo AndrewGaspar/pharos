@@ -13,6 +13,9 @@ struct Kernels {
 
 bool create(ID3D11Device* dev, Kernels& k);
 
+// Compiles a cs_5_0 compute shader (entry point main) from HLSL source.
+ID3D11ComputeShader* compile(ID3D11Device* dev, const char* src, size_t len, const char* name);
+
 // Register layout of the motion kernel. It is dispatched *inside the game's command stream* with
 // the TAA pass's own constant buffers rebound to the same slots, so it reads exactly the camera
 // and TAA constants the engine's TAA would have used.

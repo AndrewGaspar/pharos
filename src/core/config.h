@@ -104,6 +104,13 @@ struct Config {
   float world_lod_distance = 1.0f;        // [world] lod_distance
   std::string world_lod_mode = "far";      // [world] lod_mode: far (patched culling shaders, LOD range max only) | all (old: scale every range)
   std::string world_lod_skip;             // [world] lod_skip (diagnostics): culling shader hash prefixes left unpatched
+  std::string stereo_mode = "off";      // [stereo] mode: off | sbs (both eyes from one game frame, side by side)
+  float stereo_separation = 32.5f;      // [stereo] separation: eye offset from the centre, mm (each eye)
+  float stereo_convergence = 4.0f;      // [stereo] convergence: distance of zero disparity, m (0 = parallel)
+  std::string stereo_show = "sbs";      // [stereo] show: sbs | left | right | diff (debug views)
+  float stereo_diff_gain = 16.0f;       // [stereo] diff_gain: show=diff amplification
+  bool stereo_swap = false;             // [stereo] swap: exchange the eyes
+  std::string stereo_skip;              // [stereo] skip (debugging): kinds of recorded calls left out of the replay
   std::string cloth_mode = "game";  // [cloth] mode: game | render | scale (see cloth/cloth.h)
   float cloth_scale = 1.0f;         // [cloth] scale (mode=scale, diagnostics)
 };

@@ -3,6 +3,7 @@
 #define CINTERFACE
 #define COBJMACROS
 #include <d3d11.h>
+#include <d3d11_1.h>
 #include <dxgi1_2.h>
 
 #include <cstddef>
@@ -11,6 +12,7 @@ namespace aco::vt {
 
 using Device = ID3D11DeviceVtbl;
 using Context = ID3D11DeviceContextVtbl;
+using Context1 = ID3D11DeviceContext1Vtbl;
 using Factory = IDXGIFactoryVtbl;
 using Factory2 = IDXGIFactory2Vtbl;
 using SwapChain = IDXGISwapChainVtbl;
