@@ -41,6 +41,7 @@ add_library(aco_d3d11 SHARED
   src/stereo/camera.cpp
   src/stereo/temporal.cpp
   src/core/hyprland.cpp
+  src/core/quiver.cpp
   src/dlss/ngx.cpp
   src/dlss/kernels.cpp
   src/dlss/upscaler.cpp

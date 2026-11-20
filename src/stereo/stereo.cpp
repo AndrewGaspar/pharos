@@ -10,6 +10,7 @@
 
 #include "core/config.h"
 #include "core/hyprland.h"
+#include "core/quiver.h"
 #include "fg/fg_d3d12.h"
 #include "core/log.h"
 #include "dlss/kernels.h"
@@ -350,6 +351,10 @@ bool stereo_get_buffer(IDXGISwapChain* sc, UINT index, REFIID riid, void** out, 
 namespace {
 
 void set_tag(const char* tag) {
+  // Quiver's HUD/Sight: the packing of what is presented.
+  // With [stereo] mode=off Pharos says nothing (Quiver's own sight.stereo setting applies).
+  if (config().stereo_mode != "off")
+    quiver_stereo_layout(!strcmp(tag, "stereo-sbs") ? "sbs" : !strcmp(tag, "stereo-hsbs") ? "hsbs" : "mono");
   if (S.tag == tag) return;
   S.tag = tag;
   hypr_set_window_tag(tag);

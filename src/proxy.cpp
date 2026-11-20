@@ -9,6 +9,7 @@
 #include <string>
 
 #include "stereo/stereo.h"
+#include "core/quiver.h"
 #include "core/hook.h"
 #include "core/log.h"
 #include "core/vtidx.h"
@@ -316,6 +317,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
     ACO_LOG("Pharos loaded into %ls", exe);
     config_reload();
+    quiver_init();
     upscaler_preinit();
     fg_preinit();
   }

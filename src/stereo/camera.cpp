@@ -103,6 +103,70 @@ void transform_pass(F4* c, const Eye& e, float dv) {
   for (int i = 0; i < 3; ++i) add_row(c[kClipToWorld + i], c[kClipToWorld + 3], e.d[i]);
 }
 
+// ---- passes drawn for the main view without its projection ------------------------------------
+// Fullscreen passes (sky/cloud composite, ...) bind a PassParams with a flat projection but the
+// main camera's matrices, and rebuild view directions from them. Left alone, both eyes rebuild the
+// same directions: the sky lands at screen depth. Such a PassParams (non-perspective projection,
+// camera equal to the latest main view's) gets the eye's camera; its projection stays.
+std::mutex g_main_mutex;
+F4 g_main_v2w[3];        // latest main view's viewToWorld rows (mono)
+float g_main_m00 = 0;    // and its projection's m00
+bool g_main_valid = false;
+
+void note_main(const F4* c) {
+  std::lock_guard lock(g_main_mutex);
+  memcpy(g_main_v2w, c + kViewToWorld, sizeof(g_main_v2w));
+  g_main_m00 = c[kProj].x;
+  g_main_valid = true;
+}
+
+bool matches_main(const F4* c, float* m00) {
+  std::lock_guard lock(g_main_mutex);
+  if (!g_main_valid) return false;
+  for (int r = 0; r < 3; ++r) {
+    const float* a = &c[kViewToWorld + r].x;
+    const float* b = &g_main_v2w[r].x;
+    for (int i = 0; i < 3; ++i)
+      if (std::fabs(a[i] - b[i]) > 1e-3f) return false;
+    if (std::fabs(a[3] - b[3]) > 0.01f) return false;  // position, metres
+  }
+  *m00 = g_main_m00;
+  return true;
+}
+
+// A matrix whose last row is (0, 0, 0, 1) isn't a perspective one.
+inline bool perspective_rows(const F4* m) {
+  return std::fabs(m[3].x) + std::fabs(m[3].y) + std::fabs(m[3].z) > 0.5f;
+}
+
+void transform_screen_pass(F4* c, const Eye& e, float dv) {
+  for (int i = 0; i < 3; ++i) {
+    (&c[kEyePos].x)[i] += e.d[i];
+    (&c[kEyePosPrev].x)[i] += e.dp[i];
+    c[kViewToWorld + i].w += e.d[i];
+    c[kViewToWorldPrev + i].w += e.dp[i];
+    (&c[kViewTrans].x)[i] += e.d[i];
+    (&c[kViewTransPrev].x)[i] += e.dp[i];
+  }
+  c[kWorldToView].w -= dv;
+  c[kWorldToViewPrev].w -= dv;
+  if (perspective_rows(c + kViewProj)) {
+    for (int r = 0; r < 4; ++r) c[kViewProj + r].w -= dot3(c[kViewProj + r], e.d);
+    add_row(c[kViewProj], c[kViewProj + 3], e.k);
+  }
+  if (perspective_rows(c + kViewProjPrev)) {
+    for (int r = 0; r < 4; ++r) c[kViewProjPrev + r].w -= dot3(c[kViewProjPrev + r], e.dp);
+    add_row(c[kViewProjPrev], c[kViewProjPrev + 3], e.k);
+  }
+  if (perspective_rows(c + kVNTP)) add_row(c[kVNTP], c[kVNTP + 3], e.k);
+  if (perspective_rows(c + kVNTPPrev)) add_row(c[kVNTPPrev], c[kVNTPPrev + 3], e.k);
+  for (int r = 0; r < 4; ++r) {
+    c[kClipToView + r].w -= e.k * c[kClipToView + r].x;
+    c[kClipToWorld + r].w -= e.k * c[kClipToWorld + r].x;
+  }
+  for (int i = 0; i < 3; ++i) add_row(c[kClipToWorld + i], c[kClipToWorld + 3], e.d[i]);
+}
+
 // ---- pool --------------------------------------------------------------------------------------
 
 constexpr UINT kPoolBytes = 32u << 20;
@@ -210,7 +274,7 @@ bool shadow_size(ID3D11Resource* res, UINT* size) {
 
 // ---- statistics --------------------------------------------------------------------------------
 
-std::atomic<uint64_t> st_pass_main{0}, st_pass_other{0}, st_inst_main{0}, st_inst_other{0}, st_nodata{0},
+std::atomic<uint64_t> st_pass_main{0}, st_pass_screen{0}, st_pass_other{0}, st_inst_main{0}, st_inst_other{0}, st_nodata{0},
     st_uploads{0}, st_upload_bytes{0};
 
 // Copies the slot data into a chunk of this context (new chunk if full). Returns the pool offset.
@@ -305,12 +369,28 @@ unsigned cam_filter(ID3D11DeviceContext* ctx, CamStage stage, UINT start, UINT n
     alignas(16) F4 l[kPassParamsBytes / 16], r[kPassParamsBytes / 16];
     UINT nreg = size / 16;
     if (slot == kPassSlot) {
+      float sep = cfg.stereo_separation * 0.001f;
       if (!is_main_view(src)) {
         cs->main.valid = false;
-        st_pass_other.fetch_add(1, std::memory_order_relaxed);
-        continue;
-      }
-      float sep = cfg.stereo_separation * 0.001f;
+        float m00 = 0;
+        if (perspective_rows(src + kProj) || !matches_main(src, &m00)) {
+          st_pass_other.fetch_add(1, std::memory_order_relaxed);
+          continue;
+        }
+        // A screen pass of the main view: eye parameters from the main projection.
+        F4 tmp[kPassParamsBytes / 16];
+        memcpy(tmp, src, size);
+        tmp[kProj].x = m00;
+        Eye ey[2];
+        for (int e = 0; e < 2; ++e) eye_params(tmp, sep, cfg.stereo_convergence, e, &ey[e]);
+        float dv0 = -sep * (m00 < 0 ? -1.0f : 1.0f);
+        memcpy(l, src, size);
+        memcpy(r, src, size);
+        transform_screen_pass(l, ey[0], dv0);
+        transform_screen_pass(r, ey[1], -dv0);
+        st_pass_screen.fetch_add(1, std::memory_order_relaxed);
+      } else {
+      note_main(src);
       MainView& mv = cs->main;
       mv.valid = true;
       memcpy(mv.vp, src + kViewProj, sizeof(mv.vp));
@@ -323,6 +403,7 @@ unsigned cam_filter(ID3D11DeviceContext* ctx, CamStage stage, UINT start, UINT n
       transform_pass(l, mv.eye[0], dv0);
       transform_pass(r, mv.eye[1], dv1);
       st_pass_main.fetch_add(1, std::memory_order_relaxed);
+      }
     } else {
       // InstanceParams: worldViewProj of the main view? (== viewProj x world)
       const MainView& mv = cs->main;
@@ -428,8 +509,8 @@ void cam_on_present(bool stereo_on) {
   static uint64_t frames = 0;
   if (!stereo_on) return;
   if (++frames % 300 == 0 || frames == 60) {
-    ACO_LOG("stereo: camera binds/frame: PassParams main %.0f other %.0f, InstanceParams main %.0f other %.0f, no data %.0f; uploads %.0f (%.2f MB)",
-            st_pass_main.exchange(0) / 300.0, st_pass_other.exchange(0) / 300.0, st_inst_main.exchange(0) / 300.0,
+    ACO_LOG("stereo: camera binds/frame: PassParams main %.0f screen %.0f other %.0f, InstanceParams main %.0f other %.0f, no data %.0f; uploads %.0f (%.2f MB)",
+            st_pass_main.exchange(0) / 300.0, st_pass_screen.exchange(0) / 300.0, st_pass_other.exchange(0) / 300.0, st_inst_main.exchange(0) / 300.0,
             st_inst_other.exchange(0) / 300.0, st_nodata.exchange(0) / 300.0, st_uploads.exchange(0) / 300.0,
             st_upload_bytes.exchange(0) / 300.0 / 1048576.0);
   }
