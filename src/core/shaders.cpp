@@ -13,6 +13,7 @@
 #include <unordered_map>
 
 #include "core/log.h"
+#include "stereo/camera.h"
 
 namespace aco {
 
@@ -48,13 +49,15 @@ bool contains(const std::vector<uint8_t>& bc, const char* needle) {
 
 ShaderClass classify(ShaderKind kind, const std::vector<uint8_t>& bc) {
   if (kind == ShaderKind::CS)
-    return contains(bc, "MiscCullingConsts_cbuffer")     ? ShaderClass::Culling
-           : contains(bc, "SkinningPassCompute_cbuffer") ? ShaderClass::Skinning
-                                                         : ShaderClass::None;
+    return contains(bc, "MiscCullingConsts_cbuffer")                ? ShaderClass::Culling
+           : contains(bc, "SkinningPassCompute_cbuffer")            ? ShaderClass::Skinning
+           : cam_effect_bytecode(bc.data(), bc.size())              ? ShaderClass::CamEffect
+                                                                    : ShaderClass::None;
   if (kind != ShaderKind::PS) return ShaderClass::None;
   if (contains(bc, "TemporalAA_ColorAccumulation")) return ShaderClass::TemporalAA;
   if (contains(bc, "ConvertLinearZParams_DepthBufferSampler")) return ShaderClass::LinearZ;
   if (contains(bc, "UICompositingParameters_cbuffer")) return ShaderClass::UIComposite;
+  if (cam_effect_bytecode(bc.data(), bc.size())) return ShaderClass::CamEffect;
   return ShaderClass::None;
 }
 
@@ -82,6 +85,7 @@ void shaders_register(ID3D11DeviceChild* shader, ShaderKind kind, const void* by
   memcpy(&info.hash, static_cast<const uint8_t*>(bytecode) + 4, sizeof(info.hash));
   info.bytecode.assign(static_cast<const uint8_t*>(bytecode), static_cast<const uint8_t*>(bytecode) + size);
   info.cls = classify(kind, info.bytecode);
+  if (info.cls == ShaderClass::CamEffect) cam_register_effect(shader, info.hash, bytecode, size);
   std::unique_lock lock(g_mutex);
   if (info.cls != ShaderClass::None) {
     // Serialised by g_mutex; readers are lock-free and only see published entries.
@@ -120,6 +124,7 @@ const char* shader_class_name(ShaderClass c) {
     case ShaderClass::UIComposite: return "UIComposite";
     case ShaderClass::Culling: return "Culling";
     case ShaderClass::Skinning: return "Skinning";
+    case ShaderClass::CamEffect: return "CamEffect";
   }
   return "?";
 }

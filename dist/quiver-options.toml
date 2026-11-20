@@ -77,7 +77,7 @@ options = ["stereo.mode", "stereo.output", "stereo.separation", "stereo.converge
 
 [[page.group]]
 title = "Debugging"
-options = ["stereo.show", "stereo.diff_gain", "stereo.skip"]
+options = ["stereo.show", "stereo.diff_gain", "stereo.effects", "stereo.skip"]
 
 [[page]]
 id = "diagnostics"
@@ -1259,6 +1259,13 @@ step = 1.0
 precision = 0
 unit = "×"
 when = { "stereo.show" = "diff" }
+level = "debug"
+apply = "live"
+
+[option."stereo.effects"]
+type = "string"
+label = "Effect cameras"
+help = "Effects whose own copies of the camera are moved to each eye (ssr, fog, clouds, cloudmarch, shadow, flare). Remove one to see it drawn from the left eye's camera in both eyes."
 level = "debug"
 apply = "live"
 

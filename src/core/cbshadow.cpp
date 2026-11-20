@@ -143,6 +143,7 @@ void STDMETHODCALLTYPE hk_Unmap(ID3D11DeviceContext* self, ID3D11Resource* res, 
 void STDMETHODCALLTYPE hk_UpdateSubresource(ID3D11DeviceContext* self, ID3D11Resource* res, UINT sub, const D3D11_BOX* box,
                                             const void* data, UINT rowpitch, UINT depthpitch) {
   if (ACO_REC_WANT(self)) rec_update(res, sub, box, data, rowpitch, depthpitch, 0, false);
+  cam_update(self, res, box, data);
   if (data) {
     mapstats_note(res, true);
     if (uint32_t size = shadow_size(res)) {

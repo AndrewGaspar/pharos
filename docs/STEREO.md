@@ -92,6 +92,91 @@ Check, measured on screenshot pairs:
   2560 px wide.
 - **Anaglyphs** of the Alexandria courtyard and Giza show consistent geometry, shadows and lighting.
 
+### 2b. Effects with their own camera copies (`camera.cpp`, "effect cameras")
+
+Some effects don't read the camera from `PassParams` but from a copy in a constant buffer of their
+own. Left alone, both eyes use the left eye's copy. Found in capture cap-001 (Alexandria harbour)
+from the shaders' reflection data and CB dumps:
+
+| Effect (`[stereo] effects` name) | cbuffer (slot) | Fields | Form |
+|---|---|---|---|
+| SSR (`ssr`) | `NewSSLRShared` (PS cb7, 512 B) | `worldToProj`, `prevWorldToProj` | viewProj, linear-depth row 2 |
+| Volumetric fog (`fog`), 16 CS | `VolumetricFogAllParamsCustomLayout` (CS cb5, 4 KB) | `SSToWS`, `EyePositionWS` | (x z, y z, z, 1) → world; position |
+| Near clouds' ray march (`cloudmarch`) | `CloudsRayMarch` (CS cb6, 8 KB) | `Camera[0].PlaneTopLeft`, `PlaneRight` | ray = TL + u R − v U |
+| Cloud composite (`clouds`) | `CloudsCompositeViewCache` (CS cb6, 16 KB) | `Proj2World` | (cs.x, cs.y, 1) → sky direction |
+| Shadow mask stabilisation (`shadow`) | `ShadowMaskStabilization` (CS cb6, 256 B) | `SSToWS`, `LastSSToWS` | as above |
+| Sun flare occlusion (`flare`) | `SunFlareOcclusion` (CS cb6) | `ViewProj` | viewProj |
+
+The clouds are drawn in three steps (cap-001): the near clouds are ray-marched into a 742x464
+texture in screen space (`CloudsRayMarch`), blended with the previous frame's (`CombineCloudsTexture`),
+and the composite (`CloudsCompositeViewCache`) maps each pixel to a sky direction to read the far
+clouds from a 1280x1024 view cache and puts the near ones over them. The sky pass reads the result.
+With both copies mono, the clouds came out at mixed depths in front of the mountains.
+
+**How:** shaders whose reflection data names one of these cbuffers are classified `CamEffect` when
+the game creates them, and the fields' offsets are read from the reflection data (RDEF). At each
+draw/dispatch of such a shader, the buffer bound at that slot (read back with
+`*GetConstantBuffers1`) is copied into the camera pool with the fields moved to each eye, the slot
+is pointed at the copy for that one call and then given back. Deferred contexts use the per-command-
+list slots of §2; the immediate context uploads the eye being drawn (the replay runs the hook again
+for the right eye). The data comes from the cached shadow of the buffer's last `Map(WRITE_DISCARD)`
+on that context. If that context didn't write it, the latest write from any context is used. Live,
+the fog's buffer is always written on another deferred context than the one that dispatches (16 of
+the 26 buffers moved per frame). The buffer sizes involved are learned at the effects' draws (live:
+256 B, 4 KB, 8 KB, 16 KB, plus the 512 B already shadowed for `InstanceParams`), so only maps of those
+sizes are shadowed. A shadow is dropped once the buffer is written another way (`WRITE_NO_OVERWRITE`,
+a partial `UpdateSubresource`).
+
+**No D3D call while one of our locks is held.** The per-context state has a lock, because the
+immediate context's maps come from several game threads. The uploads and binds that follow from it
+happen after the lock is released. (A build that uploaded under the lock hung before its first
+Present once, live. It wasn't seen again after the change, but the host was heavily loaded then, so
+that's suggestive, not proof.)
+
+Each field is first checked against the main view (the latest main `PassParams` of the command
+list, else of any context). A field that isn't a copy of the main camera is left alone. Live, that's 2 per frame: the cloud
+view cache's ring cameras, whose `PlaneRight` can line up with the main view's right vector. So the
+ray-march planes must also span the screen (2 NDC per unit of u, centred). Per eye:
+
+- **viewProj copies:** the same as `viewProj` in §2: translation by the eye offset, then `x += k w`.
+- **screen-to-world (`SSToWS`):** the input x is NDC, and the eye's NDC is the centre's + k, so
+  column 2 −= k × column 0. Then the position column += the eye offset.
+- **directions (`Proj2World`, the ray-march planes):** the eye's pixel sees the centre's direction
+  at NDC − k. The shift in the matrix's own units is measured on the matrix (the NDC of two
+  directions it produces), and the constant column (or `PlaneTopLeft`) moves by it.
+- **positions:** + the eye offset.
+
+**Measured** (t1, 32.5 mm, 4 m convergence, render 1484x928; expected disparity at infinity +31.2 px).
+Disparities are taken from one hsbs frame (both eyes at once, ×2 for the half-width squeeze).
+Captures a few seconds apart can't be compared: the clouds, the time of day and the camera move.
+Only patches at 0 px with all effects off (the volumetric clouds) are counted:
+
+| `[stereo] effects` | Giza, volumetric clouds (median) |
+|---|---|
+| none (the bug: clouds at screen depth, in front of the mountains) | 0.0 to +0.2 px |
+| `clouds` (composite only) | +0.6 px: these clouds are all near-layer |
+| `cloudmarch` | +30.8 px |
+| all | +29.4 px |
+
+- **Composite on far clouds: not verified.** No far clouds were visible during the runs, and the
+  composite alone doesn't move the near layer. Its matrix maps 1.00 NDC per unit, as expected.
+- **2D cloud layers already correct:** the sky pass's own layers (Alexandria at dusk) were already
+  at +31.5 px with effects off, because they take the camera from `PassParams`.
+- **SSR, Alexandria quay, water region:** with `ssr`, 45 patches match between the eyes, at +28.4
+  to +29.0 px (reflected buildings behind the surface). Without it, 24 match, spread up to +34 px
+  (beyond infinity: inconsistent eyes). Visibly, the right eye's reflections were smeared, and are
+  now as sharp as the left's.
+- **Fog:** no colour artifacts or ghosts (all effects on, Giza and Alexandria).
+- **Zero separation, all effects on:** L/R difference 0.24/255 mean, the same as before.
+- **Frame rate (Giza, uncapped, GPU to itself):** 52.7 and 52.8 fps with all effects, against 53.0
+  and 52.6 with none. Cost: ~26 buffer copies of ≤16 KB per frame.
+
+Not moved (deliberately): the temporal reprojection matrices (`SSToLastFrameSS` of the fog and of
+`CombineCloudsTexture`). They map an eye's screen to its own previous screen. That's the same
+matrix for both eyes when the camera is still, and only second-order different while it moves.
+Also not moved: the fog's light-culling view matrices (`VolumetricFogLightCullMask`), the culling
+cbuffers (HZB), GI and the water's particle projection (VS stage).
+
 ### 3. Per-eye temporal state (`temporal.cpp`, DLSS in `upscaler.cpp`)
 
 **DLSS** has one NGX feature, and so one history, per eye.
@@ -173,4 +258,9 @@ about half of the 2560x1600 numbers per eye, so 1080p60 at DLSS Performance hold
 - **Quiver's HUD isn't told the layout.** Pharos doesn't use the Quiver SDK
   (`quiver_set_stereo_layout`).
 - **Learning hitch:** ~300 ms, once per scene change.
+- **Effect cameras not covered** (§2b): the temporal reprojection matrices, the fog's light-culling
+  view matrices, the shadow reprojection (`ReprojectConsts.ScreenToWorldToShadowViewProjection`, VS)
+  and other VS-stage copies (`WaterCompositingCommonConsts.waterParticleViewProj`). Only PS and CS
+  shaders are tracked for effect cameras.
+- **The cloud composite's far-cloud correction is unmeasured** (no far clouds were in view).
 - **Not yet checked on the glasses under HypXRland.**

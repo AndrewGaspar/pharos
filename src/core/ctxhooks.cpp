@@ -52,6 +52,9 @@ struct CtxState {
   std::atomic<ID3D11DeviceContext*> ctx{nullptr};
   std::atomic<ShaderClass> ps{ShaderClass::None};
   std::atomic<ShaderClass> cs{ShaderClass::None};
+  // The bound shader when it is a CamEffect (stereo camera copies), else null.
+  std::atomic<ID3D11DeviceChild*> ps_fx{nullptr};
+  std::atomic<ID3D11DeviceChild*> cs_fx{nullptr};
 };
 constexpr size_t kMaxContexts = 64;
 CtxState g_ctx[kMaxContexts];
@@ -89,7 +92,11 @@ inline ShaderClass ps_class(ID3D11DeviceContext* ctx) {
 void STDMETHODCALLTYPE hk_PSSetShader(ID3D11DeviceContext* self, ID3D11PixelShader* ps, ID3D11ClassInstance* const* ci, UINT n) {
   if (ACO_REC_WANT(self)) rec_ps_set_shader(ps, ci, n);
   ctx_gate(self);
-  if (CtxState* s = state_for(self)) s->ps.store(shader_class_fast(ps), std::memory_order_relaxed);
+  if (CtxState* s = state_for(self)) {
+    ShaderClass c = shader_class_fast(ps);
+    s->ps.store(c, std::memory_order_relaxed);
+    s->ps_fx.store(c == ShaderClass::CamEffect ? ps : nullptr, std::memory_order_relaxed);
+  }
   ORIG(decltype(hk_PSSetShader), Context_PSSetShader)(self, ps, ci, n);
 }
 
@@ -97,8 +104,26 @@ void STDMETHODCALLTYPE hk_CSSetShader(ID3D11DeviceContext* self, ID3D11ComputeSh
                                       UINT n) {
   if (ACO_REC_WANT(self)) rec_cs_set_shader(cs, ci, n);
   ctx_gate(self);
-  if (CtxState* s = state_for(self)) s->cs.store(shader_class_fast(cs), std::memory_order_relaxed);
+  if (CtxState* s = state_for(self)) {
+    ShaderClass c = shader_class_fast(cs);
+    s->cs.store(c, std::memory_order_relaxed);
+    s->cs_fx.store(c == ShaderClass::CamEffect ? cs : nullptr, std::memory_order_relaxed);
+  }
   ORIG(decltype(hk_CSSetShader), Context_CSSetShader)(self, cs, ci, n);
+}
+
+// A draw/dispatch with a CamEffect shader bound: its camera copies per eye around the call.
+template <typename F>
+inline bool cam_effect_call(ID3D11DeviceContext* ctx, bool compute, F&& issue) {
+  if (!g_cam_on.load(std::memory_order_relaxed)) return false;
+  CtxState* s = state_for(ctx);
+  ID3D11DeviceChild* sh = s ? (compute ? s->cs_fx : s->ps_fx).load(std::memory_order_relaxed) : nullptr;
+  if (!sh) return false;
+  CamFx fx;
+  cam_effect_begin(ctx, compute ? kCS : kPS, sh, &fx);
+  issue();
+  cam_effect_end(ctx, &fx);
+  return true;
 }
 
 inline bool skinning_cs(ID3D11DeviceContext* ctx) {
@@ -117,6 +142,8 @@ void STDMETHODCALLTYPE hk_ClearState(ID3D11DeviceContext* self) {
   if (CtxState* s = state_for(self)) {
     s->ps.store(ShaderClass::None, std::memory_order_relaxed);
     s->cs.store(ShaderClass::None, std::memory_order_relaxed);
+    s->ps_fx.store(nullptr, std::memory_order_relaxed);
+    s->cs_fx.store(nullptr, std::memory_order_relaxed);
   }
   ORIG(decltype(hk_ClearState), Context_ClearState)(self);
 }
@@ -128,6 +155,7 @@ inline void draw_common(ID3D11DeviceContext* self, const char* op, const char* a
   tmp_on_draw(self);
   trace_draw(self, op, args);
   ShaderClass c = ps_class(self);
+  if (c == ShaderClass::CamEffect && cam_effect_call(self, false, issue)) return;
   if (c != ShaderClass::None && upscaler_on_draw(self, c, issue)) return;
   issue();
 }
@@ -194,6 +222,7 @@ void STDMETHODCALLTYPE hk_Dispatch(ID3D11DeviceContext* self, UINT x, UINT y, UI
     world_on_culling_dispatch(self, [&] { ORIG(decltype(hk_Dispatch), Context_Dispatch)(self, x, y, z); });
     return;
   }
+  if (cam_effect_call(self, true, [&] { ORIG(decltype(hk_Dispatch), Context_Dispatch)(self, x, y, z); })) return;
   ORIG(decltype(hk_Dispatch), Context_Dispatch)(self, x, y, z);
 }
 void STDMETHODCALLTYPE hk_DispatchIndirect(ID3D11DeviceContext* self, ID3D11Buffer* buf, UINT off) {
@@ -208,6 +237,8 @@ void STDMETHODCALLTYPE hk_DispatchIndirect(ID3D11DeviceContext* self, ID3D11Buff
     world_on_culling_dispatch(self, [&] { ORIG(decltype(hk_DispatchIndirect), Context_DispatchIndirect)(self, buf, off); });
     return;
   }
+  if (cam_effect_call(self, true, [&] { ORIG(decltype(hk_DispatchIndirect), Context_DispatchIndirect)(self, buf, off); }))
+    return;
   ORIG(decltype(hk_DispatchIndirect), Context_DispatchIndirect)(self, buf, off);
 }
 void STDMETHODCALLTYPE hk_CopyResource(ID3D11DeviceContext* self, ID3D11Resource* dst, ID3D11Resource* src) {
@@ -260,6 +291,8 @@ HRESULT STDMETHODCALLTYPE hk_FinishCommandList(ID3D11DeviceContext* self, BOOL r
     if (CtxState* s = state_for(self)) {
       s->ps.store(ShaderClass::None, std::memory_order_relaxed);
       s->cs.store(ShaderClass::None, std::memory_order_relaxed);
+      s->ps_fx.store(nullptr, std::memory_order_relaxed);
+      s->cs_fx.store(nullptr, std::memory_order_relaxed);
     }
   if (SUCCEEDED(hr) && out && *out) {
     cam_finish_command_list(self, *out);
@@ -281,6 +314,8 @@ void STDMETHODCALLTYPE hk_ExecuteCommandList(ID3D11DeviceContext* self, ID3D11Co
     if (CtxState* s = state_for(self)) {
       s->ps.store(ShaderClass::None, std::memory_order_relaxed);
       s->cs.store(ShaderClass::None, std::memory_order_relaxed);
+      s->ps_fx.store(nullptr, std::memory_order_relaxed);
+      s->cs_fx.store(nullptr, std::memory_order_relaxed);
     }
 }
 
