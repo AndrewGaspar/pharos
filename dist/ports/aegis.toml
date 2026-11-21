@@ -1,0 +1,14 @@
+id = "aegis"
+name = "Aegis"
+version = "0.1.0-dev.1"
+kind = "mod"
+description = "DLSS Super Resolution, Frame Generation and stereoscopic rendering for Assassin's Creed Odyssey."
+save_compatible = true
+products = [5059]
+
+[launch.dll]
+d3d11 = "n,b"
+
+[launch.env]
+PROTON_ENABLE_NVAPI = "1"
+DXVK_ENABLE_NVAPI = "1"

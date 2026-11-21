@@ -1,5 +1,10 @@
-#include "core/d3d11_title.h"
-#define QUIVER_MOD_VERSION ::aco::title::sdk_name
+#ifdef PORT_NAME
+#define QUIVER_MOD_VERSION PORT_NAME
+static constexpr auto mod_id = PORT_NAME;
+#else
+#define QUIVER_MOD_VERSION "pharos"
+static constexpr auto mod_id = "aco-dlss";
+#endif
 #define QUIVER_MOD_IMPLEMENTATION
 #include "core/quiver_mod.h"
 
@@ -20,7 +25,7 @@ std::string g_layout;  // last layout said
 
 void quiver_init() {
   if (g_q) return;
-  g_q = quiver_open(title::mod_id, nullptr, 0);
+  g_q = quiver_open(mod_id, nullptr, 0);
   if (!g_q) return;
   std::thread([] {
     for (int i = 0; i < 120; i++) {

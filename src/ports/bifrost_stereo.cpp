@@ -1,6 +1,10 @@
 #include "ports/bifrost_dual.h"
 #include "ports/bifrost_stereo.h"
+#include "ports/bifrost_wide.h"
+#include "ports/bifrost_present.h"
 #include <d3dcompiler.h>
+#include <cmath>
+#include <cwchar>
 #include "ports/bifrost_scene.h"
 #include "ports/common.h"
 #include "core/hook.h"
@@ -15,13 +19,22 @@ constexpr char hlsl[] = R"(
 Texture2D<float4> leftEye:register(t0);
 Texture2D<float4> rightEye:register(t1);
 SamplerState linearClamp:register(s0);
+cbuffer Display:register(b0) { uint show; uint swap; float differenceGain; }
 struct Coord {float4 position:SV_Position; float2 uv:TEXCOORD0;};
 Coord vs(uint id:SV_VertexID) {
  Coord o; o.uv=float2((id<<1)&2,id&2);o.position=float4(o.uv*float2(2,-2)+float2(-1,1),0,1);return o;
 }
 float4 ps(Coord v):SV_Target{
+ if (show == 1) return leftEye.SampleLevel(linearClamp,v.uv,0);
+ if (show == 2) return rightEye.SampleLevel(linearClamp,v.uv,0);
+ if (show == 3) {
+   float3 l=leftEye.SampleLevel(linearClamp,v.uv,0).rgb;
+   float3 r=rightEye.SampleLevel(linearClamp,v.uv,0).rgb;
+   return float4(saturate(abs(l-r)*differenceGain),1);
+ }
  float2 uv=float2(frac(v.uv.x*2),v.uv.y);
- return v.uv.x<.5 ? leftEye.SampleLevel(linearClamp,uv,0) : rightEye.SampleLevel(linearClamp,uv,0);
+ bool left=(v.uv.x<.5) != (swap!=0);
+ return left ? leftEye.SampleLevel(linearClamp,uv,0) : rightEye.SampleLevel(linearClamp,uv,0);
 }
 )";
 ComPtr<ID3DBlob> compile(const char* fn, const char* target) {
@@ -60,10 +73,13 @@ bool StereoOutput::open(ID3D12Device* dev, const D3D12_RESOURCE_DESC& d) {
   }
   if (!root) {
     D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0};
-    D3D12_ROOT_PARAMETER param{};
-    param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    param.DescriptorTable = {1, &range};
-    param.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_ROOT_PARAMETER params[2]{};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[0].DescriptorTable = {1, &range};
+    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[1].Constants = {0, 0, 3};
+    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     D3D12_STATIC_SAMPLER_DESC sampler{};
     sampler.Filter = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
     sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
@@ -71,7 +87,7 @@ bool StereoOutput::open(ID3D12Device* dev, const D3D12_RESOURCE_DESC& d) {
     sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
     sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     sampler.MaxAnisotropy = 1;
-    D3D12_ROOT_SIGNATURE_DESC signature{1, &param, 1, &sampler, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    D3D12_ROOT_SIGNATURE_DESC signature{2, params, 1, &sampler, D3D12_ROOT_SIGNATURE_FLAG_NONE};
     static auto encode = reinterpret_cast<decltype(&D3D12SerializeRootSignature)>(
         GetProcAddress(port::system_library(L"d3d12.dll"), "D3D12SerializeRootSignature"));
     ComPtr<ID3DBlob> code;
@@ -114,7 +130,7 @@ bool StereoOutput::open(ID3D12Device* dev, const D3D12_RESOURCE_DESC& d) {
   width = UINT(d.Width);
   height = d.Height;
   format = d.Format;
-  ACO_LOG("Bifrost: opened two %ux%u native eye images and half-SBS output", width, height);
+  ACO_LOG("Bifrost: opened two %ux%u native eye images", width, height);
   return true;
 }
 bool StereoOutput::present(IDXGISwapChain* chain, ID3D12CommandQueue* queue, int eye, UINT64 synchronized_target) {
@@ -135,7 +151,11 @@ bool StereoOutput::present(IDXGISwapChain* chain, ID3D12CommandQueue* queue, int
   auto* cl = s.list.Get();
   auto handle = rtv->GetCPUDescriptorHandleForHeapStart();
   handle.ptr += slot * stride;
-  dev->CreateRenderTargetView(bb.Get(), nullptr, handle);
+  auto target = wide::physical(chain, sc->GetCurrentBackBufferIndex());
+  if (!target) { cl->Close(); return false; }
+  const UINT packed_width = UINT(target->GetDesc().Width);
+  const bool full_width = target.Get() != bb.Get();
+  dev->CreateRenderTargetView(target.Get(), nullptr, handle);
   transition(cl, bb.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
   auto* right = synchronized_target ? dual::other(bb.Get()) : bb.Get();
   const bool both = right != bb.Get() && reinterpret_cast<UINT64>(right) == synchronized_target;
@@ -153,24 +173,40 @@ bool StereoOutput::present(IDXGISwapChain* chain, ID3D12CommandQueue* queue, int
     valid = 3;
   }
   if (eye >= 0) valid |= 1u << eye;
-  transition(cl, bb.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+  if (full_width) transition(cl, bb.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT);
+  transition(cl, target.Get(), full_width ? D3D12_RESOURCE_STATE_PRESENT : D3D12_RESOURCE_STATE_COPY_SOURCE,
+             D3D12_RESOURCE_STATE_RENDER_TARGET);
   cl->SetGraphicsRootSignature(root.Get());
   auto* heap = srv.Get();
   cl->SetDescriptorHeaps(1, &heap);
   cl->SetGraphicsRootDescriptorTable(0, srv->GetGPUDescriptorHandleForHeapStart());
+  auto now = GetTickCount64();
+  if (now >= next_settings) {
+    auto mode = option_text(L"stereo", L"show", L"sbs");
+    show = mode == L"left" ? 1u : mode == L"right" ? 2u : mode == L"diff" ? 3u : 0u;
+    swap = option(L"stereo", L"swap", 0) != 0;
+    auto gain = option_text(L"stereo", L"diff_gain", L"16");
+    wchar_t* end{};
+    float value = std::wcstof(gain.c_str(), &end);
+    difference_gain = end != gain.c_str() && !*end && std::isfinite(value) && value >= 0 ? value : 16;
+    next_settings = now + 1000;
+  }
+  struct { UINT show, swap; float gain; } display{show, swap, difference_gain};
+  cl->SetGraphicsRoot32BitConstants(1, 3, &display, 0);
   cl->OMSetRenderTargets(1, &handle, FALSE, nullptr);
-  D3D12_VIEWPORT vp{0, 0, float(width), float(height), 0, 1};
-  D3D12_RECT rect{0, 0, LONG(width), LONG(height)};
+  D3D12_VIEWPORT vp{0, 0, float(packed_width), float(height), 0, 1};
+  D3D12_RECT rect{0, 0, LONG(packed_width), LONG(height)};
   cl->RSSetViewports(1, &vp);
   cl->RSSetScissorRects(1, &rect);
   cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
   cl->DrawInstanced(3, 1, 0, 0);
-  transition(cl, bb.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+  transition(cl, target.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
   if (FAILED(cl->Close())) return false;
   ID3D12CommandList* batch[]{cl};
   aco::orig<void WINAPI(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*)>(queue, port::execute)(queue, 1, batch);
   if (FAILED(queue->Signal(fence.Get(), last + 1))) return false;
   s.done = ++last;
+  if (last == 1) ACO_LOG("Bifrost: %ux%u eyes packed into %ux%u swapchain", width, height, packed_width, height);
   if (valid == 3 && ++pairs % 300 == 0)
     ACO_LOG("Bifrost: packed %s stereo frame #%u", both ? "synchronized" : "alternating", pairs);
   return true;

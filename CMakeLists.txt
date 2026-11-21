@@ -34,6 +34,7 @@ set(D3D11_RENDER_SOURCES
   src/stereo/camera.cpp
   src/stereo/marker_history.cpp
   src/stereo/markers.cpp
+  src/stereo/system_cursor.cpp
   src/stereo/cursor.cpp
   src/stereo/temporal.cpp
   src/core/hyprland.cpp
@@ -88,4 +89,27 @@ target_compile_definitions(aegis PRIVATE AEGIS_ODYSSEY PORT_NAME="aegis" PORT_EX
 set_target_properties(aegis PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/ports/aegis"
   ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/ports/aegis/lib")
 add_anvil_port(aegis-probe ACOdyssey d3d11 src/ports/aegis.cpp src/ports/aegis_sr.cpp src/core/d3d11_forward.cpp src/core/vtidx.cpp src/d3d11.def)
-add_anvil_port(bifrost ACValhalla d3d12 src/fg/camera.cpp src/core/vtidx.cpp src/ports/bifrost_camera.cpp src/ports/bifrost_lists.cpp src/ports/bifrost_dual.cpp src/ports/bifrost_eye.cpp src/ports/bifrost_stereo.cpp src/ports/bifrost_replay.cpp src/ports/bifrost_composite.cpp src/ports/bifrost_sr.cpp src/ports/bifrost_verify.cpp src/ports/bifrost_present.cpp src/ports/bifrost_scene.cpp src/ports/bifrost.cpp src/ports/bifrost_resources.cpp src/ports/bifrost_uploads.cpp src/ports/bifrost_slots.cpp src/ports/bifrost.def)
+add_anvil_port(bifrost ACValhalla d3d12
+  src/core/quiver.cpp
+  src/core/hyprland.cpp
+  src/ports/bifrost_wide.cpp
+  src/fg/camera.cpp
+  src/core/vtidx.cpp
+  src/ports/bifrost_camera.cpp
+  src/ports/bifrost_rate.cpp
+  src/ports/bifrost_lists.cpp
+  src/ports/bifrost_dual.cpp
+  src/ports/bifrost_eye.cpp
+  src/ports/bifrost_stereo.cpp
+  src/ports/bifrost_replay.cpp
+  src/ports/bifrost_composite.cpp
+  src/ports/bifrost_sr.cpp
+  src/ports/bifrost_verify.cpp
+  src/ports/bifrost_present.cpp
+  src/ports/bifrost_scene.cpp
+  src/ports/bifrost.cpp
+  src/ports/bifrost_resources.cpp
+  src/ports/bifrost_uploads.cpp
+  src/ports/bifrost_slots.cpp
+  src/ports/bifrost.def)
+target_link_libraries(bifrost PRIVATE ws2_32)

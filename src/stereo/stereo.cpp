@@ -435,6 +435,7 @@ void stereo_on_present(IDXGISwapChain* sc, PFN_GetBuffer real_get_buffer) {
     S.imm->CopyResource(S.eye[0], bb);
     const bool right_reference = cam_right_aim();
     if (!right_reference) marker_history_filter(S.imm1, S.own_state);
+    cursor_save_left(S.imm);
     tmp_before_right(S.imm);
     double t_copy = now_ms();
     g_eye.store(1, std::memory_order_relaxed);

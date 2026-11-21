@@ -1,0 +1,129 @@
+format = 1
+surface = "@id@"
+title = "@name@"
+
+[file.ini]
+path = "@id@.ini"
+format = "ini"
+owner = "quiver"
+reload = "poll"
+
+[[page]]
+id = "rendering"
+title = "DLSS"
+options = ["upscaler.enabled", "upscaler.toggle_key", "fg.enabled", "fg.toggle_key", "fg.count", "fg.count_min", "fg.count_max", "fg.target_hz", "fg.hudless"]
+
+[[page]]
+id = "stereo"
+title = "Stereo 3D"
+options = ["stereo.mode", "stereo.output", "stereo.separation", "stereo.convergence", "stereo.swap", "stereo.show"]
+
+[option."upscaler.enabled"]
+type = "bool"
+label = "DLSS Super Resolution"
+apply = "live"
+
+[option."upscaler.toggle_key"]
+type = "key"
+format = "vk-name"
+allowed = "F1-F24"
+none = "none"
+label = "Switch DLSS on or off"
+apply = "live"
+
+[option."fg.enabled"]
+type = "bool"
+label = "DLSS Frame Generation"
+help = "Generates intermediate frames during monoscopic play."
+apply = "live"
+
+[option."fg.toggle_key"]
+type = "key"
+format = "vk-name"
+allowed = "F1-F24"
+none = "none"
+label = "Switch frame generation on or off"
+apply = "live"
+
+[option."fg.count"]
+type = "enum"
+label = "Display multiplier"
+values = [{value="2", label="2×"}, {value="3", label="3×"}, {value="4", label="4×"}, {value="5", label="5×"}, {value="6", label="6×"}, {value="auto", label="Automatic"}]
+help = "The driver limits the available multipliers. Automatic adjusts to the frame rate."
+apply = "live"
+
+[option."fg.count_min"]
+type = "int"
+label = "Minimum automatic multiplier"
+min = 2
+max = 6
+when = { "fg.count" = "auto" }
+apply = "live"
+
+[option."fg.count_max"]
+type = "int"
+label = "Maximum automatic multiplier"
+min = 2
+max = 6
+when = { "fg.count" = "auto" }
+apply = "live"
+
+[option."fg.target_hz"]
+type = "int"
+label = "Target presentation rate"
+unit = "Hz"
+min = 30
+max = 1000
+special = [{value = 0, label = "Display refresh rate"}]
+apply = "live"
+
+[option."fg.hudless"]
+type = "bool"
+label = "Supply the scene before HUD composition"
+help = "Gives DLSS-G a separate scene image when available."
+apply = "live"
+
+[option."stereo.mode"]
+type = "enum"
+label = "Stereo rendering"
+values = [{value="off", label="Off"}, {value="auto", label="Detect stereo display"}, {value="sbs", label="On"}]
+help = "Renders a pair of eyes per game frame. Stereo and frame generation use separate presentation modes."
+apply = "restart"
+
+[option."stereo.output"]
+type = "enum"
+label = "Side-by-side packing"
+values = [{value="auto", label="Automatic"}, {value="hsbs", label="Half width"}, {value="sbs", label="Full width"}]
+apply = "restart"
+
+[option."stereo.separation"]
+type = "float"
+label = "Distance from camera centre to each eye"
+unit = "mm"
+min = 0
+max = 100
+step = 0.5
+precision = 1
+apply = "live"
+
+[option."stereo.convergence"]
+type = "float"
+label = "Distance to the screen plane"
+unit = "m"
+min = 0
+max = 50
+step = 0.25
+precision = 2
+apply = "live"
+
+[option."stereo.swap"]
+type = "bool"
+label = "Swap left and right eyes"
+apply = "live"
+
+[option."stereo.show"]
+type = "enum"
+label = "Eye view"
+values = [{value="sbs", label="Side by side"}, {value="left", label="Left eye"}, {value="right", label="Right eye"}, {value="diff", label="Difference"}]
+level = "debug"
+apply = "live"

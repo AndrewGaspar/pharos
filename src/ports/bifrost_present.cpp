@@ -12,10 +12,15 @@
 #include <mutex>
 
 #include "core/hook.h"
+#include "core/function_key.h"
+#include "core/hyprland.h"
+#include "core/quiver.h"
+#include "ports/bifrost_wide.h"
 #include "core/vtidx.h"
 #include "dlss/ngx.h"
 #include "fg/camera.h"
 #include "ports/bifrost_scene.h"
+#include "ports/bifrost_rate.h"
 #include "ports/bifrost_replay.h"
 #include "ports/bifrost_eye.h"
 #include "ports/bifrost_dual.h"
@@ -76,12 +81,32 @@ Fn ngx_proc(const char* name) {
   return dll ? reinterpret_cast<Fn>(GetProcAddress(dll, name)) : nullptr;
 }
 
+// Reloads change the effective switch only when its configured value changes.
+struct Toggle {
+  bool value{}, configured{}, down{};
+  int key{};
+  void read(const wchar_t* section, const wchar_t* default_key, bool initial) {
+    bool next = option(section, L"enabled", 1) != 0;
+    if (initial || configured != next) value = next;
+    configured = next;
+    auto name = option_text(section, L"toggle_key", default_key);
+    key = aco::function_key(std::wstring_view(name));
+  }
+  void poll() {
+    bool pressed = key && (GetAsyncKeyState(key) & 0x8000);
+    if (pressed && !down) value = !value;
+    down = pressed;
+  }
+};
+
 // Owned by the swapchain. Holding its queue and device does not keep the
 // swapchain alive.
 class Session final : public IUnknown {
  public:
   explicit Session(ID3D12CommandQueue* q) : queue(q) {
-    fg_enabled = !eye::enabled() && option(L"fg", L"enabled", 1);
+    fg_switch.read(L"fg", L"F9", true);
+    sr_switch.read(L"upscaler", L"F10", true);
+    enable_sr(q, sr_switch.value);
     hudless = option(L"fg", L"hudless", 1) && !option(L"upscaler", L"compare", 0);
     verify = GetPrivateProfileIntW(L"fg", L"verify", 0, ini_file().c_str()) != 0;
   }
@@ -107,7 +132,7 @@ class Session final : public IUnknown {
     if (SUCCEEDED(hr)) {
       DXGI_SWAP_CHAIN_DESC d{};
       ComPtr<ID3D12Device> dev;
-      if (option(L"upscaler", L"enabled", 1) && SUCCEEDED(chain->GetDesc(&d)) &&
+      if (SUCCEEDED(chain->GetDesc(&d)) &&
           SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(&dev))))
         display_size(dev.Get(), d.BufferDesc.Width, d.BufferDesc.Height);
       reset_history = true;
@@ -127,7 +152,8 @@ class Session final : public IUnknown {
     if (flags & (DXGI_PRESENT_TEST | DXGI_PRESENT_DO_NOT_WAIT | DXGI_PRESENT_RESTART)) return flip();
     replay::present();
     finish_sr_frame(queue.Get());
-    if (!fg_enabled && !eye::alternating() && !dual::enabled()) return flip();
+    controls();
+    if ((!fg_switch.value || eye::enabled()) && !eye::alternating() && !dual::enabled()) return flip();
     Scene scene;
     Pair pair{};
     {
@@ -156,6 +182,7 @@ class Session final : public IUnknown {
     }
     if (!scene.info.serial || scene.info.serial == seen || !scene.motion || !scene.depth) {
       reset_history = true;
+      rate.cancel();
       return flip();
     }
     seen = scene.info.serial;
@@ -221,6 +248,8 @@ class Session final : public IUnknown {
     p.set(NVSDK_NGX_DLSSG_Parameter_InputBackbufferSubrectHeight, wanted.height);
     p.set(NVSDK_NGX_DLSSG_Parameter_OutputInterpolatedSubrectWidth, wanted.width);
     p.set(NVSDK_NGX_DLSSG_Parameter_OutputInterpolatedSubrectHeight, wanted.height);
+    rate.frame(period);
+    const UINT generated_count = rate.count() - 1;
     p.set(NVSDK_NGX_DLSSG_Parameter_MultiFrameCount, generated_count);
     const bool insert = !reset_history;
     bool flipped = false;
@@ -272,10 +301,42 @@ class Session final : public IUnknown {
 
  private:
   using Clock = std::chrono::steady_clock;
+  void controls() {
+    const bool old_fg = fg_switch.value, old_sr = sr_switch.value;
+    auto now = GetTickCount64();
+    if (now >= next_poll) {
+      next_poll = now + 1000;
+      fg_switch.read(L"fg", L"F9", false);
+      sr_switch.read(L"upscaler", L"F10", false);
+      UINT target = option(L"fg", L"target_hz", 0);
+      if (!target) target = option(L"fg", L"present_hz", 0);
+      if (target != target_hz) {
+        target_hz = target;
+        refresh_checked = false;
+        next_flip = {};
+        period = {};
+        rate.cancel();
+      }
+      hudless = option(L"fg", L"hudless", 1) && !option(L"upscaler", L"compare", 0);
+      if (driver_limit) configure_rate();
+    }
+    if (!eye::enabled()) fg_switch.poll();
+    sr_switch.poll();
+    if (sr_switch.value != old_sr) {
+      enable_sr(queue.Get(), sr_switch.value);
+      ACO_LOG("Bifrost: super resolution %s", sr_switch.value ? "on" : "off");
+    }
+    if (fg_switch.value != old_fg) {
+      rate.cancel();
+      next_flip = {};
+      ACO_LOG("Bifrost: frame generation %s", fg_switch.value ? "on" : "off");
+    }
+    if (fg_switch.value != old_fg || sr_switch.value != old_sr) reset_history = true;
+  }
   void pace(IDXGISwapChain* chain) {
     if (!refresh_checked) {
       refresh_checked = true;
-      UINT hz = GetPrivateProfileIntW(L"fg", L"present_hz", 0, ini_file().c_str());
+      UINT hz = target_hz;
       if (!hz) {
         ComPtr<IDXGIOutput> output;
         DXGI_OUTPUT_DESC output_desc{};
@@ -290,8 +351,12 @@ class Session final : public IUnknown {
     }
     if (!period.count()) return;
     auto now = Clock::now();
-    if (next_flip > now) std::this_thread::sleep_until(next_flip);
-    now = Clock::now();
+    if (next_flip > now) {
+      const auto before = now;
+      std::this_thread::sleep_until(next_flip);
+      now = Clock::now();
+      rate.slept(now - before);
+    }
     next_flip = (now > next_flip + period ? now : next_flip) + period;
   }
   void prepare(const FeatureDesc& wanted) {
@@ -325,7 +390,7 @@ class Session final : public IUnknown {
     p.set(NVSDK_NGX_DLSSG_Parameter_InternalWidth, wanted.render_width);
     p.set(NVSDK_NGX_DLSSG_Parameter_InternalHeight, wanted.render_height);
     p.set(NVSDK_NGX_DLSSG_Parameter_BackbufferFormat, UINT(wanted.format));
-    p.set(NVSDK_NGX_DLSSG_Parameter_MultiFrameCount, generated_count);
+    p.set(NVSDK_NGX_DLSSG_Parameter_MultiFrameCount, rate.capacity() - 1);
     p.set(NVSDK_NGX_DLSSG_Parameter_DynamicResolution, 0u);
     const auto result = create(list.Get(), NVSDK_NGX_Feature_FrameGeneration, p.get(), &feature);
     const auto closed = list->Close();
@@ -373,9 +438,20 @@ class Session final : public IUnknown {
       ngx::Params(limits).get(NVSDK_NGX_DLSSG_Parameter_MultiFrameCountMax, &maximum);
       destroy(limits);
     }
-    UINT requested = GetPrivateProfileIntW(L"fg", L"count", 2, ini_file().c_str());
-    generated_count = std::clamp(requested, 2u, std::clamp(maximum, 1u, 5u) + 1) - 1;
+    driver_limit = std::clamp(maximum, 1u, 5u) + 1;
+    configure_rate();
     return NVSDK_NGX_SUCCEED(alloc(&raw_params)) && raw_params;
+  }
+  void configure_rate() {
+    bool automatic = option_text(L"fg", L"count", L"2") == L"auto";
+    UINT high = std::clamp(automatic ? option(L"fg", L"count_max", 4) : option(L"fg", L"count", 2), 2u, driver_limit);
+    UINT low = automatic ? std::clamp(option(L"fg", L"count_min", 2), 2u, high) : high;
+    if (low == configured_low && high == rate.capacity()) return;
+    if (feature && high != rate.capacity()) last = {};
+    reset_history = true;
+    configured_low = low;
+    rate.configure(low, high);
+    ACO_LOG("Bifrost: FG multiplier range %u..%u, driver maximum %u", low, high, driver_limit);
   }
   bool begin() {
     current = (current + 1) % slots.size();
@@ -416,8 +492,11 @@ class Session final : public IUnknown {
                                void*){};
   StereoOutput stereo;
   VerifyFrames verifier;
-  UINT generated_count = 1;
-  bool fg_enabled{}, verify{}, hudless{};
+  FrameRate rate;
+  UINT target_hz{}, driver_limit{}, configured_low{};
+  Toggle fg_switch, sr_switch;
+  ULONGLONG next_poll{};
+  bool verify{}, hudless{};
   bool refresh_checked{};
   std::chrono::nanoseconds period{};
   Clock::time_point next_flip{};
@@ -576,12 +655,14 @@ HRESULT on_resize(IDXGISwapChain* chain, Fn&& fn) {
   return hr;
 }
 HRESULT WINAPI resize(IDXGISwapChain* chain, UINT count, UINT w, UINT h, DXGI_FORMAT format, UINT flags) {
+  if (!in_resize) w = wide::resize_width(chain, w);
   return on_resize(chain, [&] {
     return orig<decltype(resize)>(chain, vt::SwapChain_ResizeBuffers)(chain, count, w, h, format, flags);
   });
 }
 HRESULT WINAPI resize1(IDXGISwapChain3* chain, UINT count, UINT w, UINT h, DXGI_FORMAT format, UINT flags,
                        const UINT* masks, IUnknown* const* queues) {
+  if (!in_resize) w = wide::resize_width(chain, w);
   return on_resize(chain, [&] {
     return orig<decltype(resize1)>(chain, port::resize1)(chain, count, w, h, format, flags, masks, queues);
   });
@@ -592,7 +673,7 @@ void attach(IUnknown* creator, IDXGISwapChain* chain) {
       queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT)
     return;
   DXGI_SWAP_CHAIN_DESC desc{};
-  if (option(L"upscaler", L"enabled", 1) && SUCCEEDED(chain->GetDesc(&desc)))
+  if (SUCCEEDED(chain->GetDesc(&desc)))
     attach_sr(queue.Get(), desc.BufferDesc.Width, desc.BufferDesc.Height);
   dual::backbuffers(chain, queue.Get());
   auto* session = new Session(queue.Get());
@@ -616,17 +697,49 @@ void attach(IUnknown* creator, IDXGISwapChain* chain) {
   }
   ACO_LOG("Bifrost: attached to the D3D12 swapchain and its graphics queue");
 }
-HRESULT WINAPI swap(IDXGIFactory* f, IUnknown* device, DXGI_SWAP_CHAIN_DESC* desc, IDXGISwapChain** out) {
-  auto hr = orig<decltype(swap)>(f, vt::Factory_CreateSwapChain)(f, device, desc, out);
-  if (SUCCEEDED(hr) && out) attach(device, *out);
+thread_local bool creating_swapchain{};
+// DXGI may implement the older factory method through the newer one.
+template<class Desc, class Chain, class Create>
+HRESULT create_chain(IUnknown* device, HWND hwnd, Desc* d, UINT* w, Chain** out, Create create) {
+  if (creating_swapchain || !d || !out) return create(d);
+  creating_swapchain = true;
+  UINT wide_width = wide::requested() ? wide::width(hwnd, *w) : 0;
+  HRESULT hr = E_FAIL;
+  if (wide_width) {
+    auto old = *w;
+    *w = wide_width;
+    hr = create(d);
+    *w = old;
+  }
+  bool full = SUCCEEDED(hr);
+  if (!full) hr = create(d);
+  creating_swapchain = false;
+  if (SUCCEEDED(hr) && *out) {
+    if (full) wide::attach(*out, hwnd);
+    attach(device, *out);
+    if (dual::enabled() || eye::alternating()) {
+      static std::once_flag sdk;
+      std::call_once(sdk, quiver_init);
+      quiver_stereo_layout(full ? "sbs" : "hsbs");
+      hypr_set_window_tag(full ? "stereo-sbs" : "stereo-hsbs");
+    }
+  }
   return hr;
+}
+HRESULT WINAPI swap(IDXGIFactory* f, IUnknown* device, DXGI_SWAP_CHAIN_DESC* desc, IDXGISwapChain** out) {
+  auto fn = orig<decltype(swap)>(f, vt::Factory_CreateSwapChain);
+  if (!desc) return fn(f, device, desc, out);
+  auto local = *desc;
+  return create_chain(device, local.OutputWindow, &local, &local.BufferDesc.Width, out,
+                      [&](auto* d) { return fn(f, device, d, out); });
 }
 HRESULT WINAPI swap_hwnd(IDXGIFactory2* f, IUnknown* device, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc,
                          const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fs, IDXGIOutput* restrict_to, IDXGISwapChain1** out) {
-  auto hr =
-      orig<decltype(swap_hwnd)>(f, vt::Factory2_CreateSwapChainForHwnd)(f, device, hwnd, desc, fs, restrict_to, out);
-  if (SUCCEEDED(hr) && out) attach(device, *out);
-  return hr;
+  auto fn = orig<decltype(swap_hwnd)>(f, vt::Factory2_CreateSwapChainForHwnd);
+  if (!desc) return fn(f, device, hwnd, desc, fs, restrict_to, out);
+  auto local = *desc;
+  return create_chain(device, hwnd, &local, &local.Width, out,
+                      [&](auto* d) { return fn(f, device, hwnd, d, fs, restrict_to, out); });
 }
 }  // namespace
 UINT option(const wchar_t* section, const wchar_t* key, UINT fallback) {

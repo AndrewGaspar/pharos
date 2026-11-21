@@ -1,0 +1,14 @@
+id = "bifrost"
+name = "Bifrost"
+version = "0.1.0-dev.1"
+kind = "mod"
+description = "Native D3D12 DLSS Super Resolution, Frame Generation and stereoscopic rendering for Assassin's Creed Valhalla."
+save_compatible = true
+products = [13504]
+
+[launch.dll]
+d3d12 = "n,b"
+
+[launch.env]
+PROTON_ENABLE_NVAPI = "1"
+VKD3D_CONFIG = "descriptor_heap"

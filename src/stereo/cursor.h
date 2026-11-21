@@ -22,6 +22,7 @@ bool cursor_ready(ID3D11Device* dev);
 // Only the indexed indirect UI batch contains the cursor.
 enum class CursorDraw { Game, Hide, Capture };
 CursorDraw cursor_prepare(ID3D11DeviceContext* ctx, ID3D11Buffer* args, UINT off);
+void cursor_save_left(ID3D11DeviceContext* imm);
 void cursor_restore(ID3D11DeviceContext* ctx);
 // Per frame, before drawing: read the OS cursor, sample last frame's depth, issue this frame's.
 void cursor_begin_frame(ID3D11DeviceContext* imm, IDXGISwapChain* sc, unsigned w, unsigned h);

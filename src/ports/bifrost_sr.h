@@ -5,6 +5,7 @@
 namespace bifrost {
 struct Scene;
 void attach_sr(ID3D12CommandQueue* queue, UINT width, UINT height);
+void enable_sr(ID3D12CommandQueue* queue, bool enabled);
 void display_size(ID3D12Device* device, UINT width, UINT height);
 void prepare_output(ID3D12Resource* native, Scene& scene);
 Microsoft::WRL::ComPtr<ID3D12Resource> output_for(ID3D12Resource* native);

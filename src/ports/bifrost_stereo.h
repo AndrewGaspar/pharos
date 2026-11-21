@@ -31,6 +31,9 @@ class StereoOutput {
   DXGI_FORMAT format{};
   UINT64 last{};
   unsigned valid{}, pairs{};
+  UINT show{}, swap{};
+  float difference_gain = 16;
+  ULONGLONG next_settings{};
   bool open(ID3D12Device* dev, const D3D12_RESOURCE_DESC& desc);
 };
 }  // namespace bifrost

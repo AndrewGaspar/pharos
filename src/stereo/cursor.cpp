@@ -11,19 +11,21 @@
 #include <wrl/client.h>
 
 #include "core/config.h"
+#include "core/d3d11_title.h"
 #include "core/log.h"
 #include "core/shaders.h"
 #include "dlss/kernels.h"
 #include "dlss/upscaler.h"
 #include "stereo/camera.h"
+#include "stereo/system_cursor.h"
 
 namespace aco {
 
 namespace {
 
-// The map arrow's shaders (DXBC checksum hashes; ACOrigins v1.62). See cursor.h.
-constexpr unsigned long long kCursorVS = 0x12b61097a3a0b0e7ULL;
-constexpr unsigned long long kCursorPS = 0x068233d2886bf2c8ULL;
+// The interactive sprites use different shaders in each game.
+constexpr unsigned long long kCursorVS = title::origins ? 0x12b61097a3a0b0e7ULL : 0x76b57ce1598793e5ULL;
+constexpr unsigned long long kCursorPS = title::origins ? 0x068233d2886bf2c8ULL : 0x97091288f72ad57cULL;
 
 const char kCursorHlsl[] = R"(
 cbuffer P : register(b0) { float2 Centre; float Radius; float Pad; uint2 Origin; uint2 Size; }
@@ -74,7 +76,13 @@ bool pair_bound(ID3D11DeviceContext* ctx) {
   ID3D11PixelShader* ps = nullptr;
   ctx->VSGetShader(&vs, nullptr, nullptr);
   ctx->PSGetShader(&ps, nullptr, nullptr);
-  bool hit = vs && ps && shader_hash(vs) == kCursorVS && shader_hash(ps) == kCursorPS;
+  const auto vertex = vs ? shader_hash(vs) : 0;
+  const auto pixel = ps ? shader_hash(ps) : 0;
+  if constexpr (!title::origins) {
+    // Odyssey's main-menu background. Its buttons and pointer share the HUD plane.
+    if (vertex == 0x275b56c336f2b40bULL && pixel == 0xafc3de8b425b3010ULL) cursor_note_flat_menu();
+  }
+  bool hit = vertex == kCursorVS && pixel == kCursorPS;
   if (vs) vs->Release();
   if (ps) ps->Release();
   return hit;
@@ -98,7 +106,7 @@ Batch classify(ID3D11DeviceContext* ctx, ID3D11Buffer* args, UINT off) {
   static thread_local Sequence prev;
   ComPtr<ID3D11ShaderResourceView> pages[2];
   ID3D11ShaderResourceView* raw[2]{};
-  ctx->PSGetShaderResources(70, 2, raw);
+  ctx->PSGetShaderResources(title::origins ? 70 : 69, 2, raw);
   D3D11_TEXTURE2D_DESC d[2]{};
   for (int i = 0; i < 2; ++i) {
     pages[i].Attach(raw[i]);
@@ -112,6 +120,12 @@ Batch classify(ID3D11DeviceContext* ctx, ID3D11Buffer* args, UINT off) {
   auto page = [&](int i, UINT size, DXGI_FORMAT fmt) {
     return d[i].Width == size && d[i].Height == size && d[i].Format == fmt;
   };
+  if constexpr (!title::origins) {
+    // In Odyssey's pad map pass the first sprite is the animated pointer.
+    // The 256x256 BC4 sprite in the world pass is a map location instead.
+    return off == 0 && page(0, 4, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) &&
+           page(1, 256, DXGI_FORMAT_BC7_UNORM) ? Batch::PadDot : Batch::Other;
+  }
   bool next = prev.ctx == ctx && prev.args == args && off == prev.off + 20;
   Batch result = Batch::Other;
   if (page(0, 64, DXGI_FORMAT_BC3_UNORM) && page(1, 512, DXGI_FORMAT_BC4_UNORM)) result = Batch::Mouse;
@@ -152,6 +166,7 @@ struct State {
   ID3D11Buffer* cb = nullptr;
   ID3D11GeometryShader* pad_gs = nullptr;
   ID3D11Buffer* pad_point = nullptr;
+  ID3D11Buffer* pad_left = nullptr;
   ID3D11Buffer* pad_stage[3] = {};
   unsigned pad_slot = 0;
   bool pad_valid = false;
@@ -199,11 +214,16 @@ bool ensure_objects(ID3D11Device* dev) {
   bd.ByteWidth = 16;  // one point for each triangle in the centre-dot quad
   bd.BindFlags = D3D11_BIND_STREAM_OUTPUT;
   dev->CreateBuffer(&bd, nullptr, &S.pad_point);
+  if constexpr (!title::origins) {
+    bd.BindFlags = 0;
+    dev->CreateBuffer(&bd, nullptr, &S.pad_left);
+    bd.ByteWidth *= 2;
+  }
   bd.Usage = D3D11_USAGE_STAGING;
   bd.BindFlags = 0;
   bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
   for (auto& stage : S.pad_stage) dev->CreateBuffer(&bd, nullptr, &stage);
-  if (!S.cs || !S.cb || !S.pad_point || !S.pad_gs || !S.pad_stage[0] || !S.pad_stage[1] || !S.pad_stage[2]) {
+  if ((!title::origins && !S.pad_left) || !S.cs || !S.cb || !S.pad_point || !S.pad_gs || !S.pad_stage[0] || !S.pad_stage[1] || !S.pad_stage[2]) {
     ACO_LOG("stereo: cursor objects failed (cs=%p cb=%p); cursor=depth off", static_cast<void*>(S.cs),
             static_cast<void*>(S.cb));
     S.failed = true;
@@ -310,6 +330,7 @@ void cursor_set_active(bool on) {
   if (g_on.exchange(on, std::memory_order_acq_rel) != on && on)
     ACO_LOG("stereo: cursor=depth on (game arrow hidden, substitute at scene depth)");
   if (!on) {
+    if constexpr (!title::origins) stereo_system_cursor(nullptr);
     g_flat_menu.store(false);
     S.visible = false;
     g_hidden.store(false, std::memory_order_relaxed);
@@ -335,6 +356,10 @@ CursorDraw cursor_prepare(ID3D11DeviceContext* ctx, ID3D11Buffer* args, UINT off
   bool occupied = false;
   for (auto* buf : bound) if (buf) { occupied = true; buf->Release(); }
   if (occupied) return CursorDraw::Game;
+  if constexpr (!title::origins) {
+    g_pad.store(true);
+    note_hidden();
+  }
   UINT offset = 0;
   ctx->GSSetShader(S.pad_gs, nullptr, 0);
   ctx->SOSetTargets(1, &S.pad_point, &offset);
@@ -346,16 +371,31 @@ void cursor_restore(ID3D11DeviceContext* ctx) {
   ctx->GSSetShader(nullptr, nullptr, 0);
 }
 
+void cursor_save_left(ID3D11DeviceContext* imm) {
+  if constexpr (!title::origins) {
+    if (g_pad.load() && S.pad_left) imm->CopyResource(S.pad_left, S.pad_point);
+  }
+}
+
 bool pad_position(ID3D11DeviceContext* imm, unsigned w, unsigned h, float out[2]) {
   unsigned slot = S.pad_slot;
-  imm->CopyResource(S.pad_stage[slot], S.pad_point);
+  if constexpr (title::origins) {
+    imm->CopyResource(S.pad_stage[slot], S.pad_point);
+  } else {
+    imm->CopySubresourceRegion(S.pad_stage[slot], 0, 0, 0, 0, S.pad_left, 0, nullptr);
+    imm->CopySubresourceRegion(S.pad_stage[slot], 0, 16, 0, 0, S.pad_point, 0, nullptr);
+  }
   S.pad_slot = (slot+1)%3;
   if (S.pad_samples < 2) { ++S.pad_samples; return false; }
   D3D11_MAPPED_SUBRESOURCE m{};
   if (SUCCEEDED(imm->Map(S.pad_stage[S.pad_slot], 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m))) {
     const float* xy = static_cast<const float*>(m.pData);
-    S.pad_xy[0] = (xy[0] + 1)*0.5f;
-    S.pad_xy[1] = (1 - xy[1])*0.5f;
+    // The map projects the native ring once per eye. Sample depth at its
+    // binocular midpoint before applying the terrain's own disparity.
+    float x = title::origins ? xy[0] : (xy[0] + xy[4]) * 0.5f;
+    float y = title::origins ? xy[1] : (xy[1] + xy[5]) * 0.5f;
+    S.pad_xy[0] = (x + 1)*0.5f;
+    S.pad_xy[1] = (1 - y)*0.5f;
     S.pad_valid = S.pad_xy[0] >= 0 && S.pad_xy[0] <= 1 && S.pad_xy[1] >= 0 && S.pad_xy[1] <= 1;
     imm->Unmap(S.pad_stage[S.pad_slot], 0);
   }
@@ -370,15 +410,21 @@ void cursor_begin_frame(ID3D11DeviceContext* imm, IDXGISwapChain* sc, unsigned w
   bool hidden = g_hidden.exchange(false, std::memory_order_relaxed);
   float pos[2] = {};
   bool pad = g_pad.exchange(false);
+  bool mouse = false;
+  if constexpr (!title::origins) {
+    bool inside = !pad && cursor_pos(sc, w, h, pos);
+    mouse = stereo_system_cursor(inside ? S.hwnd : nullptr);
+  }
   if (!pad) {
     S.pad_samples = 0;
     S.pad_valid = false;
   }
-  S.visible = hidden && (pad ? pad_position(imm, w, h, pos) : cursor_pos(sc, w, h, pos));
+  S.visible = mouse || (hidden && (pad ? pad_position(imm, w, h, pos) : cursor_pos(sc, w, h, pos)));
   if (!S.visible) return;
   if (flat_menu) {
     for (auto& centre : S.centre) { centre[0] = pos[0]; centre[1] = pos[1]; }
     S.pending[0] = S.pending[1] = false;
+    if (S.frames % 300 == 0) ACO_LOG("stereo: menu cursor at (%.0f, %.0f), screen depth", pos[0], pos[1]);
     return;
   }
   S.mono[0] = pos[0];

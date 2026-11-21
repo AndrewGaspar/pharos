@@ -23,7 +23,7 @@ constexpr GUID key(unsigned n) {
   return {0xa61c4df1, 0x4690, 0x4206, {0x83, 0x61, 0x36, 0x30, 0x4e, 0xc8, 0x10, BYTE(n)}};
 }
 constexpr GUID output_key = key(1), display_buffer_key = key(2), queue_key = key(3), display_key = key(4),
-               right_key = key(5);
+               right_key = key(5), enabled_key = key(6);
 constexpr auto read_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 struct Size {
   UINT width{}, height{};
@@ -139,6 +139,10 @@ class Upscaler final : public IUnknown {
               render.height, target.width, target.height, ngx::result_str(r), scene.info.jitter[0],
               scene.info.jitter[1], reset);
     return submitted && next && !reset_next;
+  }
+  void invalidate() {
+    std::lock_guard guard(lock);
+    reset_next = true;
   }
   void finish() {
     std::lock_guard guard(lock);
@@ -287,6 +291,16 @@ void display_size(ID3D12Device* dev, UINT width, UINT height) {
   Size s{width, height};
   dev->SetPrivateData(display_key, sizeof(s), &s);
 }
+void enable_sr(ID3D12CommandQueue* q, bool enabled) {
+  BOOL value = enabled;
+  q->SetPrivateData(enabled_key, sizeof(value), &value);
+  ComPtr<ID3D12Device> dev;
+  if (SUCCEEDED(q->GetDevice(IID_PPV_ARGS(&dev)))) dev->SetPrivateData(enabled_key, sizeof(value), &value);
+  for (const auto& tag : {queue_key, right_key}) {
+    auto sr = associated<IUnknown>(q, tag);
+    if (sr) static_cast<Upscaler*>(sr.Get())->invalidate();
+  }
+}
 void attach_sr(ID3D12CommandQueue* q, UINT width, UINT height) {
   ComPtr<ID3D12Device> dev;
   if (FAILED(q->GetDevice(IID_PPV_ARGS(&dev)))) return;
@@ -301,8 +315,11 @@ void prepare_output(ID3D12Resource* native, Scene& scene) {
   if (!native) return;
   ComPtr<ID3D12Device> dev;
   if (FAILED(native->GetDevice(IID_PPV_ARGS(&dev)))) return;
+  BOOL enabled = FALSE;
+  UINT n = sizeof(enabled);
+  if (FAILED(dev->GetPrivateData(enabled_key, &n, &enabled)) || !enabled) return;
   Size size{};
-  UINT n = sizeof(size);
+  n = sizeof(size);
   if (FAILED(dev->GetPrivateData(display_key, &n, &size)) || !size.width || !size.height) return;
   std::lock_guard guard(surfaces);
   auto output = output_for(native);
@@ -332,6 +349,9 @@ ComPtr<ID3D12Resource> display_buffer(ID3D12Resource* output) {
   return associated<ID3D12Resource>(output, display_buffer_key);
 }
 bool upscale(ID3D12CommandQueue* queue, const Scene& scene) {
+  BOOL enabled = FALSE;
+  UINT n = sizeof(enabled);
+  if (FAILED(queue->GetPrivateData(enabled_key, &n, &enabled)) || !enabled) return false;
   auto sr =
       associated<IUnknown>(queue, (eye::alternating() || dual::enabled()) && scene.info.eye ? right_key : queue_key);
   return sr && static_cast<Upscaler*>(sr.Get())->eval(scene);

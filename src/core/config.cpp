@@ -1,5 +1,6 @@
 #include "core/d3d11_title.h"
 #include "core/config.h"
+#include "core/function_key.h"
 
 #include <windows.h>
 
@@ -314,12 +315,6 @@ void config_toggle_upscaler() {
 
 int config_toggle_vk() { return config_key_vk(config().toggle_key); }
 
-int config_key_vk(const std::string& k) {
-  if (k.size() >= 2 && (k[0] == 'F' || k[0] == 'f')) {
-    int n = atoi(k.c_str() + 1);
-    if (n >= 1 && n <= 24) return VK_F1 + n - 1;
-  }
-  return 0;  // "none" or unknown: no hotkey
-}
+int config_key_vk(const std::string& k) { return function_key(std::string_view(k)); }
 
 } // namespace aco

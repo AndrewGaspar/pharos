@@ -7,6 +7,7 @@
 #include <mutex>
 
 #include "core/hook.h"
+#include "core/hyprland.h"
 #include "ports/bifrost_present.h"
 #include "ports/common.h"
 
@@ -95,7 +96,10 @@ void fail(const char* action, HRESULT hr) {
 }
 bool healthy() { return !failed.load(std::memory_order_relaxed); }
 bool enabled() {
-  static const bool active = option_text(L"stereo", L"mode", L"off") == L"sbs" || option(L"stereo", L"dual", 0);
+  static const bool active = [] {
+    auto mode = option_text(L"stereo", L"mode", L"off");
+    return mode == L"sbs" || (mode == L"auto" && aco::hypr_display_stereo_now() == 1) || option(L"stereo", L"dual", 0);
+  }();
   return active;
 }
 Internal::Internal() { ++inside; }

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Assemble a port and its per-install shader signatures for a disposable lab.
+# Assemble a lab overlay and its installable Quiver package.
 set -euo pipefail
 if [[ $# != 2 ]]; then echo "usage: $0 odyssey|odyssey-probe|valhalla GAME_INSTALL" >&2; exit 2; fi
 case $1 in
@@ -18,5 +18,13 @@ mkdir -p "$out"
 cp "$build/ports/$target/$proxy.dll" "$out/"
 sdk=$root/third_party/DLSS-310.9.16/lib/Windows_x86_64/rel
 cp "$sdk/nvngx_dlss.dll" "$sdk/nvngx_dlssg.dll" "$out/"
-if [[ $target == aegis || $target == bifrost ]]; then cp "$root/dist/$target.ini" "$out/"; fi
+if [[ $target == aegis || $target == bifrost ]]; then
+  cp "$root/dist/$target.ini" "$out/"
+  pkg=$build/ports/$target/package
+  mkdir -p "$pkg/files"
+  cp "$out/$proxy.dll" "$out/nvngx_dlss.dll" "$out/nvngx_dlssg.dll" "$out/$target.ini" "$out/shaders.tsv" "$pkg/files/"
+  cp "$root/dist/ports/$target.toml" "$pkg/quiver-mod.toml"
+  sed -e "s/@id@/$target/g" -e "s/@name@/${target^}/g" "$root/dist/ports/options.toml.in" > "$pkg/quiver-options.toml"
+  echo "$pkg"
+fi
 echo "$out"
