@@ -45,5 +45,11 @@ struct Pose {
   Quat q;  // Hamilton xyzw. Maps sensor coordinates (+right,+down,+forward) to world metres.
   Pose operator*(Pose b) const { return {p + q.rotate(b.p), q * b.q}; }
 };
+// Bound the rig-centre displacement when an animation snaps between poses.
+inline Vec limit_translation(Vec previous, Vec target, float max_step) {
+  Vec delta = target - previous;
+  float distance = std::sqrt(delta.dot(delta));
+  return distance > max_step ? previous + delta * (max_step / distance) : target;
+}
 using Anchor = bool (*)(Pose&);
 }  // namespace aco::rig

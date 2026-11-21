@@ -42,7 +42,8 @@ struct Session {
   unsigned hz = 0, count = 0, stride = 0, shutter = 0, paced = 0, tick = 0, warm = 8;
   Pose mount{};
   Quat previous{};
-  float turn_limit = 0;
+  Vec previous_position{};
+  float turn_limit = 0, speed_limit = 0;
   std::vector<Camera> cameras;
   std::vector<float> luminance;
   File output{nullptr, fclose};
@@ -84,8 +85,10 @@ bool configure() {
   if (!f || fscanf(f.get(), "%31s%63s%u%u%u%u%u%u%u", magic, name, &run.hz, &run.count, &run.stride, &run.shutter,
                    &run.paced, &views, &pixels) != 9)
     return false;
-  bool streamed = std::string(magic) == "PHAROS_RIG_RING_1";
-  if (!streamed && std::string(magic) != "PHAROS_RIG_1") return false;
+  const std::string protocol(magic);
+  bool bounded = protocol == "PHAROS_RIG_2" || protocol == "PHAROS_RIG_RING_2";
+  bool streamed = protocol == "PHAROS_RIG_RING_1" || protocol == "PHAROS_RIG_RING_2";
+  if (!bounded && !streamed && protocol != "PHAROS_RIG_1") return false;
   auto anchor = anchors.find(name);
   if (anchor == anchors.end() || !run.hz || run.hz > 2000 || !run.count || !run.stride || !run.shutter ||
       run.shutter > run.stride || !views || views > 32 || !pixels || pixels > 8000000 ||
@@ -101,6 +104,9 @@ bool configure() {
   }
   int limit = fscanf(f.get(), "%f", &run.turn_limit);
   if (limit == 0 || !(run.turn_limit >= 0 && run.turn_limit <= 36000)) return false;
+  if (bounded && (fscanf(f.get(), "%f", &run.speed_limit) != 1 || !std::isfinite(run.speed_limit) ||
+                  run.speed_limit < 0))
+    return false;
   File rays{_wfopen((run.dir + L"\\rays").c_str(), L"rb"), fclose};
   run.luminance.resize(pixels);
   for (unsigned i = 0; i < pixels; ++i) {
@@ -255,6 +261,9 @@ void capture(ID3D11DeviceContext* ctx, const std::function<void()>& replay, cons
     anchor.q = limit_turn(run.previous, anchor.q, run.turn_limit * 0.01745329252f / run.hz);
   run.previous = anchor.q;
   auto body = anchor * run.mount;
+  if (run.tick && run.speed_limit > 0)
+    body.p = limit_translation(run.previous_position, body.p, run.speed_limit / run.hz);
+  run.previous_position = body.p;
   if (!run.tick) run.start = Clock::now();
   bool image = run.tick % run.stride < run.shutter;
   if (image) {
