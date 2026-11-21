@@ -24,6 +24,12 @@ These commands assume Odyssey and Valhalla instances named `aegis` and `bifrost`
 
 Installed profiles use the port name for SR and frame generation and append `Stereo` for SR and stereo. For example, launch with `quiver play 5059 --profile "Aegis Stereo"` or `quiver play 13504 --profile "Bifrost Stereo"`.
 
+### Skip intro videos
+
+Each game has a separate Quiver fix for its startup logos and localized notices. Install it from the repository root with `quiver mods 5059 install dist/ports/odyssey-skip-intros` or `quiver mods 13504 install dist/ports/valhalla-skip-intros`. Add **Skip intro videos** to the profiles where you want it. Quiver hides the listed movies for that launch. Remove the fix from a profile to play the intros again.
+
+In English-language lab launches, Odyssey reached the first visible “Press any key” prompt in 58 seconds with the five startup movies and 22 seconds with them hidden (r27–28). Valhalla reached its prompt in 59 and 18 seconds respectively (r47–48, six movies). Both recipes cover the 17 installed localizations.
+
 ## Aegis • Odyssey
 
 The main Aegis build runs the Pharos D3D11 rendering path with Odyssey's texture slots, constant-buffer ranges, projection layout, config file and game settings path. Its default `aegis.ini` enables DLSS SR and 2× FG. To run stereo, set `[stereo] mode=sbs` before launch. The compositor and per-eye temporal histories use the same scene twice per simulation step. Aegis uses Odyssey’s icon controllers to read the world positions of tracked targets.
