@@ -330,6 +330,20 @@ std::string verb_teleport(const std::vector<std::string>& a, bool& ok) {
 
 } // namespace
 
+bool camera_at_player_head() {
+  float cam[5];
+  if (!read_camera(cam)) return false;
+  for (const Chain& chain : kChains) {
+    uintptr_t root = read_ptr(image_base() + chain.rva);
+    uintptr_t e = root ? read_ptr(root + chain.off) : 0;
+    if (!valid_entity(e)) continue;
+    const float* p = pos_of(e);
+    float dx = cam[0]-p[0], dy = cam[1]-p[1], dz = cam[2]-p[2];
+    return dx*dx + dy*dy < 0.6f*0.6f && dz > 0.5f && dz < 2.2f;
+  }
+  return false;
+}
+
 void teleport_register() {
   if (!lab_active()) return;
   // `quiver lab where <i>`: player position and heading, render camera (Z up, yaw 0 = +X, 90 = +Y).

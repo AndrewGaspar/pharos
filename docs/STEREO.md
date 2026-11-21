@@ -248,13 +248,46 @@ eye's cost is GPU work plus DXVK's CS thread executing the lists again. At 1080p
 about half of the 2560x1600 numbers per eye, so 1080p60 at DLSS Performance holds where mono runs
 ~100 fps. In dense crowds (CPU-bound mono ~55 fps) it won't.
 
+## Predator Bow and tracked markers
+
+`stereo.aim_eye` selects the eye that looks down the Predator Bow sight. The selected eye takes
+the native first-person camera position. The other eye moves by the full eye separation.
+`left` is the default. `right` mirrors the arrangement and `center` keeps the native sight line
+between the eyes. The activation check uses both the narrow perspective and the camera's proximity
+to the player's head. In the Alexandria story save the vertical projection scale changed from
+2.40 to 6.19. At two headings the sight camera was 0.18 m to Bayek's right and 1.85 m above the
+player origin. This measures the camera rig. The model's eye dominance cannot be inferred from it.
+Lab run r29 showed the dot inside the selected aperture for each setting at 32.5 mm separation
+and 4 m convergence.
+
+`stereo.markers` adjusts the disparity of tracked sprites and distance labels. The geometry
+shader samples the scene depth at the centre and corners of each sprite rectangle, clamps the
+samples to the viewport, and uses the nearest visible surface. It removes the disparity already
+applied to the game's UI quad before applying the scene disparity. In-world sprites use the
+scene camera. Screen-edge indicators use a separate HUD camera and distinct vertex layouts for
+their directional arrow and distance. Their brackets follow in a shared sprite batch.
+In r31, the waypoint and its distance readout moved from −6 to +6 pixels of disparity against
+a wall measured at +7 pixels. Turning to put the waypoint off screen also moved its arrow and
+brackets to the foreground. In Senu’s scan view a moving icon measured +10 to +11 pixels against
+a building at +12. Measurements use the lab’s 1280×720 capture of full side-by-side output.
+The samples depend on what is present in the game's depth buffer. Transparent details without
+depth writes and subpixel occluders can be missed.
+
+## Interrupted right-eye replay
+
+Senu's flight can leave a mapped resource open across Present while the game streams scenery.
+Pharos skips the unsafe replay. For up to three consecutive missed presents it displays the last
+complete stereo pair. A longer interruption shows the live scene in both halves until replay
+resumes. The frame statistics record held pairs and mono fallbacks separately. During one
+300-present flight interval in r31, 287 replays completed and 13 presents held a stereo pair.
+
 ## Not done / known issues
 
 - **Full resolution needs DXVK to honour the larger-swapchain switch** (above).
 - **Occlusion and frustum culling use the left eye's camera.** HZB culling and the per-instance
   culling constants aren't redirected, so objects at the right edge of the right eye could be culled
   early. Not seen yet.
-- **The HUD and menus sit at screen depth in both eyes.** That's the same as torchbearer.
+- **General HUD and menu layout** retains the game's stereo UI projection. The cursor and tracked markers have their own depth controls.
 - **Map/menu cursor at screen depth: fixed by `[stereo] cursor=depth`** (`stereo/cursor.cpp`;
   measured live in the lab, runs r9-r24). The game's white arrow is drawn into the backbuffer
   (present in framedump PPMs, not a compositor cursor) by one DrawIndexedInstancedIndirect in

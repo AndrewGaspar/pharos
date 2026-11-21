@@ -172,6 +172,8 @@ Config load() {
   c.stereo_swap = read_float(L"swap", 0.0f, L"stereo") != 0.0f;
   c.stereo_skip = read_str(L"skip", "", L"stereo");
   c.stereo_effects = read_str(L"effects", "ssr,fog,clouds,cloudmarch,shadow,flare", L"stereo");
+  c.stereo_aim_eye = read_str(L"aim_eye", "left", L"stereo");
+  c.stereo_markers = read_float(L"markers", 1, L"stereo") != 0;
   c.stereo_cursor = read_str(L"cursor", "game", L"stereo");
   c.cloth_mode = read_str(L"mode", "game", L"cloth");
   c.cloth_scale = read_float(L"scale", 1.0f, L"cloth");
@@ -189,6 +191,7 @@ bool same(const Config& a, const Config& b) {
          a.stereo_mode == b.stereo_mode && a.stereo_output == b.stereo_output && a.stereo_separation == b.stereo_separation &&
          a.stereo_convergence == b.stereo_convergence && a.stereo_show == b.stereo_show &&
          a.stereo_diff_gain == b.stereo_diff_gain && a.stereo_swap == b.stereo_swap && a.stereo_skip == b.stereo_skip && a.stereo_effects == b.stereo_effects && a.stereo_cursor == b.stereo_cursor &&
+         a.stereo_aim_eye == b.stereo_aim_eye && a.stereo_markers == b.stereo_markers &&
          a.world_lod_distance == b.world_lod_distance && a.world_lod_skip == b.world_lod_skip && a.world_lod_mode == b.world_lod_mode && a.world_npc_density == b.world_npc_density &&
          a.world_npc_distance == b.world_npc_distance && a.world_npc_spawn_ceiling == b.world_npc_spawn_ceiling && a.world_npc_units == b.world_npc_units &&
          a.world_npc_mem_floor == b.world_npc_mem_floor && a.world_npc_senu_max == b.world_npc_senu_max &&

@@ -18,6 +18,7 @@ enum class ShaderClass : uint8_t {
   UIComposite,  // final scene + UI composite ("UICompositingParameters_cbuffer")
   Culling,      // GPU instance culling / LOD selection CS ("MiscCullingConsts_cbuffer" at b8)
   Skinning,     // character skinning CS ("SkinningPassCompute_cbuffer"); counted for NPC load stats
+  UiSprite, UiPlain,  // Origins UI sprite/text shader permutations
   CamEffect,    // PS/CS with its own copy of the camera (SSR, fog, clouds...): per-eye in stereo
 };
 

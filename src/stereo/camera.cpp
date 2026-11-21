@@ -1,6 +1,7 @@
 #include "stereo/camera.h"
 
 #include <windows.h>
+#include <wrl/client.h>
 
 #include <cmath>
 #include <cstring>
@@ -17,6 +18,7 @@
 #include "core/vtidx.h"
 #include "stereo/record.h"
 #include "stereo/stereo.h"
+#include "world/teleport.h"
 
 namespace aco {
 
@@ -68,9 +70,11 @@ struct Eye {
   float k;      // NDC shift (convergence)
 };
 
-void eye_params(const F4* c, float sep_m, float conv_m, int eye, Eye* e) {
+// r27: the Predator Bow puts the camera at Bayek's head and uses m11=6.19.
+std::atomic<bool> zoom_seen{false};
+std::atomic<int> aim_bias{0};
+void eye_params(const F4* c, float dv, float conv_m, Eye* e) {
   float m00 = c[kProj].x;
-  float dv = (eye == 0 ? -sep_m : sep_m) * (m00 < 0 ? -1.0f : 1.0f);  // view-space x of the eye
   for (int i = 0; i < 3; ++i) {
     // Camera right vector = column 0 of viewToWorld (rows are output components).
     e->d[i] = dv * (&c[kViewToWorld + i].x)[0];
@@ -147,6 +151,8 @@ F4 g_main_v2w[3];        // latest main view's viewToWorld rows (mono)
 F4 g_main_c2v[4];        // and its ClipXYZToViewPos rows (cursor depth)
 float g_main_m00 = 0;    // and its projection's m00
 bool g_main_valid = false;
+F4 g_scene_z{}, g_scene_w{};
+float g_scene_m00 = 0;
 MainView g_last_main;    // and the rest of it (effect cameras, any context)
 
 void note_main(const F4* c, const MainView& mv) {
@@ -154,6 +160,11 @@ void note_main(const F4* c, const MainView& mv) {
   memcpy(g_main_v2w, c + kViewToWorld, sizeof(g_main_v2w));
   memcpy(g_main_c2v, c + kClipToView, sizeof(g_main_c2v));
   g_main_m00 = c[kProj].x;
+  if (c[kEyePos].x || c[kEyePos].y || c[kEyePos].z) {
+    g_scene_z = c[kClipToView + 2];
+    g_scene_w = c[kClipToView + 3];
+    g_scene_m00 = g_main_m00;
+  }
   g_main_valid = true;
   g_last_main = mv;
 }
@@ -290,7 +301,12 @@ struct Shadow {
   bool valid = false;
 };
 
+struct MarkerView { F4 z, w, scale; };
 struct CamCtx {
+  bool marker_view = false;
+  bool marker_screen = false;
+  bool edge_group = false;
+  MarkerView marker[2]{};
   ID3D11DeviceContext* ctx = nullptr;
   // The immediate context's maps can come from several game threads: every access to this state
   // holds the lock (uncontended for deferred contexts).
@@ -875,7 +891,6 @@ void cam_update(ID3D11DeviceContext* ctx, ID3D11Resource* res, const D3D11_BOX* 
 
 unsigned cam_filter(ID3D11DeviceContext* ctx, CamStage stage, UINT start, UINT n, ID3D11Buffer* const* bufs,
                     const UINT* first, ID3D11Buffer** out_buf, UINT* out_first, UINT* out_num) {
-  (void)stage;
   if (!g_cam_on.load(std::memory_order_relaxed) || !bufs || !g_pool || g_pool_failed) return 0;
   if (start > kInstanceSlot || start + n <= kPassSlot) return 0;
   CamCtx* cs = ctx_state(ctx);
@@ -889,6 +904,7 @@ unsigned cam_filter(ID3D11DeviceContext* ctx, CamStage stage, UINT start, UINT n
   const Config& cfg = config();
   for (UINT i = 0; i < n; ++i) {
     UINT slot = start + i;
+    if (stage == kVS && slot == kPassSlot) cs->marker_view = false;
     if (slot != kPassSlot && slot != kInstanceSlot) continue;
     ID3D11Buffer* b = bufs[i];
     if (!b) continue;
@@ -907,7 +923,9 @@ unsigned cam_filter(ID3D11DeviceContext* ctx, CamStage stage, UINT start, UINT n
     alignas(16) F4 l[kPassParamsBytes / 16], r[kPassParamsBytes / 16];
     UINT nreg = size / 16;
     if (slot == kPassSlot) {
+      int bias = aim_bias.load(std::memory_order_relaxed);
       float sep = cfg.stereo_separation * 0.001f;
+      auto offset = [&](int eye, float m00) { return sep * ((eye ? 1 : -1) + bias) * (m00 < 0 ? -1 : 1); };
       if (!is_main_view(src)) {
         cs->main.valid = false;
         float m00 = 0;
@@ -920,29 +938,41 @@ unsigned cam_filter(ID3D11DeviceContext* ctx, CamStage stage, UINT start, UINT n
         memcpy(tmp, src, size);
         tmp[kProj].x = m00;
         Eye ey[2];
-        for (int e = 0; e < 2; ++e) eye_params(tmp, sep, cfg.stereo_convergence, e, &ey[e]);
-        float dv0 = -sep * (m00 < 0 ? -1.0f : 1.0f);
+        for (int e = 0; e < 2; ++e) eye_params(tmp, offset(e, m00), cfg.stereo_convergence, &ey[e]);
         memcpy(l, src, size);
         memcpy(r, src, size);
-        transform_screen_pass(l, ey[0], dv0);
-        transform_screen_pass(r, ey[1], -dv0);
+        transform_screen_pass(l, ey[0], offset(0, m00));
+        transform_screen_pass(r, ey[1], offset(1, m00));
         st_pass_screen.fetch_add(1, std::memory_order_relaxed);
       } else {
-      MainView& mv = cs->main;
-      mv.valid = true;
-      memcpy(mv.vp, src + kViewProj, sizeof(mv.vp));
-      memcpy(mv.vpp, src + kViewProjPrev, sizeof(mv.vpp));
-      for (int e = 0; e < 2; ++e) eye_params(src, sep, cfg.stereo_convergence, e, &mv.eye[e]);
-      fill_main(mv, src);
-      cs->last_main = mv;
-      note_main(src, mv);
-      float m00 = src[kProj].x;
-      float dv0 = -sep * (m00 < 0 ? -1.0f : 1.0f), dv1 = -dv0;
-      memcpy(l, src, size);
-      memcpy(r, src, size);
-      transform_pass(l, mv.eye[0], dv0);
-      transform_pass(r, mv.eye[1], dv1);
-      st_pass_main.fetch_add(1, std::memory_order_relaxed);
+        MainView& mv = cs->main;
+        mv.valid = true;
+        memcpy(mv.vp, src + kViewProj, sizeof(mv.vp));
+        memcpy(mv.vpp, src + kViewProjPrev, sizeof(mv.vpp));
+        float m00 = src[kProj].x;
+        if (stage == kVS) {
+          cs->marker_screen = !src[kEyePos].x && !src[kEyePos].y && !src[kEyePos].z;
+          std::lock_guard lock(g_main_mutex);
+          float scene_m00 = cs->marker_screen ? g_scene_m00 : m00;
+          cs->marker_view = scene_m00 != 0;
+          for (int e = 0; e < 2; ++e) {
+            auto& marker = cs->marker[e];
+            marker.z = cs->marker_screen ? g_scene_z : src[kClipToView + 2];
+            marker.w = cs->marker_screen ? g_scene_w : src[kClipToView + 3];
+            marker.scale = {m00 * offset(e, m00), scene_m00 * offset(e, scene_m00),
+                            cfg.stereo_convergence > 0 ? 1.0f / cfg.stereo_convergence : 0.0f, 0};
+          }
+        }
+        if (std::fabs(src[kProj + 1].y) > 4.0f) zoom_seen.store(true, std::memory_order_relaxed);
+        for (int e = 0; e < 2; ++e) eye_params(src, offset(e, m00), cfg.stereo_convergence, &mv.eye[e]);
+        fill_main(mv, src);
+        cs->last_main = mv;
+        note_main(src, mv);
+        memcpy(l, src, size);
+        memcpy(r, src, size);
+        transform_pass(l, mv.eye[0], offset(0, m00));
+        transform_pass(r, mv.eye[1], offset(1, m00));
+        st_pass_main.fetch_add(1, std::memory_order_relaxed);
       }
     } else {
       // InstanceParams: worldViewProj of the main view? (== viewProj x world)
@@ -1031,6 +1061,8 @@ void cam_finish_command_list(ID3D11DeviceContext* ctx, ID3D11CommandList* cl) {
   if (!cs) return;
   std::lock_guard lock(cs->mutex);
   cs->main.valid = false;
+  cs->marker_view = false;
+  cs->edge_group = false;
   cs->last_main.valid = false;
   if (cs->chunks.empty()) return;
   auto* h = new ClChunks;
@@ -1200,6 +1232,30 @@ void cam_before_execute(ID3D11DeviceContext* imm, ID3D11CommandList* cl, int eye
   u->Release();
 }
 
+bool cam_bind_marker(ID3D11DeviceContext* ctx, bool edge, bool bracket) {
+  if (ctx == g_imm) return false;
+  CamCtx* cs = ctx_state(ctx);
+  if (!cs) return false;
+  UINT offset;
+  {
+    std::lock_guard lock(cs->mutex);
+    if (!cs->marker_view) return false;
+    if (cs->marker_screen) {
+      const bool follow = cs->edge_group && bracket;
+      cs->edge_group = edge;
+      if (!edge && !follow) return false;
+    } else {
+      cs->edge_group = false;
+    }
+    offset = put_slot(cs, &cs->marker[0], &cs->marker[1], sizeof(MarkerView));
+  }
+  Microsoft::WRL::ComPtr<ID3D11DeviceContext1> ctx1;
+  if (FAILED(ctx->QueryInterface(IID_PPV_ARGS(&ctx1)))) return false;
+  UINT first = offset / 16, count = 16;
+  ctx1->GSSetConstantBuffers1(13, 1, &g_pool, &first, &count);
+  return true;
+}
+
 bool cam_cursor_view(float* m00, float clip_to_view[4][4]) {
   std::lock_guard lock(g_main_mutex);
   if (!g_main_valid) return false;
@@ -1211,6 +1267,14 @@ bool cam_cursor_view(float* m00, float clip_to_view[4][4]) {
 void cam_on_present(bool stereo_on) {
   if (stereo_on && !g_pool && !g_pool_failed && g_dev) create_pool();  // only once stereo runs
   g_cam_on.store(stereo_on && g_pool && !g_pool_failed, std::memory_order_relaxed);
+  bool zoom = zoom_seen.exchange(false);
+  int bias = 0;
+  if (stereo_on && zoom && camera_at_player_head()) {
+    const auto& eye = config().stereo_aim_eye;
+    bias = eye == "left" ? 1 : eye == "right" ? -1 : 0;
+  }
+  if (aim_bias.exchange(bias) != bias)
+    ACO_LOG("stereo: bow camera %s", bias > 0 ? "left" : bias < 0 ? "right" : "centred");
   static uint64_t frames = 0;
   if (!stereo_on) return;
   if (g_imm)

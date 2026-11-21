@@ -85,6 +85,10 @@ void shaders_register(ID3D11DeviceChild* shader, ShaderKind kind, const void* by
   memcpy(&info.hash, static_cast<const uint8_t*>(bytecode) + 4, sizeof(info.hash));
   info.bytecode.assign(static_cast<const uint8_t*>(bytecode), static_cast<const uint8_t*>(bytecode) + size);
   info.cls = classify(kind, info.bytecode);
+  if (kind == ShaderKind::PS) {
+    if (info.hash == 0x068233d2886bf2c8ULL || info.hash == 0xaa384ce949239abeULL) info.cls = ShaderClass::UiSprite;
+    if (info.hash == 0xd0e87cc04dcdc27fULL) info.cls = ShaderClass::UiPlain;
+  }
   if (info.cls == ShaderClass::CamEffect) cam_register_effect(shader, info.hash, bytecode, size);
   std::unique_lock lock(g_mutex);
   if (info.cls != ShaderClass::None) {
@@ -119,6 +123,8 @@ ShaderClass shader_class_fast(ID3D11DeviceChild* shader) {
 const char* shader_class_name(ShaderClass c) {
   switch (c) {
     case ShaderClass::None: return "none";
+    case ShaderClass::UiSprite: return "UI sprite or text";
+    case ShaderClass::UiPlain: return "UI sprite";
     case ShaderClass::TemporalAA: return "TemporalAA";
     case ShaderClass::LinearZ: return "LinearZ";
     case ShaderClass::UIComposite: return "UIComposite";

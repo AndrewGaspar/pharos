@@ -16,6 +16,7 @@
 #include "dlss/kernels.h"
 #include "stereo/camera.h"
 #include "stereo/cursor.h"
+#include "stereo/markers.h"
 #include "stereo/record.h"
 #include "stereo/temporal.h"
 
@@ -115,7 +116,9 @@ struct State {
   PFN_GetBuffer real_get_buffer = nullptr;
 
   bool active = false;
+  unsigned hold_frames = 0;  // remaining presents for which the last stereo pair is fresh
   uint64_t frames = 0, replays = 0;
+  unsigned held = 0, mono = 0;
   size_t cmds_sum = 0, bytes_sum = 0;
   double replay_ms = 0;
   const char* last_bad = nullptr;
@@ -126,6 +129,7 @@ std::atomic<int> g_eye{0};
 bool ensure_device_objects() {
   if (S.compose) return true;
   if (S.failed) return false;
+  markers_init(S.dev);
   S.compose = kernels::compile(S.dev, kComposeHlsl, sizeof(kComposeHlsl) - 1, "aco_stereo_compose.hlsl");
   D3D11_BUFFER_DESC bd{};
   bd.ByteWidth = sizeof(ComposeParams);
@@ -166,6 +170,7 @@ bool ensure_targets(ID3D11Texture2D* bb) {
   D3D11_TEXTURE2D_DESC d;
   bb->GetDesc(&d);
   if (S.out && d.Width == S.w && d.Height == S.h && d.Format == S.fmt) return true;
+  S.hold_frames = 0;
   for (int i = 0; i < 2; ++i) {
     release(S.eye_uav[i]);
     release(S.eye_srv[i]);
@@ -392,6 +397,7 @@ void stereo_on_present(IDXGISwapChain* sc, PFN_GetBuffer real_get_buffer) {
     rec_free(f);
     if (S.active) ACO_LOG("stereo: off");
     S.active = false;
+    S.hold_frames = 0;
     if (wide && S.proxy) compose_wide(sc, S.proxy, S.proxy);  // 2D: the same image in both halves
     set_tag(wide ? "stereo-sbs" : "");
     return;
@@ -416,7 +422,9 @@ void stereo_on_present(IDXGISwapChain* sc, PFN_GetBuffer real_get_buffer) {
   } else {
     got = SUCCEEDED(sc->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&bb)));
   }
-  if (rec_frame_ok(f, &why) && ensure_device_objects() && got && ensure_targets(bb)) {
+  bool ready = got && ensure_device_objects() && ensure_targets(bb);
+  if (rec_frame_ok(f, &why) && ready) {
+    S.hold_frames = 3;
     cursor_set_active(cfg.stereo_cursor == "depth" && S.eye_uav[0] && S.eye_uav[1] && cursor_ready(S.dev));
     double t0 = now_ms();
     S.imm->CopyResource(S.eye[0], bb);
@@ -465,16 +473,31 @@ void stereo_on_present(IDXGISwapChain* sc, PFN_GetBuffer real_get_buffer) {
       ACO_LOG("stereo: frame not replayed: %s", why);
       S.last_bad = why;
     }
-    if (wide && S.proxy) compose_wide(sc, S.proxy, S.proxy);
+    // Streaming can leave a Map open at Present. Keep a short coherent pair through
+    // that gap. Longer interruptions get live mono in both halves.
+    if (ready) {
+      if (S.hold_frames) {
+        --S.hold_frames;
+        ++S.held;
+      } else {
+        ++S.mono;
+        S.imm->CopyResource(S.eye[0], bb);
+        S.imm->CopyResource(S.eye[1], bb);
+      }
+      if (wide) compose_wide(sc, S.eye[cfg.stereo_swap], S.eye[!cfg.stereo_swap]);
+      else compose(bb, false);
+    } else if (wide && S.proxy) compose_wide(sc, S.proxy, S.proxy);
   }
   tmp_frame_end(true, bb, rec_frame_size(f));
   if (bb) bb->Release();
   if (S.frames <= 3 || S.frames % 300 == 0) rec_log_uploads(f);
   rec_free(f);
-  if (S.frames % 300 == 0 && S.replays) {
-    ACO_LOG("stereo: %llu/300 frames replayed, %.0f calls and %.2f MB uploads per frame, replay %.2f ms CPU",
-            (unsigned long long)S.replays, double(S.cmds_sum) / S.replays, double(S.bytes_sum) / S.replays / 1048576.0,
-            S.replay_ms / S.replays);
+  if (S.frames % 300 == 0) {
+    const double replays = S.replays ? double(S.replays) : 1.0;
+    ACO_LOG("stereo: %llu/300 frames replayed (%u held pairs, %u mono), %.0f calls and %.2f MB uploads per frame, replay %.2f ms CPU",
+            (unsigned long long)S.replays, S.held, S.mono, double(S.cmds_sum) / replays, double(S.bytes_sum) / replays / 1048576.0,
+            S.replay_ms / replays);
+    S.held = S.mono = 0;
     S.replays = 0;
     S.cmds_sum = S.bytes_sum = 0;
     S.replay_ms = 0;

@@ -113,6 +113,8 @@ struct Config {
   bool stereo_swap = false;             // [stereo] swap: exchange the eyes
   std::string stereo_effects = "ssr,fog,clouds,cloudmarch,shadow,flare";  // [stereo] effects (debugging): effect cameras shifted per eye
   std::string stereo_skip;              // [stereo] skip (debugging): kinds of recorded calls left out of the replay
+  std::string stereo_aim_eye = "left";
+  bool stereo_markers = true;
   std::string stereo_cursor = "game";   // [stereo] cursor: game | depth (hide the game's arrow, draw ours at scene depth)
   std::string cloth_mode = "game";  // [cloth] mode: game | render | scale (see cloth/cloth.h)
   float cloth_scale = 1.0f;         // [cloth] scale (mode=scale, diagnostics)

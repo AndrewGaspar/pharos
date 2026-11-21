@@ -73,7 +73,7 @@ options = ["cloth.mode", "cloth.scale"]
 [[page]]
 id = "stereo"
 title = "Stereo 3D"
-options = ["stereo.mode", "stereo.output", "stereo.separation", "stereo.convergence", "stereo.swap", "stereo.cursor"]
+options = ["stereo.mode", "stereo.output", "stereo.separation", "stereo.convergence", "stereo.swap", "stereo.cursor", "stereo.aim_eye", "stereo.markers"]
 
 [[page.group]]
 title = "Debugging"
@@ -1244,6 +1244,25 @@ values = [
   { value = "game", label = "Game's cursor" },
   { value = "depth", label = "At scene depth" },
 ]
+level = "advanced"
+apply = "live"
+
+[option."stereo.aim_eye"]
+type = "enum"
+label = "Predator Bow aiming eye"
+help = "Aligns the selected eye with the native first-person sight. Center places the sight line between the eyes."
+values = [
+  { value = "left", label = "Left eye" },
+  { value = "right", label = "Right eye" },
+  { value = "center", label = "Between the eyes" },
+]
+level = "advanced"
+apply = "live"
+
+[option."stereo.markers"]
+type = "bool"
+label = "World marker depth"
+help = "Places in-world marker sprites and labels at visible scene depth."
 level = "advanced"
 apply = "live"
 

@@ -19,6 +19,7 @@ namespace aco {
 // turns the camera to the reply's "want" from the host); and the lab state is kept (menu | in-world)
 // for `quiver lab wait
 // <i> in-world`.
+bool camera_at_player_head();
 void teleport_on_present();
 void teleport_register();
 

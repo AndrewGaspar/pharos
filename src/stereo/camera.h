@@ -56,6 +56,9 @@ void cam_effect_end(ID3D11DeviceContext* ctx, CamFx* fx);
 void cam_finish_command_list(ID3D11DeviceContext* ctx, ID3D11CommandList* cl);
 void cam_before_execute(ID3D11DeviceContext* imm, ID3D11CommandList* cl, int eye);
 
+// Bind per-eye geometry shader constants for a matching UI pass.
+bool cam_bind_marker(ID3D11DeviceContext* ctx, bool edge, bool bracket);
+
 // Latest main view's projection m00 and ClipXYZToViewPos (mono), for the stereo cursor's depth.
 bool cam_cursor_view(float* m00, float clip_to_view[4][4]);
 
