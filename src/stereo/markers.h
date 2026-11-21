@@ -4,6 +4,8 @@
 
 namespace aco {
 void markers_init(ID3D11Device* dev);
-bool markers_begin(ID3D11DeviceContext* ctx, ShaderClass shader);
-void markers_end(ID3D11DeviceContext* ctx);
+bool panel_begin(ID3D11DeviceContext* ctx, ShaderClass shader, UINT* caption_offset);
+enum class MarkerDraw { Game, Shift, RecordLogo };
+MarkerDraw markers_begin(ID3D11DeviceContext* ctx, ShaderClass shader);
+void markers_end(ID3D11DeviceContext* ctx, MarkerDraw draw);
 }  // namespace aco

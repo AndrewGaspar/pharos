@@ -17,8 +17,10 @@
 #include "core/log.h"
 #include "core/vtidx.h"
 #include "stereo/record.h"
+#include "stereo/cursor.h"
 #include "stereo/stereo.h"
 #include "world/teleport.h"
+#include "world/marker_targets.h"
 
 namespace aco {
 
@@ -73,6 +75,7 @@ struct Eye {
 // r27: the Predator Bow puts the camera at Bayek's head and uses m11=6.19.
 std::atomic<bool> zoom_seen{false};
 std::atomic<int> aim_bias{0};
+std::atomic<bool> menu_seen{false}, menu_previous_frame{false};
 void eye_params(const F4* c, float dv, float conv_m, Eye* e) {
   float m00 = c[kProj].x;
   for (int i = 0; i < 3; ++i) {
@@ -153,6 +156,8 @@ float g_main_m00 = 0;    // and its projection's m00
 bool g_main_valid = false;
 F4 g_scene_z{}, g_scene_w{};
 float g_scene_m00 = 0;
+F4 g_scene_vp[4]{};
+MarkerCamera g_scene_camera{};
 MainView g_last_main;    // and the rest of it (effect cameras, any context)
 
 void note_main(const F4* c, const MainView& mv) {
@@ -161,6 +166,10 @@ void note_main(const F4* c, const MainView& mv) {
   memcpy(g_main_c2v, c + kClipToView, sizeof(g_main_c2v));
   g_main_m00 = c[kProj].x;
   if (c[kEyePos].x || c[kEyePos].y || c[kEyePos].z) {
+    memcpy(g_scene_vp, c + kViewProj, sizeof(g_scene_vp));
+    memcpy(g_scene_camera.pos, mv.pos, sizeof(mv.pos));
+    memcpy(g_scene_camera.look, mv.look, sizeof(mv.look));
+    g_scene_camera.m00 = mv.m00;
     g_scene_z = c[kClipToView + 2];
     g_scene_w = c[kClipToView + 3];
     g_scene_m00 = g_main_m00;
@@ -306,7 +315,12 @@ struct CamCtx {
   bool marker_view = false;
   bool marker_screen = false;
   bool edge_group = false;
+  bool panel = false, logo_batch = false;
+  // Original VS camera of the currently bound flat UI pass, before stereo translation.
+  F4 ui_camera[kPassParamsBytes / sizeof(F4)]{};
   MarkerView marker[2]{};
+  F4 marker_vp[4]{};
+  UINT target_offset = UINT(-1);
   ID3D11DeviceContext* ctx = nullptr;
   // The immediate context's maps can come from several game threads: every access to this state
   // holds the lock (uncontended for deferred contexts).
@@ -904,7 +918,9 @@ unsigned cam_filter(ID3D11DeviceContext* ctx, CamStage stage, UINT start, UINT n
   const Config& cfg = config();
   for (UINT i = 0; i < n; ++i) {
     UINT slot = start + i;
-    if (stage == kVS && slot == kPassSlot) cs->marker_view = false;
+    if (stage == kVS && slot == kPassSlot) {
+      cs->marker_screen = cs->marker_view = cs->panel = cs->logo_batch = false;
+    }
     if (slot != kPassSlot && slot != kInstanceSlot) continue;
     ID3D11Buffer* b = bufs[i];
     if (!b) continue;
@@ -952,7 +968,10 @@ unsigned cam_filter(ID3D11DeviceContext* ctx, CamStage stage, UINT start, UINT n
         float m00 = src[kProj].x;
         if (stage == kVS) {
           cs->marker_screen = !src[kEyePos].x && !src[kEyePos].y && !src[kEyePos].z;
+          if (cs->marker_screen) memcpy(cs->ui_camera, src, kPassParamsBytes);
           std::lock_guard lock(g_main_mutex);
+          memcpy(cs->marker_vp, cs->marker_screen ? g_scene_vp : src+kViewProj, sizeof(cs->marker_vp));
+          cs->target_offset = UINT(-1);
           float scene_m00 = cs->marker_screen ? g_scene_m00 : m00;
           cs->marker_view = scene_m00 != 0;
           for (int e = 0; e < 2; ++e) {
@@ -960,7 +979,7 @@ unsigned cam_filter(ID3D11DeviceContext* ctx, CamStage stage, UINT start, UINT n
             marker.z = cs->marker_screen ? g_scene_z : src[kClipToView + 2];
             marker.w = cs->marker_screen ? g_scene_w : src[kClipToView + 3];
             marker.scale = {m00 * offset(e, m00), scene_m00 * offset(e, scene_m00),
-                            cfg.stereo_convergence > 0 ? 1.0f / cfg.stereo_convergence : 0.0f, 0};
+                            cfg.stereo_convergence > 0 ? 1.0f / cfg.stereo_convergence : 0.0f, cs->marker_screen ? 0.0f : 1.0f};
           }
         }
         if (std::fabs(src[kProj + 1].y) > 4.0f) zoom_seen.store(true, std::memory_order_relaxed);
@@ -1022,6 +1041,11 @@ unsigned cam_filter(ID3D11DeviceContext* ctx, CamStage stage, UINT start, UINT n
       }
       st_inst_main.fetch_add(1, std::memory_order_relaxed);
     }
+    if (stage == kVS && slot == kPassSlot && cs->marker_screen && menu_previous_frame.load(std::memory_order_relaxed)) {
+      memcpy(l, src, size);
+      memcpy(r, src, size);
+      cs->panel = true;
+    }
     (void)nreg;
     UINT poff;
     if (ctx == g_imm) {
@@ -1062,7 +1086,7 @@ void cam_finish_command_list(ID3D11DeviceContext* ctx, ID3D11CommandList* cl) {
   std::lock_guard lock(cs->mutex);
   cs->main.valid = false;
   cs->marker_view = false;
-  cs->edge_group = false;
+  cs->edge_group = cs->panel = cs->logo_batch = false;
   cs->last_main.valid = false;
   if (cs->chunks.empty()) return;
   auto* h = new ClChunks;
@@ -1232,28 +1256,116 @@ void cam_before_execute(ID3D11DeviceContext* imm, ID3D11CommandList* cl, int eye
   u->Release();
 }
 
-bool cam_bind_marker(ID3D11DeviceContext* ctx, bool edge, bool bracket) {
+// The tour viewer draws its photo and then the entire caption panel with the same
+// VS PassParams. Use the native film gate for the photo. Give the overlay one
+// binocular shift, including its text shading and button legends. A matching
+// guard band keeps the shading over the full viewport on the displaced side.
+bool cam_begin_panel(ID3D11DeviceContext* ctx, bool menu, UINT* caption_offset) {
+  if (menu) {
+    menu_seen.store(true, std::memory_order_relaxed);
+    cursor_note_flat_menu();
+  }
   if (ctx == g_imm) return false;
   CamCtx* cs = ctx_state(ctx);
   if (!cs) return false;
-  UINT offset;
+  UINT photo_offset;
   {
     std::lock_guard lock(cs->mutex);
-    if (!cs->marker_view) return false;
+    if (!cs->marker_screen || cs->panel) return false;
+    const F4* mono = cs->ui_camera;
+    photo_offset = put_slot(cs, mono, mono, kPassParamsBytes);
+    cs->panel = true;
+    if (menu) {
+      *caption_offset = photo_offset;
+    } else {
+      F4 eyes[2][kPassParamsBytes / sizeof(F4)];
+      const float shift = std::min(0.012f, std::fabs(mono[kProj].x) * config().stereo_separation * 0.001f * 0.15f);
+      for (int eye = 0; eye < 2; ++eye) {
+        memcpy(eyes[eye], mono, kPassParamsBytes);
+        F4* vp = eyes[eye] + kVNTP;
+        for (int row = 0; row < 2; ++row)
+          for (int col = 0; col < 4; ++col) (&vp[row].x)[col] *= 1.0f + shift;
+        add_row(vp[0], vp[3], eye == 0 ? shift : -shift);
+      }
+      *caption_offset = put_slot(cs, eyes[0], eyes[1], kPassParamsBytes);
+    }
+  }
+  cam_bind_panel_plane(ctx, photo_offset);
+  return true;
+}
+
+void cam_bind_panel_plane(ID3D11DeviceContext* ctx, UINT offset) {
+  const UINT first = offset / 16, count = kPassParamsBytes / 16;
+  auto set = reinterpret_cast<SetCb1>(original(ctx, vt::Context1_VSSetConstantBuffers1));
+  set(static_cast<ID3D11DeviceContext1*>(ctx), kPassSlot, 1, &g_pool, &first, &count);
+}
+
+// Project the engine's target positions through this UI pass's scene camera.
+struct MarkerTargets {
+  UINT count, padding[3];
+  F4 points[kMaxMarkerTargets];  // screen XY, reciprocal view distance, nominal vertical icon lift
+};
+
+UINT put_targets(CamCtx* cs) {
+  MarkerTarget positions[kMaxMarkerTargets];
+  const size_t n = marker_targets_read(positions);
+  MarkerTargets block{};
+  const F4* vp = cs->marker_vp;
+  for (size_t i = 0; i < n; ++i) {
+    const auto& p = positions[i];
+    auto project = [&](int row) {
+      const F4& r = vp[row];
+      return r.x * p.x + r.y * p.y + r.z * p.z + r.w;
+    };
+    float w = project(3);
+    if (w <= 0.05f) continue;
+    const float x = project(0) / w, y = project(1) / w;
+    const float raised_w = w + 2 * vp[3].z;
+    float lift = raised_w > 0.05f ? (project(1) + 2 * vp[1].z) / raised_w - y : 0;
+    block.points[block.count++] = {x, y, 1 / w, lift};
+  }
+  return put_slot(cs, &block, &block, sizeof(block));
+}
+
+bool cam_bind_marker(ID3D11DeviceContext* ctx, MarkerRole role, bool* record_logo) {
+  if (ctx == g_imm) return false;
+  CamCtx* cs = ctx_state(ctx);
+  if (!cs) return false;
+  UINT offset, target_offset;
+  {
+    std::lock_guard lock(cs->mutex);
+    if (!cs->marker_view || cs->panel) return false;
     if (cs->marker_screen) {
-      const bool follow = cs->edge_group && bracket;
-      cs->edge_group = edge;
-      if (!edge && !follow) return false;
+      const bool follow = cs->edge_group && (role == MarkerRole::Bracket || role == MarkerRole::Logo);
+      cs->edge_group = role == MarkerRole::Edge;
+      if (!cs->edge_group && !follow && role != MarkerRole::Reticle) return false;
     } else {
       cs->edge_group = false;
     }
-    offset = put_slot(cs, &cs->marker[0], &cs->marker[1], sizeof(MarkerView));
+    const bool label = role == MarkerRole::Label;
+    if (label && !cs->logo_batch) return false;
+    *record_logo = role == MarkerRole::Logo && !cs->marker_screen;
+    if (!label) cs->logo_batch = *record_logo;
+    if (cs->target_offset == UINT(-1)) cs->target_offset = put_targets(cs);
+    target_offset = cs->target_offset;
+    MarkerView eyes[] = {cs->marker[0], cs->marker[1]};
+    if (role == MarkerRole::Reticle && cs->marker_screen) eyes[0].scale.w = eyes[1].scale.w = 2;
+    offset = put_slot(cs, &eyes[0], &eyes[1], sizeof(MarkerView));
   }
   Microsoft::WRL::ComPtr<ID3D11DeviceContext1> ctx1;
   if (FAILED(ctx->QueryInterface(IID_PPV_ARGS(&ctx1)))) return false;
-  UINT first = offset / 16, count = 16;
+  UINT first = target_offset / 16, count = ((sizeof(MarkerTargets) + 255) / 256) * 16;
+  ctx1->GSSetConstantBuffers1(12, 1, &g_pool, &first, &count);
+  first = offset / 16;
+  count = 16;
   ctx1->GSSetConstantBuffers1(13, 1, &g_pool, &first, &count);
   return true;
+}
+
+bool cam_right_aim() { return aim_bias.load(std::memory_order_relaxed) < 0; }
+MarkerCamera cam_marker_view() {
+  std::lock_guard lock(g_main_mutex);
+  return g_scene_camera;
 }
 
 bool cam_cursor_view(float* m00, float clip_to_view[4][4]) {
@@ -1267,6 +1379,8 @@ bool cam_cursor_view(float* m00, float clip_to_view[4][4]) {
 void cam_on_present(bool stereo_on) {
   if (stereo_on && !g_pool && !g_pool_failed && g_dev) create_pool();  // only once stereo runs
   g_cam_on.store(stereo_on && g_pool && !g_pool_failed, std::memory_order_relaxed);
+  marker_targets_frame(stereo_on && config().stereo_markers);
+  menu_previous_frame.store(menu_seen.exchange(false) && stereo_on);
   bool zoom = zoom_seen.exchange(false);
   int bias = 0;
   if (stereo_on && zoom && camera_at_player_head()) {

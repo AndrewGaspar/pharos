@@ -260,18 +260,28 @@ player origin. This measures the camera rig. The model's eye dominance cannot be
 Lab run r29 showed the dot inside the selected aperture for each setting at 32.5 mm separation
 and 4 m convergence.
 
-`stereo.markers` adjusts the disparity of tracked sprites and distance labels. The geometry
-shader samples the scene depth at the centre and corners of each sprite rectangle, clamps the
-samples to the viewport, and uses the nearest visible surface. It removes the disparity already
-applied to the game's UI quad before applying the scene disparity. In-world sprites use the
-scene camera. Screen-edge indicators use a separate HUD camera and distinct vertex layouts for
-their directional arrow and distance. Their brackets follow in a shared sprite batch.
-In r31, the waypoint and its distance readout moved from −6 to +6 pixels of disparity against
-a wall measured at +7 pixels. Turning to put the waypoint off screen also moved its arrow and
-brackets to the foreground. In Senu’s scan view a moving icon measured +10 to +11 pixels against
-a building at +12. Measurements use the lab’s 1280×720 capture of full side-by-side output.
-The samples depend on what is present in the game's depth buffer. Transparent details without
-depth writes and subpixel occluders can be missed.
+The Predator Bow dot uses the depth at the centre of the selected eye's view. That eye keeps
+the native sight line. The other eye sees the corresponding 3D point. The bow and Senu reticles
+sample the centre ray independently of tagged world icons.
+
+`stereo.markers` reads the world positions returned by the game's position, entity, custom
+marker and dynamic location icon controllers on Origins 1.62. Sprite positions are compressed
+by the UI. At the Sphinx a 53 m tour label had a native billboard depth of 9.27 m. The marker
+shader associates the sprite with a projected world target and limits its depth to the first
+visible obstruction. It places an obstructed marker just in front of that surface. Screen-edge
+arrows sample the clamped screen position. An unrecognised target uses the visible surface.
+Transparent objects without depth writes cannot be identified from this buffer.
+
+A quarter-resolution history holds newly visible foreground depth for 120 ms and eases back
+as an obstruction clears. Stereo replay uses the same history for both eyes. The icon batch
+records its resolved depths during rasterization. Senu's name and distance labels reuse their
+icon's depth. Level numerals use the corresponding shield sprite batch.
+
+The Discovery Tour photo viewer draws its image at zero disparity, with the title, credit and
+body text on a nearer plane. The animated panel on the tour introduction also covers the
+viewport edge in each eye. The live landscape behind that panel retains its stereo camera.
+Main-menu and Tours controls and their mouse or left-stick cursor share the screen plane.
+The map continues to use terrain depth.
 
 ## Interrupted right-eye replay
 
@@ -300,7 +310,7 @@ resumes. The frame statistics record held pairs and mono fallbacks separately. D
   disparity of the scene depth under it: last frame's DLSS depth sampled at the pointer,
   converted with the main view's ClipXYZToViewPos, smoothed in disparity space. Measured: on
   the Giza map, scene 833 m, ring disparity 10-12 px at 1280 wide vs 10 px template-matched
-  terrain disparity; main menu 10 m. In gameplay the pair's only draw binds other pages, so
+  terrain disparity. The main menu used the 10 m backdrop in v16. In gameplay the pair's only draw binds other pages, so
   nothing is hidden or drawn there; in mono the feature is inert. Still open: the arrow's
   hotspot vs the ring centre (ring is centred on the pointer position; the arrow's tip measured
   within ~7 px of it), and checking other menu screens (inventory) bind the same pages.

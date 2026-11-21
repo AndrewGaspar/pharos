@@ -64,6 +64,7 @@ void release(T*& p) {
   p = nullptr;
 }
 
+std::atomic<bool> g_flat_menu{false};
 std::atomic<bool> g_on{false};
 std::atomic<bool> g_hidden{false};   // a cursor draw was dropped since the last begin_frame
 std::atomic<bool> g_logged_hide{false};
@@ -303,10 +304,13 @@ void issue_depth_sample(ID3D11DeviceContext* imm, ID3D11Device* dev, unsigned w,
 
 } // namespace
 
+void cursor_note_flat_menu() { g_flat_menu.store(true, std::memory_order_relaxed); }
+
 void cursor_set_active(bool on) {
   if (g_on.exchange(on, std::memory_order_acq_rel) != on && on)
     ACO_LOG("stereo: cursor=depth on (game arrow hidden, substitute at scene depth)");
   if (!on) {
+    g_flat_menu.store(false);
     S.visible = false;
     g_hidden.store(false, std::memory_order_relaxed);
     S.pending[0] = S.pending[1] = false;
@@ -362,6 +366,7 @@ bool pad_position(ID3D11DeviceContext* imm, unsigned w, unsigned h, float out[2]
 
 void cursor_begin_frame(ID3D11DeviceContext* imm, IDXGISwapChain* sc, unsigned w, unsigned h) {
   ++S.frames;
+  bool flat_menu = g_flat_menu.exchange(false);
   bool hidden = g_hidden.exchange(false, std::memory_order_relaxed);
   float pos[2] = {};
   bool pad = g_pad.exchange(false);
@@ -371,6 +376,11 @@ void cursor_begin_frame(ID3D11DeviceContext* imm, IDXGISwapChain* sc, unsigned w
   }
   S.visible = hidden && (pad ? pad_position(imm, w, h, pos) : cursor_pos(sc, w, h, pos));
   if (!S.visible) return;
+  if (flat_menu) {
+    for (auto& centre : S.centre) { centre[0] = pos[0]; centre[1] = pos[1]; }
+    S.pending[0] = S.pending[1] = false;
+    return;
+  }
   S.mono[0] = pos[0];
   S.mono[1] = pos[1];
 

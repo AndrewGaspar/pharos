@@ -56,8 +56,16 @@ void cam_effect_end(ID3D11DeviceContext* ctx, CamFx* fx);
 void cam_finish_command_list(ID3D11DeviceContext* ctx, ID3D11CommandList* cl);
 void cam_before_execute(ID3D11DeviceContext* imm, ID3D11CommandList* cl, int eye);
 
+// The photo and its caption share one VS camera binding in the tour info pass.
+bool cam_begin_panel(ID3D11DeviceContext* ctx, bool menu, UINT* caption_offset);
+void cam_bind_panel_plane(ID3D11DeviceContext* ctx, UINT offset);
+
 // Bind per-eye geometry shader constants for a matching UI pass.
-bool cam_bind_marker(ID3D11DeviceContext* ctx, bool edge, bool bracket);
+enum class MarkerRole { Ordinary, Edge, Bracket, Logo, Label, Reticle };
+bool cam_bind_marker(ID3D11DeviceContext* ctx, MarkerRole role, bool* record_logo);
+bool cam_right_aim();
+struct MarkerCamera { float pos[3], look[3], m00; };
+MarkerCamera cam_marker_view();
 
 // Latest main view's projection m00 and ClipXYZToViewPos (mono), for the stereo cursor's depth.
 bool cam_cursor_view(float* m00, float clip_to_view[4][4]);

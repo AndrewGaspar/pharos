@@ -16,6 +16,7 @@ namespace aco {
 // GetCursorPos 1:1). For a controller, stream output captures the native dot position. If the hashes never match (other game build), nothing is hidden and no
 // substitute is drawn: the game cursor stays.
 
+void cursor_note_flat_menu();
 void cursor_set_active(bool on);  // at Present, like g_cam_on
 bool cursor_ready(ID3D11Device* dev);
 // Only the indexed indirect UI batch contains the cursor.

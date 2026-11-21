@@ -24,6 +24,7 @@ add_library(aco_d3d11 SHARED
   src/core/dump.cpp
   src/core/memtool.cpp
   src/world/world.cpp
+  src/world/marker_targets.cpp
   src/world/lodpatch.cpp
   src/world/npc.cpp
   src/world/npc_units.cpp
@@ -40,6 +41,7 @@ add_library(aco_d3d11 SHARED
   src/stereo/record.cpp
   src/stereo/stereo.cpp
   src/stereo/camera.cpp
+  src/stereo/marker_history.cpp
   src/stereo/markers.cpp
   src/stereo/cursor.cpp
   src/stereo/temporal.cpp

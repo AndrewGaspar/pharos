@@ -17,6 +17,7 @@
 #include "stereo/camera.h"
 #include "stereo/cursor.h"
 #include "stereo/markers.h"
+#include "stereo/marker_history.h"
 #include "stereo/record.h"
 #include "stereo/temporal.h"
 
@@ -392,6 +393,7 @@ void stereo_on_present(IDXGISwapChain* sc, PFN_GetBuffer real_get_buffer) {
   RecFrame* f = rec_stop();
   cam_on_present(want);
   if (!want) {
+    marker_history_reset();
     cursor_set_active(false);
     tmp_frame_end(false, nullptr, 0);
     rec_free(f);
@@ -428,6 +430,8 @@ void stereo_on_present(IDXGISwapChain* sc, PFN_GetBuffer real_get_buffer) {
     cursor_set_active(cfg.stereo_cursor == "depth" && S.eye_uav[0] && S.eye_uav[1] && cursor_ready(S.dev));
     double t0 = now_ms();
     S.imm->CopyResource(S.eye[0], bb);
+    const bool right_reference = cam_right_aim();
+    if (!right_reference) marker_history_filter(S.imm1, S.own_state);
     tmp_before_right(S.imm);
     double t_copy = now_ms();
     g_eye.store(1, std::memory_order_relaxed);
@@ -443,6 +447,8 @@ void stereo_on_present(IDXGISwapChain* sc, PFN_GetBuffer real_get_buffer) {
     g_eye.store(0, std::memory_order_relaxed);
     S.imm->CopyResource(S.eye[1], bb);
     tmp_after_right(S.imm);
+    if (right_reference) marker_history_filter(S.imm1, S.own_state);
+    marker_history_publish(S.imm);
     if (cfg.stereo_cursor == "depth") {
       cursor_begin_frame(S.imm, sc, S.w, S.h);
       if (cursor_visible()) {
@@ -468,6 +474,7 @@ void stereo_on_present(IDXGISwapChain* sc, PFN_GetBuffer real_get_buffer) {
     S.cmds_sum += rec_frame_size(f);
     S.bytes_sum += rec_frame_bytes(f);
   } else {
+    marker_history_reset();
     cursor_set_active(false);
     if (why && why != S.last_bad) {
       ACO_LOG("stereo: frame not replayed: %s", why);

@@ -1239,7 +1239,7 @@ apply = "live"
 [option."stereo.cursor"]
 type = "enum"
 label = "Map and menu cursor"
-help = "Depth draws a ring at the surface under the mouse pointer or left-stick cursor in each eye."
+help = "Depth places the mouse and left-stick rings on main-menu and Tours controls, and on terrain in the map."
 values = [
   { value = "game", label = "Game's cursor" },
   { value = "depth", label = "At scene depth" },
@@ -1262,7 +1262,7 @@ apply = "live"
 [option."stereo.markers"]
 type = "bool"
 label = "World marker depth"
-help = "Places in-world marker sprites and labels at visible scene depth."
+help = "Places tracked icons and their labels at the target or a nearer obstruction. Bow and Senu reticles follow the surface under the sight."
 level = "advanced"
 apply = "live"
 

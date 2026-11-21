@@ -87,6 +87,8 @@ void shaders_register(ID3D11DeviceChild* shader, ShaderKind kind, const void* by
   info.cls = classify(kind, info.bytecode);
   if (kind == ShaderKind::PS) {
     if (info.hash == 0x068233d2886bf2c8ULL || info.hash == 0xaa384ce949239abeULL) info.cls = ShaderClass::UiSprite;
+    if (info.hash == 0x49121071b3b9679aULL) info.cls = ShaderClass::UiRichText;
+    if (info.hash == 0x9b14ee478f4adcadULL) info.cls = ShaderClass::UiTourIntro;
     if (info.hash == 0xd0e87cc04dcdc27fULL) info.cls = ShaderClass::UiPlain;
   }
   if (info.cls == ShaderClass::CamEffect) cam_register_effect(shader, info.hash, bytecode, size);
@@ -124,6 +126,8 @@ const char* shader_class_name(ShaderClass c) {
   switch (c) {
     case ShaderClass::None: return "none";
     case ShaderClass::UiSprite: return "UI sprite or text";
+    case ShaderClass::UiRichText: return "UI rich text";
+    case ShaderClass::UiTourIntro: return "UI animated panel";
     case ShaderClass::UiPlain: return "UI sprite";
     case ShaderClass::TemporalAA: return "TemporalAA";
     case ShaderClass::LinearZ: return "LinearZ";
