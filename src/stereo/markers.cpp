@@ -337,9 +337,13 @@ MarkerDraw markers_begin(ID3D11DeviceContext* ctx, ShaderClass shader) {
   const auto atlas = texture_at(ctx, first_atlas);
   const bool bracket = sprite && page(atlas, 64, 64, title::origins ? DXGI_FORMAT_BC3_UNORM : DXGI_FORMAT_BC7_UNORM);
   // The ordinary bow draws its left and right spread bars as separate 32x16 sprites.
-  const bool eagle_ring = two_colors && page(atlas, 4, 4, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) &&
-                          page(texture_at(ctx, 70), 128, 128, DXGI_FORMAT_BC7_UNORM);
-  const bool reticle = eagle_ring || (plain && (page(atlas, 32, 32, DXGI_FORMAT_BC3_UNORM) ||
+  bool odyssey_reticle = false;
+  if (two_colors && page(atlas, 4, 4, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)) {
+    auto mask = texture_at(ctx, 70);
+    odyssey_reticle = page(mask, 128, 128, DXGI_FORMAT_BC7_UNORM) ||
+                      page(mask, 32, 16, DXGI_FORMAT_BC3_UNORM) || page(mask, 32, 32, DXGI_FORMAT_BC7_UNORM);
+  }
+  const bool reticle = odyssey_reticle || (plain && (page(atlas, 32, 32, DXGI_FORMAT_BC3_UNORM) ||
                                  page(atlas, 32, 16, DXGI_FORMAT_BC3_UNORM) ||
                                  page(atlas, 128, 128, DXGI_FORMAT_BC4_UNORM)));
   // Level numerals (f4b81a7a) follow a plain 128x128 shield batch.
@@ -352,7 +356,7 @@ MarkerDraw markers_begin(ID3D11DeviceContext* ctx, ShaderClass shader) {
                          (shield && page(mask, 512, 512, DXGI_FORMAT_BC1_UNORM));
   // This Odyssey material also draws the compass and UI panels. Limit the
   // depth pass to the world-icon atlas identified while scanning with Ikaros.
-  if (!title::origins && !eagle_ring && !(bracket && logo_mask)) return MarkerDraw::Game;
+  if (!title::origins && !odyssey_reticle && !(bracket && logo_mask)) return MarkerDraw::Game;
   const bool logo = label_background && logo_mask && shaders[plain ? PlainLogo : Logo] && empty_anchors &&
                     anchor_view && stream_available(ctx);
   bool record = false;
