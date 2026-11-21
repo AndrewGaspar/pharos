@@ -391,6 +391,7 @@ void stereo_on_present(IDXGISwapChain* sc, PFN_GetBuffer real_get_buffer) {
               !S.failed && !fg12_proxy_on();
   bool wide = sc == S.wide_sc;
   RecFrame* f = rec_stop();
+  TemporalPresentScope compositor;
   cam_on_present(want);
   if (!want) {
     marker_history_reset();
@@ -446,8 +447,8 @@ void stereo_on_present(IDXGISwapChain* sc, PFN_GetBuffer real_get_buffer) {
     rec_replay(f, S.imm, skip);
     g_eye.store(0, std::memory_order_relaxed);
     S.imm->CopyResource(S.eye[1], bb);
-    tmp_after_right(S.imm);
     if (right_reference) marker_history_filter(S.imm1, S.own_state);
+    tmp_after_right(S.imm);
     marker_history_publish(S.imm);
     if (cfg.stereo_cursor == "depth") {
       cursor_begin_frame(S.imm, sc, S.w, S.h);

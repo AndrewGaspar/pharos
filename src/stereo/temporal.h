@@ -25,6 +25,14 @@ void tmp_on_clear(ID3D11DeviceContext* ctx, ID3D11View* v);
 void tmp_on_finish_command_list(ID3D11DeviceContext* ctx, ID3D11CommandList* cl);
 void tmp_on_execute(ID3D11DeviceContext* imm, ID3D11CommandList* cl);
 
+// Ignore the compositor's copies and draws when identifying game-owned histories.
+struct TemporalPresentScope {
+  TemporalPresentScope();
+  ~TemporalPresentScope();
+  TemporalPresentScope(const TemporalPresentScope&) = delete;
+  TemporalPresentScope& operator=(const TemporalPresentScope&) = delete;
+};
+
 // Render thread, from stereo's Present.
 void tmp_init(ID3D11Device* dev, ID3D11DeviceContext* imm);
 // Learning bookkeeping, every frame; frame_size = immediate-context calls recorded this frame.

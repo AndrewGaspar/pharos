@@ -193,6 +193,9 @@ void drop_twins() {
 
 }  // namespace
 
+TemporalPresentScope::TemporalPresentScope() { ++g_internal; }
+TemporalPresentScope::~TemporalPresentScope() { --g_internal; }
+
 void tmp_init(ID3D11Device* dev, ID3D11DeviceContext* imm) {
   std::lock_guard lock(g_mutex);
   if (g_dev == dev) return;
@@ -262,6 +265,7 @@ void tmp_on_finish_command_list(ID3D11DeviceContext* ctx, ID3D11CommandList* cl)
 
 void tmp_on_execute(ID3D11DeviceContext* imm, ID3D11CommandList* cl) {
   (void)imm;
+  if (g_rec_replaying || g_internal) return;
   std::lock_guard lock(g_mutex);
   auto it = g_cl_lists.find(cl);
   if (it == g_cl_lists.end()) return;
