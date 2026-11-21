@@ -29,6 +29,10 @@ constexpr uintptr_t kFrameClock = 0x48b4a10;
 constexpr uintptr_t kShutdown = 0x4c23eb0;
 constexpr uintptr_t kBatchCaller = 0x135b6a5;
 constexpr uintptr_t kEmptyPrepare = 0x25121c0;
+constexpr uintptr_t kTagVtable = 0x36536d8;
+constexpr uintptr_t kTagPrepare = 0x135f810;
+constexpr uintptr_t kTagPublish = 0x135ead0;
+bool tag_layout_verified;
 
 template <typename T>
 T load(const Byte* p) {
@@ -56,10 +60,37 @@ struct Publication {
 };
 thread_local Publication publication;
 
-const Byte* resolved_asset(const Byte* entry) {
-  const Byte* handle = load<const Byte*>(entry + 0x10);
+const Byte* resolved_handle(const Byte* handle) {
   if (!handle || !(load<uint32_t>(handle + 8) & 0x80000000u)) return nullptr;
   return load<const Byte*>(handle);
+}
+
+const Byte* resolved_asset(const Byte* entry) {
+  return resolved_handle(load<const Byte*>(entry + 0x10));
+}
+
+const Byte* retained_tag_resource(const Byte* asset, size_t offset) {
+  const Byte* handle = load<const Byte*>(asset + offset);
+  if (handle != load<const Byte*>(asset + offset + 0x18)) return nullptr;
+  return resolved_handle(handle);
+}
+
+bool tag_prepared(const Byte* asset, const Byte* table) {
+  if (!tag_layout_verified || table != image + kTagVtable ||
+      load<const Byte*>(table + 0xa8) != image + kTagPrepare ||
+      load<const Byte*>(table + 0xb0) != image + kTagPublish)
+    return false;
+
+  // TagDLCAddon retains three handles. Its prepare method waits for +0x20 and
+  // +0x28, rebuilds their tables, then starts the +0x18 request and returns.
+  // Its publish method consumes the list at +0x18 on the game thread.
+  const Byte* list = retained_tag_resource(asset, 0x18);
+  if (!list || !retained_tag_resource(asset, 0x20) || !retained_tag_resource(asset, 0x28)) return false;
+  const auto& children = *reinterpret_cast<const Batch*>(list + 0x10);
+  if (children.size() > (children.counts & 0x7fffu) || (children.size() && !children.data)) return false;
+  for (uint32_t i = 0; i < children.size(); ++i)
+    if (!resolved_handle(children.data[i])) return false;
+  return true;
 }
 
 bool skipped_duplicate(const Byte* entry, const Batch& registered) {
@@ -90,7 +121,7 @@ bool completed(const Batch& batch, const Batch& registered, Stage stage) {
     if (stage == Stage::published) return false;
     if (stage == Stage::prepared && !marked) {
       const Byte* table = load<const Byte*>(asset);
-      if (load<const Byte*>(table + 0xa8) != image + kEmptyPrepare) return false;
+      if (load<const Byte*>(table + 0xa8) != image + kEmptyPrepare && !tag_prepared(asset, table)) return false;
     }
   }
   return true;
@@ -164,6 +195,17 @@ bool matches(uintptr_t rva, const Byte* bytes, size_t n) {
 
 bool install() {
   image = reinterpret_cast<Byte*>(GetModuleHandleW(nullptr));
+  // The final preparation request and the publishing method's use of its result.
+  // A mismatch keeps the ordinary three-frame deadline for this class alone.
+  const Byte tag_request[] = {
+      0x48,0x8b,0x56,0x18,0x4c,0x8d,0x05,0x89,0x7d,0x96,0x02,0x44,0x88,0x7c,0x24,0x30,0x45,0x33,0xc9,0x4c,
+      0x89,0x7c,0x24,0x28,0x33,0xc9,0x4c,0x89,0x7c,0x24,0x20,0x48,0x8b,0x52,0x10,0xe8,0x5c,0x37,0x52,0xff};
+  const Byte tag_list[] = {
+      0x48,0x8b,0x51,0x18,0x48,0x89,0x7c,0x24,0x68,0x4c,0x89,0x74,0x24,0x70,0x45,0x33,0xf6,0x41,0x8b,0xfe,
+      0x48,0x8b,0x42,0x08,0x4c,0x8b,0x02,0x48,0xc1,0xe0,0x20,0x48,0xc1,0xf8,0x3f,0x49,0x23,0xc0,
+      0xf7,0x40,0x18,0,0,0xfe,0xff};
+  tag_layout_verified = matches(0x135fd2c, tag_request, sizeof(tag_request)) &&
+                        matches(0x135eaea, tag_list, sizeof(tag_list));
   const Byte empty_method[] = {0xc2, 0, 0};
   const Byte publish[] = {0xff,0x90,0xb0,0,0,0,0xc6,0x47,0x2d,0x01};
   const Byte batch_call[] = {0x48,0x8d,0x55,0xa7,0x49,0x8b,0xcf,0xe8,0xcb,0x09,0,0};
