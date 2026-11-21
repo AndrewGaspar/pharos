@@ -1,6 +1,6 @@
 id = "aegis"
 name = "Aegis"
-version = "0.1.0-dev.1"
+version = "0.1.0-dev.2"
 kind = "mod"
 description = "DLSS Super Resolution, Frame Generation and stereoscopic rendering for Assassin's Creed Odyssey."
 save_compatible = true

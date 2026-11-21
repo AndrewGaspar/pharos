@@ -1,0 +1,40 @@
+[[page]]
+id = "odyssey"
+title = "Odyssey"
+options = ["stereo.cursor", "stereo.markers", "upscaler.render_scale", "upscaler.preset", "reflex.mode"]
+
+[option."stereo.cursor"]
+type = "enum"
+label = "Map and menu cursor"
+values = [{value="game", label="Game cursor"}, {value="depth", label="Follow the surface"}]
+help = "Applies to the mouse pointer and the left-stick ring."
+apply = "live"
+
+[option."stereo.markers"]
+type = "bool"
+label = "World marker and scanning-ring depth"
+help = "Places tracked Ikaros location icons at the target or the first obstruction, and the scanning ring at the surface under the sight."
+apply = "live"
+
+[option."upscaler.render_scale"]
+type = "float"
+label = "Render scale"
+min = 0.33
+max = 1
+step = 0.01
+precision = 3
+special = [{value=0, label="Use Odyssey’s resolution scale"}]
+marks = [{value=0.5, label="Performance"}, {value=0.58, label="Balanced"}, {value=0.667, label="Quality"}, {value=1.0, label="DLAA"}]
+apply = "restart"
+
+[option."upscaler.preset"]
+type = "enum"
+label = "DLSS model preset"
+values = [{value="default", label="Driver default"}, {value="K", label="K"}, {value="L", label="L"}, {value="M", label="M"}]
+apply = "live"
+
+[option."reflex.mode"]
+type = "enum"
+label = "NVIDIA Reflex"
+values = [{value="off", label="Off"}, {value="on", label="On"}, {value="boost", label="On with boost"}]
+apply = "live"

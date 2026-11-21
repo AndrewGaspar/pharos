@@ -6,6 +6,7 @@
 #include <string>
 #include <wrl/client.h>
 #include "core/config.h"
+#include "core/d3d11_title.h"
 #include "core/log.h"
 #include "core/lab.h"
 #include "dlss/kernels.h"
@@ -15,7 +16,7 @@
 namespace aco {
 namespace {
 using Microsoft::WRL::ComPtr;
-enum Layout { Sprite, Plain, Rich, Level, Logo, PlainLogo, LayoutCount };
+enum Layout { Sprite, Plain, Rich, Level, Logo, PlainLogo, TwoColors, LayoutCount };
 ComPtr<ID3D11GeometryShader> shaders[LayoutCount];
 ComPtr<ID3D11Buffer> anchors, empty_anchors;
 ComPtr<ID3D11ShaderResourceView> anchor_view;
@@ -38,6 +39,9 @@ struct Vertex {
 #else
 #ifndef PLAIN
   float4 color : COLOR0;
+#endif
+#ifdef TWO_COLORS
+  float4 secondColor : COLOR1;
 #endif
   float4 a : TEXCOORD1; float4 b : TEXCOORD2; float4 c : TEXCOORD3; float4 d : TEXCOORD4;
 #endif
@@ -192,8 +196,10 @@ void markers_init(ID3D11Device* dev) {
                            "#define RICH\n",
                            "#define RICH\n#define LEVEL\n",
                            "#define LOGO\n",
-                           "#define LOGO\n#define PLAIN\n"};
+                           "#define LOGO\n#define PLAIN\n",
+                           "#define TWO_COLORS\n"};
   for (int i = 0; i < LayoutCount; ++i) {
+    if (title::origins && i == TwoColors) continue;
     std::string hlsl = std::string(defines[i]) + source;
     ComPtr<ID3DBlob> code;
     code.Attach(kernels::compile_code(hlsl.data(), hlsl.size(), "pharos_marker.hlsl", "gs_5_0"));
@@ -299,12 +305,14 @@ MarkerDraw markers_begin(ID3D11DeviceContext* ctx, ShaderClass shader) {
   ctx->VSGetShader(&vs, nullptr, nullptr);
   const auto hash = shader_hash(vs.Get());
   const bool edge = hash == 0x8495d24fffb60308ULL || hash == 0xd8d8858e469845bcULL;
-  const bool sprite = hash == 0x12b61097a3a0b0e7ULL;
+  const bool sprite = hash == (title::origins ? 0x12b61097a3a0b0e7ULL : 0x8040438b60d002e2ULL);
+  const bool two_colors = !title::origins && hash == 0x76b57ce1598793e5ULL;
   if (plain  ? hash != 0xcab2d4126b8ca082ULL
       : rich ? (hash != 0x6d0fb2ea896797e3ULL && hash != 0xf4b81a7a619bd7b3ULL)
-             : !edge && !sprite && hash != 0xb1bcca4dff8812c8ULL)
+             : !edge && !sprite && !two_colors && hash != 0xb1bcca4dff8812c8ULL)
     return MarkerDraw::Game;
   Layout layout = plain ? Plain : rich ? Rich : Sprite;
+  if (two_colors) layout = TwoColors;
   if (hash == 0xf4b81a7a619bd7b3ULL) layout = Level;
   if (!shaders[layout]) return MarkerDraw::Game;
   ComPtr<ID3D11GeometryShader> gs;
@@ -314,7 +322,7 @@ MarkerDraw markers_begin(ID3D11DeviceContext* ctx, ShaderClass shader) {
   ctx->GSGetConstantBuffers(12, 1, &cb);
   if (cb) return MarkerDraw::Game;
   ctx->GSGetConstantBuffers(13, 1, &cb);
-  ctx->PSGetShaderResources(28, 1, &depth);
+  ctx->PSGetShaderResources(title::origins ? 28 : 26, 1, &depth);
   if (gs || cb || !depth) return MarkerDraw::Game;
   ID3D11ShaderResourceView* old[3]{};
   ctx->GSGetShaderResources(125, 3, old);
@@ -325,20 +333,26 @@ MarkerDraw markers_begin(ID3D11DeviceContext* ctx, ShaderClass shader) {
       v->Release();
     }
   if (occupied) return MarkerDraw::Game;
-  const auto atlas = texture_at(ctx, 70);
-  const bool bracket = sprite && page(atlas, 64, 64, DXGI_FORMAT_BC3_UNORM);
+  constexpr UINT first_atlas = title::origins ? 70 : 69;
+  const auto atlas = texture_at(ctx, first_atlas);
+  const bool bracket = sprite && page(atlas, 64, 64, title::origins ? DXGI_FORMAT_BC3_UNORM : DXGI_FORMAT_BC7_UNORM);
   // The ordinary bow draws its left and right spread bars as separate 32x16 sprites.
-  const bool reticle = plain && (page(atlas, 32, 32, DXGI_FORMAT_BC3_UNORM) ||
+  const bool eagle_ring = two_colors && page(atlas, 4, 4, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) &&
+                          page(texture_at(ctx, 70), 128, 128, DXGI_FORMAT_BC7_UNORM);
+  const bool reticle = eagle_ring || (plain && (page(atlas, 32, 32, DXGI_FORMAT_BC3_UNORM) ||
                                  page(atlas, 32, 16, DXGI_FORMAT_BC3_UNORM) ||
-                                 page(atlas, 128, 128, DXGI_FORMAT_BC4_UNORM));
+                                 page(atlas, 128, 128, DXGI_FORMAT_BC4_UNORM)));
   // Level numerals (f4b81a7a) follow a plain 128x128 shield batch.
   const bool shield = plain && page(atlas, 128, 128, DXGI_FORMAT_BC3_UNORM);
   const bool label_background = shield || bracket || (sprite && page(atlas, 16, 16, DXGI_FORMAT_BC3_UNORM_SRGB));
   // After the first guard, the level font leaves its 512px atlas mask bound
   // through the next shield. Both bindings occur in the same command list.
-  const auto mask = label_background ? texture_at(ctx, 71) : D3D11_TEXTURE2D_DESC{};
+  const auto mask = label_background ? texture_at(ctx, first_atlas + 1) : D3D11_TEXTURE2D_DESC{};
   const bool logo_mask = page(mask, 128, 128, DXGI_FORMAT_BC1_UNORM) ||
                          (shield && page(mask, 512, 512, DXGI_FORMAT_BC1_UNORM));
+  // This Odyssey material also draws the compass and UI panels. Limit the
+  // depth pass to the world-icon atlas identified while scanning with Ikaros.
+  if (!title::origins && !eagle_ring && !(bracket && logo_mask)) return MarkerDraw::Game;
   const bool logo = label_background && logo_mask && shaders[plain ? PlainLogo : Logo] && empty_anchors &&
                     anchor_view && stream_available(ctx);
   bool record = false;
@@ -365,7 +379,10 @@ MarkerDraw markers_begin(ID3D11DeviceContext* ctx, ShaderClass shader) {
 
 void markers_end(ID3D11DeviceContext* ctx, MarkerDraw draw) {
   if (draw == MarkerDraw::Game) return;
-  if (draw == MarkerDraw::RecordLogo) ctx->SOSetTargets(0, nullptr, nullptr);
+  if (draw == MarkerDraw::RecordLogo) {
+    ctx->SOSetTargets(0, nullptr, nullptr);
+    if (!title::origins && probe_requested.exchange(false)) ctx->CopyResource(probe_buffer.Get(), anchors.Get());
+  }
   ID3D11ShaderResourceView* views[3]{};
   ID3D11Buffer* cb[2]{};
   ctx->GSSetShader(nullptr, nullptr, 0);

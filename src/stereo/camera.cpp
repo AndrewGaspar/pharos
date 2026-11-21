@@ -945,6 +945,20 @@ unsigned cam_filter(ID3D11DeviceContext* ctx, CamStage stage, UINT start, UINT n
       // Its instance transforms must keep the same projection in both eyes.
       if (!title::origins && !src[kEyePos].x && !src[kEyePos].y && !src[kEyePos].z) {
         cs->main.valid = false;
+        if (stage == kVS && cfg.stereo_markers) {
+          std::lock_guard lock(g_main_mutex);
+          cs->marker_screen = true;
+          cs->marker_view = g_scene_m00 != 0;
+          cs->target_offset = UINT(-1);
+          memcpy(cs->marker_vp, g_scene_vp, sizeof(cs->marker_vp));
+          // Odyssey leaves the flat HUD camera intact. Its scanning ring needs
+          // only the new scene disparity, with zero native disparity to undo.
+          for (int e = 0; e < 2; ++e) {
+            const float eye = (e ? 1.f : -1.f) * cfg.stereo_separation * .001f;
+            cs->marker[e] = {g_scene_z, g_scene_w, {0, std::abs(g_scene_m00) * eye,
+                              cfg.stereo_convergence > 0 ? 1.f / cfg.stereo_convergence : 0.f, 0}};
+          }
+        }
         continue;
       }
       int bias = aim_bias.load(std::memory_order_relaxed);
@@ -1316,7 +1330,7 @@ struct MarkerTargets {
 
 UINT put_targets(CamCtx* cs) {
   MarkerTarget positions[kMaxMarkerTargets];
-  const size_t n = title::origins ? marker_targets_read(positions) : 0;
+  const size_t n = marker_targets_read(positions);
   MarkerTargets block{};
   const F4* vp = cs->marker_vp;
   for (size_t i = 0; i < n; ++i) {
@@ -1358,7 +1372,7 @@ bool cam_bind_marker(ID3D11DeviceContext* ctx, MarkerRole role, bool* record_log
     target_offset = cs->target_offset;
     MarkerView eyes[] = {cs->marker[0], cs->marker[1]};
     if (cs->marker_screen && role == MarkerRole::EdgeText) eyes[0].scale.w = eyes[1].scale.w = -1;
-    if (cs->marker_screen && role == MarkerRole::Reticle) eyes[0].scale.w = eyes[1].scale.w = 2;
+    if ((cs->marker_screen || !title::origins) && role == MarkerRole::Reticle) eyes[0].scale.w = eyes[1].scale.w = 2;
     offset = put_slot(cs, &eyes[0], &eyes[1], sizeof(MarkerView));
   }
   Microsoft::WRL::ComPtr<ID3D11DeviceContext1> ctx1;
@@ -1388,7 +1402,7 @@ bool cam_cursor_view(float* m00, float clip_to_view[4][4]) {
 void cam_on_present(bool stereo_on) {
   if (stereo_on && !g_pool && !g_pool_failed && g_dev) create_pool();  // only once stereo runs
   g_cam_on.store(stereo_on && g_pool && !g_pool_failed, std::memory_order_relaxed);
-  if constexpr (title::origins) marker_targets_frame(stereo_on && config().stereo_markers);
+  marker_targets_frame(stereo_on && config().stereo_markers);
   menu_previous_frame.store(menu_seen.exchange(false) && stereo_on);
   bool zoom = zoom_seen.exchange(false);
   int bias = 0;

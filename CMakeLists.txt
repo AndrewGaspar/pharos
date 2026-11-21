@@ -34,6 +34,7 @@ set(D3D11_RENDER_SOURCES
   src/stereo/camera.cpp
   src/stereo/marker_history.cpp
   src/stereo/markers.cpp
+  src/world/marker_targets.cpp
   src/stereo/system_cursor.cpp
   src/stereo/cursor.cpp
   src/stereo/temporal.cpp
@@ -50,7 +51,6 @@ add_library(aco_d3d11 SHARED ${D3D11_RENDER_SOURCES}
   src/core/tlsext.cpp
   src/core/memtool.cpp
   src/world/world.cpp
-  src/world/marker_targets.cpp
   src/world/lodpatch.cpp
   src/world/npc.cpp
   src/world/npc_units.cpp

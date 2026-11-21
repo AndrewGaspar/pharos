@@ -25,6 +25,9 @@ if [[ $target == aegis || $target == bifrost ]]; then
   cp "$out/$proxy.dll" "$out/nvngx_dlss.dll" "$out/nvngx_dlssg.dll" "$out/$target.ini" "$out/shaders.tsv" "$pkg/files/"
   cp "$root/dist/ports/$target.toml" "$pkg/quiver-mod.toml"
   sed -e "s/@id@/$target/g" -e "s/@name@/${target^}/g" "$root/dist/ports/options.toml.in" > "$pkg/quiver-options.toml"
+  if [[ -f "$root/dist/ports/$target-options.toml" ]]; then
+    cat "$root/dist/ports/$target-options.toml" >> "$pkg/quiver-options.toml"
+  fi
   echo "$pkg"
 fi
 echo "$out"

@@ -10,7 +10,7 @@
 
 namespace aco {
 namespace {
-// Origins 1.62, UIIconsController::GetWorldPosition. The custom marker
+// UIIconsController::GetWorldPosition. The custom marker
 // resolves its map position, entity/location controllers resolve the entity
 // transform, and the position controller returns the authored point.
 using GetPosition = float* (*)(void*, float*);
@@ -18,9 +18,16 @@ struct Controller {
   uintptr_t table, getter;
   GetPosition original = nullptr;
 };
+#ifdef AEGIS_ODYSSEY
+// Odyssey's Position controller returns its authored float4 at +0x200.
+Controller controllers[] = {
+    {0x444ef08, 0x2f83c90}, {0x444f010, 0x2f83d90}, {0x444f118, 0x2f83c00}, {0x444f220, 0x2f83c90}};
+constexpr unsigned kGetPosition = 28;
+#else
 Controller controllers[] = {
     {0x3822b00, 0x22f6340}, {0x3822bf0, 0xa266d0}, {0x3822ce0, 0x22f6300}, {0x3822dd0, 0x22f6340}};
 constexpr unsigned kGetPosition = 26;
+#endif
 
 struct Sample {
   MarkerTarget pos;

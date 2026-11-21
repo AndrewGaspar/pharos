@@ -94,6 +94,8 @@ void shaders_register(ID3D11DeviceChild* shader, ShaderKind kind, const void* by
   info.bytecode.assign(static_cast<const uint8_t*>(bytecode), static_cast<const uint8_t*>(bytecode) + size);
   info.cls = classify(kind, info.bytecode);
   if (kind == ShaderKind::PS) {
+    if (!title::origins && (info.hash == 0x4a6d099e4d40262bULL || info.hash == 0x97091288f72ad57cULL))
+      info.cls = ShaderClass::UiSprite;
     if (info.hash == 0x068233d2886bf2c8ULL || info.hash == 0xaa384ce949239abeULL) info.cls = ShaderClass::UiSprite;
     if (info.hash == 0x49121071b3b9679aULL) info.cls = ShaderClass::UiRichText;
     if (info.hash == 0x9b14ee478f4adcadULL) info.cls = ShaderClass::UiTourIntro;
