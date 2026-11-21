@@ -1,3 +1,4 @@
+#include "core/d3d11_title.h"
 #include "core/ctxhooks.h"
 
 #include <windows.h>
@@ -188,7 +189,7 @@ inline void draw_common(ID3D11DeviceContext* self, const char* op, const char* a
 void STDMETHODCALLTYPE hk_Draw(ID3D11DeviceContext* self, UINT a, UINT b) {
   if (skip_this_draw(self, a)) return;
   if (ACO_REC_WANT(self)) rec_draw(a, b);
-  geo_count(a, false);
+  if constexpr (title::origins) geo_count(a, false);
   char args[64] = "";
   if (trace_capturing()) snprintf(args, sizeof(args), "%u,%u", a, b);
   draw_common(self, "Draw", args, [&] { ORIG(decltype(hk_Draw), Context_Draw)(self, a, b); });
@@ -196,7 +197,7 @@ void STDMETHODCALLTYPE hk_Draw(ID3D11DeviceContext* self, UINT a, UINT b) {
 void STDMETHODCALLTYPE hk_DrawIndexed(ID3D11DeviceContext* self, UINT a, UINT b, INT c) {
   if (skip_this_draw(self, a)) return;
   if (ACO_REC_WANT(self)) rec_draw_indexed(a, b, c);
-  geo_count(a, false);
+  if constexpr (title::origins) geo_count(a, false);
   char args[64] = "";
   if (trace_capturing()) snprintf(args, sizeof(args), "%u,%u,%d", a, b, c);
   draw_common(self, "DrawIndexed", args, [&] { ORIG(decltype(hk_DrawIndexed), Context_DrawIndexed)(self, a, b, c); });
@@ -204,7 +205,7 @@ void STDMETHODCALLTYPE hk_DrawIndexed(ID3D11DeviceContext* self, UINT a, UINT b,
 void STDMETHODCALLTYPE hk_DrawInstanced(ID3D11DeviceContext* self, UINT a, UINT b, UINT c, UINT d) {
   if (skip_this_draw(self, b)) return;
   if (ACO_REC_WANT(self)) rec_draw_instanced(a, b, c, d);
-  geo_count(uint64_t(a) * b, false);
+  if constexpr (title::origins) geo_count(uint64_t(a) * b, false);
   char args[64] = "";
   if (trace_capturing()) snprintf(args, sizeof(args), "%u,%u,%u,%u", a, b, c, d);
   draw_common(self, "DrawInstanced", args,
@@ -213,7 +214,7 @@ void STDMETHODCALLTYPE hk_DrawInstanced(ID3D11DeviceContext* self, UINT a, UINT 
 void STDMETHODCALLTYPE hk_DrawIndexedInstanced(ID3D11DeviceContext* self, UINT a, UINT b, UINT c, INT d, UINT e) {
   if (skip_this_draw(self, b)) return;
   if (ACO_REC_WANT(self)) rec_draw_indexed_instanced(a, b, c, d, e);
-  geo_count(uint64_t(a) * b, false);
+  if constexpr (title::origins) geo_count(uint64_t(a) * b, false);
   char args[80] = "";
   if (trace_capturing()) snprintf(args, sizeof(args), "%u,%u,%u,%d,%u", a, b, c, d, e);
   draw_common(self, "DrawIndexedInstanced", args,
@@ -224,7 +225,7 @@ void STDMETHODCALLTYPE hk_DrawIndexedInstancedIndirect(ID3D11DeviceContext* self
   CursorDraw cursor = cursor_prepare(self, buf, off);
   if (cursor == CursorDraw::Hide) return;
   if (ACO_REC_WANT(self)) rec_draw_indexed_instanced_indirect(buf, off);
-  geo_count(0, true);
+  if constexpr (title::origins) geo_count(0, true);
   char args[64] = "";
   if (trace_capturing()) snprintf(args, sizeof(args), "\"%p\",%u", static_cast<void*>(buf), off);
   draw_common(self, "DrawIndexedInstancedIndirect", args, [&] {
@@ -251,8 +252,8 @@ void STDMETHODCALLTYPE hk_Dispatch(ID3D11DeviceContext* self, UINT x, UINT y, UI
   } else {
     trace_dispatch(self, "Dispatch", "");
   }
-  if (skinning_cs(self)) skin_count(uint64_t(x) * y * z);
-  if (culling_cs(self)) {
+  if (title::origins && skinning_cs(self)) skin_count(uint64_t(x) * y * z);
+  if (title::origins && culling_cs(self)) {
     world_on_culling_dispatch(self, [&] { ORIG(decltype(hk_Dispatch), Context_Dispatch)(self, x, y, z); });
     return;
   }
@@ -266,8 +267,8 @@ void STDMETHODCALLTYPE hk_DispatchIndirect(ID3D11DeviceContext* self, ID3D11Buff
   char args[64] = "";
   if (trace_capturing()) snprintf(args, sizeof(args), "\"%p\",%u", static_cast<void*>(buf), off);
   trace_dispatch(self, "DispatchIndirect", args);
-  if (skinning_cs(self)) skin_count(0);
-  if (culling_cs(self)) {
+  if (title::origins && skinning_cs(self)) skin_count(0);
+  if (title::origins && culling_cs(self)) {
     world_on_culling_dispatch(self, [&] { ORIG(decltype(hk_DispatchIndirect), Context_DispatchIndirect)(self, buf, off); });
     return;
   }

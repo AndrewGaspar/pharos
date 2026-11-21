@@ -1,3 +1,4 @@
+#include "core/d3d11_title.h"
 #include "stereo/camera.h"
 
 #include <windows.h>
@@ -32,12 +33,13 @@ namespace {
 
 constexpr UINT kPassParamsBytes = 2048;  // pool buffer size of PassParams (cb1)
 constexpr UINT kInstanceBytes = 512;     // pool buffer size of InstanceParams (cb3)
-constexpr UINT kPassSlot = 1, kInstanceSlot = 3;
-
-// PassParams
-constexpr int kEyePos = 0, kEyePosPrev = 1, kViewToWorld = 4, kViewToWorldPrev = 8, kWorldToView = 12,
-              kWorldToViewPrev = 16, kProj = 20, kViewProj = 24, kVNTP = 28, kViewProjPrev = 32, kVNTPPrev = 36,
-              kViewTrans = 40, kViewTransPrev = 41, kFrustum = 46, kClipToView = 57, kClipToWorld = 61;
+constexpr UINT kPassSlot = title::pass_slot, kInstanceSlot = title::instance_slot;
+constexpr int kEyePos = title::eye, kEyePosPrev = kEyePos + 1, kViewToWorld = title::view_to_world,
+              kViewToWorldPrev = kViewToWorld + 4, kWorldToView = title::world_to_view, kWorldToViewPrev = kWorldToView + 4,
+              kProj = title::projection, kViewProj = title::view_proj, kVNTP = kViewProj + 4,
+              kViewProjPrev = kViewProj + 8, kVNTPPrev = kViewProj + 12, kViewTrans = title::view_translation,
+              kViewTransPrev = kViewTrans + 1, kFrustum = title::frustum, kClipToView = title::clip_to_view,
+              kClipToWorld = title::clip_to_world;
 // InstanceParams
 constexpr int kWorld = 0, kWVP = 8, kWVPPrev = 12;
 
@@ -939,6 +941,12 @@ unsigned cam_filter(ID3D11DeviceContext* ctx, CamStage stage, UINT start, UINT n
     alignas(16) F4 l[kPassParamsBytes / 16], r[kPassParamsBytes / 16];
     UINT nreg = size / 16;
     if (slot == kPassSlot) {
+      // Odyssey uses a separate perspective camera at the origin for its flat HUD.
+      // Its instance transforms must keep the same projection in both eyes.
+      if (!title::origins && !src[kEyePos].x && !src[kEyePos].y && !src[kEyePos].z) {
+        cs->main.valid = false;
+        continue;
+      }
       int bias = aim_bias.load(std::memory_order_relaxed);
       float sep = cfg.stereo_separation * 0.001f;
       auto offset = [&](int eye, float m00) { return sep * ((eye ? 1 : -1) + bias) * (m00 < 0 ? -1 : 1); };
@@ -1308,7 +1316,7 @@ struct MarkerTargets {
 
 UINT put_targets(CamCtx* cs) {
   MarkerTarget positions[kMaxMarkerTargets];
-  const size_t n = marker_targets_read(positions);
+  const size_t n = title::origins ? marker_targets_read(positions) : 0;
   MarkerTargets block{};
   const F4* vp = cs->marker_vp;
   for (size_t i = 0; i < n; ++i) {
@@ -1380,11 +1388,11 @@ bool cam_cursor_view(float* m00, float clip_to_view[4][4]) {
 void cam_on_present(bool stereo_on) {
   if (stereo_on && !g_pool && !g_pool_failed && g_dev) create_pool();  // only once stereo runs
   g_cam_on.store(stereo_on && g_pool && !g_pool_failed, std::memory_order_relaxed);
-  marker_targets_frame(stereo_on && config().stereo_markers);
+  if constexpr (title::origins) marker_targets_frame(stereo_on && config().stereo_markers);
   menu_previous_frame.store(menu_seen.exchange(false) && stereo_on);
   bool zoom = zoom_seen.exchange(false);
   int bias = 0;
-  if (stereo_on && zoom && camera_at_player_head()) {
+  if (title::origins && stereo_on && zoom && camera_at_player_head()) {
     const auto& eye = config().stereo_aim_eye;
     bias = eye == "left" ? 1 : eye == "right" ? -1 : 0;
   }

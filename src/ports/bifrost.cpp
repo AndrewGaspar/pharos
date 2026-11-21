@@ -7,6 +7,7 @@
 
 #include "core/hook.h"
 #include "dlss/ngx.h"
+#include "ports/bifrost_resources.h"
 #include "ports/common.h"
 
 using namespace aco;
@@ -104,6 +105,7 @@ HRESULT WINAPI root_signature(ID3D12Device* dev, UINT node, const void* bytes, S
       FAILED(static_cast<IUnknown*>(*out)->QueryInterface(IID_PPV_ARGS(&root))))
     return hr;
   auto* desc = reader->GetUnconvertedRootSignatureDesc();
+  bifrost::read_layout(root.Get(), *desc);
   std::string text;
   if (desc->Version == D3D_ROOT_SIGNATURE_VERSION_1_0)
     text = layout(desc->Desc_1_0);
@@ -119,6 +121,7 @@ void tag_pipeline(IUnknown* object, const D3D12_SHADER_BYTECODE& code, ID3D12Roo
   ComPtr<ID3D12PipelineState> pso;
   if (FAILED(object->QueryInterface(IID_PPV_ARGS(&pso)))) return;
   port::tag(pso.Get(), entry);
+  bifrost::tag_inputs(pso.Get(), root, *entry);
   if (root && !entry->sampled.exchange(true)) {
     UINT size = 0;
     root->GetPrivateData(root_layout_tag, &size, nullptr);
@@ -149,11 +152,15 @@ void observe(ID3D12PipelineState* pso) {
 }
 void WINAPI bind(ID3D12GraphicsCommandList* list, ID3D12PipelineState* pso) {
   orig<decltype(bind)>(list, port::set_pso)(list, pso);
+  bifrost::bind_inputs(list, pso);
   observe(pso);
 }
 HRESULT WINAPI reset(ID3D12GraphicsCommandList* list, ID3D12CommandAllocator* allocator, ID3D12PipelineState* pso) {
   auto hr = orig<decltype(reset)>(list, port::reset_list)(list, allocator, pso);
-  if (SUCCEEDED(hr)) observe(pso);
+  if (SUCCEEDED(hr)) {
+    bifrost::reset_inputs(list, pso);
+    observe(pso);
+  }
   return hr;
 }
 HRESULT WINAPI command_list(ID3D12Device* dev, UINT node, D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator* a,
@@ -164,6 +171,8 @@ HRESULT WINAPI command_list(ID3D12Device* dev, UINT node, D3D12_COMMAND_LIST_TYP
     if (SUCCEEDED(static_cast<IUnknown*>(*out)->QueryInterface(IID_PPV_ARGS(&list)))) {
       hook_vtable(list.Get(), port::set_pso, reinterpret_cast<void*>(bind));
       hook_vtable(list.Get(), port::reset_list, reinterpret_cast<void*>(reset));
+      bifrost::observe_commands(list.Get());
+      bifrost::reset_inputs(list.Get(), pso);
       observe(pso);
     }
   }
@@ -179,6 +188,7 @@ extern "C" HRESULT WINAPI bifrost_create(IUnknown* adapter, D3D_FEATURE_LEVEL le
     ComPtr<ID3D12Device> dev;
     if (SUCCEEDED(static_cast<IUnknown*>(*out)->QueryInterface(IID_PPV_ARGS(&dev)))) {
       log_init(L"bifrost.log");
+      bifrost::observe_descriptors(dev.Get());
       ACO_LOG("Bifrost: D3D12 device, requested feature level 0x%x", level);
       hook_vtable(dev.Get(), port::create_root, reinterpret_cast<void*>(root_signature));
       hook_vtable(dev.Get(), port::graphics_pso, reinterpret_cast<void*>(graphics));

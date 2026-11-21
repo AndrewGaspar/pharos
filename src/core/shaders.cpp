@@ -1,4 +1,5 @@
 #include "core/shaders.h"
+#include "core/d3d11_title.h"
 
 #include <windows.h>
 #include <d3d11.h>
@@ -54,7 +55,14 @@ ShaderClass classify(ShaderKind kind, const std::vector<uint8_t>& bc) {
            : cam_effect_bytecode(bc.data(), bc.size())              ? ShaderClass::CamEffect
                                                                     : ShaderClass::None;
   if (kind != ShaderKind::PS) return ShaderClass::None;
-  if (contains(bc, "TemporalAA_ColorAccumulation")) return ShaderClass::TemporalAA;
+  if (contains(bc, "TemporalAA_ColorAccumulation")) {
+    // Odyssey splits geometry, sky and dither into three stencil-masked draws.
+    // Reconstruct the full color image once, from the geometry permutation.
+    if (title::origins || (contains(bc, "TemporalAA_Depth") && contains(bc, "TemporalAA_Motion") &&
+                           !contains(bc, "TemporalAA_DitherBlendColor")))
+      return ShaderClass::TemporalAA;
+    return ShaderClass::None;
+  }
   if (contains(bc, "ConvertLinearZParams_DepthBufferSampler")) return ShaderClass::LinearZ;
   if (contains(bc, "UICompositingParameters_cbuffer")) return ShaderClass::UIComposite;
   if (cam_effect_bytecode(bc.data(), bc.size())) return ShaderClass::CamEffect;

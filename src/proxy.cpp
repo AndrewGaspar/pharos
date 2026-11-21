@@ -1,6 +1,10 @@
+#include "core/d3d11_title.h"
 // d3d11.dll proxy. The game loads this from its own directory; we load the real d3d11.dll from
 // the system directory (DXVK under Proton, Microsoft's on Windows) and forward to it, installing
 // vtable hooks on the created device/contexts and on the DXGI factory/swapchain.
+#ifdef AEGIS_ODYSSEY
+#include "ports/common.h"
+#endif
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
@@ -78,16 +82,18 @@ HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain* self, UINT sync, UINT flags
     reflex_on_present_begin(self);
     dump_poll();
     fg_on_present(self);
-    memtool_poll();
-    tlsext_poll();
-    world_on_present();
-    npc_on_present();
-    npc_units_on_present();
-    framedump_on_present(self);
+    if constexpr (title::origins) {
+      memtool_poll();
+      tlsext_poll();
+      world_on_present();
+      npc_on_present();
+      npc_units_on_present();
+      framedump_on_present(self);
+      peek_on_present();
+      cloth_on_present();
+      teleport_on_present();
+    }
     mapstats_on_present();
-    peek_on_present();
-    cloth_on_present();
-    teleport_on_present();
     lab_on_present();
   }
   LARGE_INTEGER a, b, f;
@@ -256,6 +262,9 @@ void install_factory_hooks(ID3D11Device* dev) {
 std::atomic<bool> g_device_installed{false};
 
 void on_device(ID3D11Device* dev, const char* via) {
+#ifdef AEGIS_ODYSSEY
+  if (!port::active()) return;
+#endif
   ACO_LOG("%s -> device %p, feature level %x", via, static_cast<void*>(dev), dev->GetFeatureLevel());
   if (g_device_installed.exchange(true)) {
     ACO_LOG("additional device created; hooks are per-class so it is covered");
@@ -278,14 +287,17 @@ extern "C" {
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
   if (reason == DLL_PROCESS_ATTACH) {
     DisableThreadLibraryCalls(inst);
-    log_init();
+#ifdef AEGIS_ODYSSEY
+    if (!port::active()) return TRUE;
+#endif
+    log_init(title::log);
     wchar_t exe[MAX_PATH];
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    ACO_LOG("Pharos loaded into %ls", exe);
+    ACO_LOG("%s loaded into %ls", title::name, exe);
     config_reload();
     lab_init();
     config_register_lab();
-    teleport_register();
+    if constexpr (title::origins) teleport_register();
     quiver_init();
     upscaler_preinit();
     fg_preinit();

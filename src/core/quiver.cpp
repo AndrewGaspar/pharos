@@ -1,4 +1,5 @@
-#define QUIVER_MOD_VERSION "pharos"
+#include "core/d3d11_title.h"
+#define QUIVER_MOD_VERSION ::aco::title::sdk_name
 #define QUIVER_MOD_IMPLEMENTATION
 #include "core/quiver_mod.h"
 
@@ -19,7 +20,7 @@ std::string g_layout;  // last layout said
 
 void quiver_init() {
   if (g_q) return;
-  g_q = quiver_open("aco-dlss", nullptr, 0);
+  g_q = quiver_open(title::mod_id, nullptr, 0);
   if (!g_q) return;
   std::thread([] {
     for (int i = 0; i < 120; i++) {

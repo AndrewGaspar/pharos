@@ -14,7 +14,13 @@ namespace {
 //  * everything else decodes the engine's motion buffer, which stores (currentUV - previousUV)
 //    packed into RGBA8 as two 12-bit values with a quartic curve: m = sign(v) * 0.2 * v^4.
 // Unlike the TAA we don't dilate by closest depth: DLSS does its own dilation.
-const char kMotionHlsl[] = R"(
+const char kMotionHlsl[] =
+#ifdef AEGIS_ODYSSEY
+    "#define VIEW 5\n#define CLIP 68\n#define ZFRONT 53\n"
+#else
+    "#define VIEW 4\n#define CLIP 57\n#define ZFRONT 44\n"
+#endif
+R"(
 cbuffer PassParams     : register(b1) { float4 pp[85]; }
 cbuffer InstanceParams : register(b3) { float4 ip[20]; }
 cbuffer TemporalAA     : register(b5) { float4 taa[8]; }
@@ -47,10 +53,10 @@ void main(uint2 id : SV_DispatchThreadID)
     float2 motion;
     if (z >= far_threshold)
     {
-        float4 clip = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), pp[44].y, 1.0);
-        float4 v = float4(dot(clip, pp[57]), dot(clip, pp[58]), dot(clip, pp[59]), dot(clip, pp[60]));
+        float4 clip = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), pp[ZFRONT].y, 1.0);
+        float4 v = float4(dot(clip, pp[CLIP+0]), dot(clip, pp[CLIP+1]), dot(clip, pp[CLIP+2]), dot(clip, pp[CLIP+3]));
         float4 view = float4(v.xyz / v.w, 1.0);                                   // RevProjParams.ClipXYZToViewPos
-        float4 world = float4(dot(view, pp[4]), dot(view, pp[5]), dot(view, pp[6]), 1.0);   // viewToWorld
+        float4 world = float4(dot(view, pp[VIEW+0]), dot(view, pp[VIEW+1]), dot(view, pp[VIEW+2]), 1.0);   // viewToWorld
         float3 prev = float3(dot(world, ip[12]), dot(world, ip[13]), dot(world, ip[15]));   // worldViewProjPrevFrame
         float2 prev_uv = prev.xy / prev.z * float2(0.5, -0.5) + 0.5;
         motion = uv - prev_uv;

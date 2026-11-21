@@ -1,3 +1,4 @@
+#include "core/d3d11_title.h"
 #include "core/config.h"
 
 #include <windows.h>
@@ -26,8 +27,8 @@ std::atomic<unsigned> g_generation{0};  // bumped by every reload that changed s
 
 // pharos.ini; an install that still only has the pre-rename aco_dlss.ini keeps working.
 std::wstring ini_path() {
-  std::wstring p = module_dir() + L"\\pharos.ini";
-  if (GetFileAttributesW(p.c_str()) == INVALID_FILE_ATTRIBUTES) {
+  std::wstring p = module_dir() + L"\\" + title::ini;
+  if (title::origins && GetFileAttributesW(p.c_str()) == INVALID_FILE_ATTRIBUTES) {
     std::wstring old = module_dir() + L"\\aco_dlss.ini";
     if (GetFileAttributesW(old.c_str()) != INVALID_FILE_ATTRIBUTES) return old;
   }

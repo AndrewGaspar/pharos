@@ -1,3 +1,4 @@
+#include "core/d3d11_title.h"
 #include "dlss/upscaler.h"
 #include "stereo/stereo.h"
 #include "core/ctxgate.h"
@@ -48,7 +49,7 @@ struct TaaConstants {
 static_assert(sizeof(TaaConstants) == 128);
 
 // TAA resolve bindings (PS slots).
-constexpr UINT kTaaColor = 86, kTaaMotion = 87, kTaaDepth = 88, kTaaResponsive = 89;
+constexpr UINT kTaaColor = title::texture0;
 
 template <typename T>
 void safe_release(T*& p) {
@@ -548,11 +549,12 @@ bool on_taa(ID3D11DeviceContext* ctx) {
   ctx->PSGetShaderResources(kTaaColor, 4, srv);
   ID3D11RenderTargetView* rtv[1] = {};
   ctx->OMGetRenderTargets(1, rtv, nullptr);
-  ID3D11Buffer* cb[6] = {};
-  UINT first[6] = {}, num[6] = {};
+  constexpr UINT ncb = title::temporal_slot + 1;
+  ID3D11Buffer* cb[ncb] = {};
+  UINT first[ncb] = {}, num[ncb] = {};
   ID3D11DeviceContext1* c1 = nullptr;
   ctx->QueryInterface(__uuidof(ID3D11DeviceContext1), reinterpret_cast<void**>(&c1));
-  c1->PSGetConstantBuffers1(0, 6, cb, first, num);
+  c1->PSGetConstantBuffers1(0, ncb, cb, first, num);
 
   auto cleanup = [&] {
     for (auto*& s : srv) safe_release(s);
@@ -562,40 +564,46 @@ bool on_taa(ID3D11DeviceContext* ctx) {
   };
 
   TaaConstants tc;
-  if (cb[5]) {
+  if (cb[title::temporal_slot]) {
     // The engine rotates this cbuffer through a pool of identical buffers: shadow them all by size.
     // Until the first write after this is seen, the frame falls back to the game's TAA.
     D3D11_BUFFER_DESC bd{};
-    cb[5]->GetDesc(&bd);
+    cb[title::temporal_slot]->GetDesc(&bd);
     cbshadow_watch_size(bd.ByteWidth);
   }
-  bool have_tc = cb[5] && cbshadow_read(ctx, cb[5], first[5] * 16, sizeof(tc), &tc);
+  bool have_tc = cb[title::temporal_slot] && cbshadow_read(ctx, cb[title::temporal_slot], first[title::temporal_slot] * 16, sizeof(tc), &tc);
   // Camera for Frame Generation ([fg] camera=engine): PassParams (cb1) and InstanceParams (cb3) are
   // pooled too; shadow them by size as well (until the first write after this, no camera).
   FgCamera cam;
-  if (cfg.fg_mode == "d3d12" && cfg.fg_camera == "engine" && cb[1] && cb[3]) {
+  if (cfg.fg_mode == "d3d12" && cfg.fg_camera == "engine" && cb[title::pass_slot] && cb[title::instance_slot]) {
     D3D11_BUFFER_DESC b1{}, b3{};
-    cb[1]->GetDesc(&b1);
-    cb[3]->GetDesc(&b3);
+    cb[title::pass_slot]->GetDesc(&b1);
+    cb[title::instance_slot]->GetDesc(&b3);
     cbshadow_watch_size_ptr(b1.ByteWidth);
     cbshadow_watch_size_ptr(b3.ByteWidth);
-    cam.valid = cbshadow_read(ctx, cb[1], first[1] * 16 + 4 * 16, sizeof(cam.view_to_world), cam.view_to_world) &&
-                cbshadow_read(ctx, cb[1], first[1] * 16 + 57 * 16, sizeof(cam.clip_to_view), cam.clip_to_view) &&
-                cbshadow_read(ctx, cb[3], first[3] * 16 + 12 * 16, sizeof(cam.prev_view_proj), cam.prev_view_proj);
+    cam.valid = cbshadow_read(ctx, cb[title::pass_slot], first[title::pass_slot] * 16 + title::view_to_world * 16, sizeof(cam.view_to_world), cam.view_to_world) &&
+                cbshadow_read(ctx, cb[title::pass_slot], first[title::pass_slot] * 16 + title::clip_to_view * 16, sizeof(cam.clip_to_view), cam.clip_to_view) &&
+                cbshadow_read(ctx, cb[title::instance_slot], first[title::instance_slot] * 16 + 12 * 16, sizeof(cam.prev_view_proj), cam.prev_view_proj);
   }
   static std::atomic<int> diag{0};
   if (diag++ < 6)
     ACO_LOG("upscaler: TAA ctx=%p imm=%d have_tc=%d color=%p motion=%p depth=%p rt0=%p cb1=%p cb3=%p", static_cast<void*>(ctx),
             ctx == S.imm, have_tc, static_cast<void*>(srv[0]), static_cast<void*>(srv[1]), static_cast<void*>(srv[2]),
-            static_cast<void*>(rtv[0]), static_cast<void*>(cb[1]), static_cast<void*>(cb[3]));
-  if (!have_tc || !srv[0] || !srv[1] || !srv[2] || !rtv[0] || !cb[1] || !cb[3]) {
+            static_cast<void*>(rtv[0]), static_cast<void*>(cb[title::pass_slot]), static_cast<void*>(cb[title::instance_slot]));
+  if (!have_tc || !srv[0] || !srv[1] || !srv[2] || !rtv[0] || !cb[title::pass_slot] || !cb[title::instance_slot]) {
     if (S.n_bail++ < 40) {
       D3D11_BUFFER_DESC bd{};
-      if (cb[5]) cb[5]->GetDesc(&bd);
+      if (cb[title::temporal_slot]) cb[title::temporal_slot]->GetDesc(&bd);
       ACO_LOG("upscaler: TAA bail have_tc=%d srv=%d%d%d rtv=%d cb1=%d cb3=%d cb5=%p bw=%u usage=%u cpu=%x first=%u num=%u",
-              have_tc, !!srv[0], !!srv[1], !!srv[2], !!rtv[0], !!cb[1], !!cb[3], static_cast<void*>(cb[5]), bd.ByteWidth,
-              bd.Usage, bd.CPUAccessFlags, first[5], num[5]);
+              have_tc, !!srv[0], !!srv[1], !!srv[2], !!rtv[0], !!cb[title::pass_slot], !!cb[title::instance_slot], static_cast<void*>(cb[title::temporal_slot]), bd.ByteWidth,
+              bd.Usage, bd.CPUAccessFlags, first[title::temporal_slot], num[title::temporal_slot]);
     }
+    cleanup();
+    return false;
+  }
+  if (!(tc.low_res_size[0] >= 1 && tc.low_res_size[0] <= D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION &&
+        tc.low_res_size[1] >= 1 && tc.low_res_size[1] <= D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION &&
+        std::isfinite(tc.sub_pixel_jitter[0]) && std::isfinite(tc.sub_pixel_jitter[1]))) {
     cleanup();
     return false;
   }
@@ -641,7 +649,9 @@ bool on_taa(ID3D11DeviceContext* ctx) {
     ctx->CSSetUnorderedAccessViews(0, 1, &S.mv_uav, nullptr);
     for (int i = 0; i < 3; ++i) {
       UINT slot = kernels::kMotionCbSlots[i];
-      c1->CSSetConstantBuffers1(slot, 1, &cb[slot], &first[slot], &num[slot]);
+      constexpr UINT source_slots[] = {title::pass_slot, title::instance_slot, title::temporal_slot};
+      UINT source = source_slots[i];
+      c1->CSSetConstantBuffers1(slot, 1, &cb[source], &first[source], &num[source]);
     }
     ctx->Dispatch((rw + 7) / 8, (rh + 7) / 8, 1);
 
@@ -658,7 +668,7 @@ bool on_taa(ID3D11DeviceContext* ctx) {
 
   // 2) Keep engine consumers of the TAA output (screenshots, next-frame effects) fed with the
   //    un-antialiased colour, since the TAA resolve no longer writes it.
-  ctx->CopyResource(taa_out, color);
+  if constexpr (title::origins) ctx->CopyResource(taa_out, color);
 
   // 3) DLSS runs between the two halves of this command list.
   auto job = std::make_shared<Job>();
@@ -686,7 +696,8 @@ bool on_taa(ID3D11DeviceContext* ctx) {
   } else {
     split_here(ctx, std::move(job));
   }
-  return true;
+  // Odyssey still renders its three masked draws into the engine-owned history.
+  return title::origins;
 }
 
 bool on_composite(ID3D11DeviceContext* ctx, const std::function<void()>& draw) {
@@ -703,7 +714,7 @@ bool on_composite(ID3D11DeviceContext* ctx, const std::function<void()>& draw) {
   // scene = t87 (texture1). Only the scene slot may be swapped: at 100% render scale the engine's
   // texture pool hands former TAA outputs to the UI layer too, so identity alone isn't enough.
   ID3D11ShaderResourceView* srv[2] = {};
-  ctx->PSGetShaderResources(86, 2, srv);
+  ctx->PSGetShaderResources(title::texture0, 2, srv);
   int slot = -1;
   if (srv[1]) {
     std::lock_guard lock(S.mutex);
@@ -721,9 +732,9 @@ bool on_composite(ID3D11DeviceContext* ctx, const std::function<void()>& draw) {
   }
   if (slot >= 0) {
     S.n_swap++;
-    ctx->PSSetShaderResources(86 + slot, 1, &S.out_srv);
+    ctx->PSSetShaderResources(title::texture0 + slot, 1, &S.out_srv);
     draw();
-    ctx->PSSetShaderResources(86 + slot, 1, &srv[slot]);
+    ctx->PSSetShaderResources(title::texture0 + slot, 1, &srv[slot]);
   }
   for (auto*& s : srv) safe_release(s);
   return slot >= 0;
@@ -734,7 +745,7 @@ std::wstring game_ini_path() {
   wchar_t* docs = nullptr;
   std::wstring p;
   if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &docs))) {
-    p = std::wstring(docs) + L"\\Assassin's Creed Origins\\ACO.ini";
+    p = std::wstring(docs) + title::game_ini;
     CoTaskMemFree(docs);
   }
   return p;
