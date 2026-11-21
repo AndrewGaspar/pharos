@@ -20,12 +20,21 @@ enum Layout { Sprite, Plain, Rich, Level, Logo, PlainLogo, TwoColors, LayoutCoun
 ComPtr<ID3D11GeometryShader> shaders[LayoutCount];
 ComPtr<ID3D11Buffer> anchors, empty_anchors;
 ComPtr<ID3D11ShaderResourceView> anchor_view;
+// Sample while the HUD actually has scene depth bound. The game's scratch image can
+// be reused before Present. The other eye reads only the sight eye's copy.
+ComPtr<ID3D11Texture2D> aim_pixel, aim_reference;
+ComPtr<ID3D11ShaderResourceView> aim_view;
+std::atomic<int> captured_aim_eye{-1}, previous_aim_eye{-1};
 std::atomic<bool> initialized{false}, probe_requested{false};
 ComPtr<ID3D11Buffer> probe_buffer;
+// Slot 124 carries the Origins sight ray. Other titles only use slots 125–127.
+constexpr UINT kFirstMarkerSrv = title::origins ? 124 : 125;
+constexpr UINT kMarkerSrvs = 128 - kFirstMarkerSrv;
 constexpr UINT kAnchorCount = 1536;  // six vertices per icon
 const char source[] = R"(
 cbuffer Targets : register(b12) { uint numTargets; float4 targets[192]; }
 cbuffer Camera : register(b13) { float4 zRow; float4 wRow; float4 scale; }
+Texture2D<float> AimDepth : register(t124);
 Texture2D<float4> History : register(t125);
 Buffer<float4> Anchors : register(t126);
 Texture2D<float> Depth : register(t127);
@@ -88,7 +97,8 @@ void main(triangle Vertex vs[3], inout TriangleStream<OUTPUT> outStream) {
   float2 mono = centre;
   mono.x -= scale.x*(scale.z-nativeInvZ);
   float targetInvZ=0, bestError=1e20;
-  bool reticle = scale.w == 2;
+  bool otherSightEye = scale.w == 3;
+  bool reticle = scale.w >= 2;
   // The screen-edge font also draws the range below the middle of the compass.
   // Keep that label on its authored HUD plane along with the compass ticks.
   bool compassLabel = scale.w == -1 && abs(mono.x) < 0.24 && mono.y > 0.77 && mono.y < 0.90;
@@ -116,12 +126,31 @@ void main(triangle Vertex vs[3], inout TriangleStream<OUTPUT> outStream) {
     History.GetDimensions(tiles.x,tiles.y);
     // Both eyes aim along one ray. The selected Predator eye supplies its native
     // centre pixel, including when the rim of the bow crosses the other eye's view.
-    float d = all(tiles>0) ? History.Load(int3((sceneSize/2)/4,0)).z : Depth.Load(int3(sceneSize/2,0));
+    float d;
+    if (otherSightEye) {
+      uint aw, ah;
+      AimDepth.GetDimensions(aw,ah);
+      if (!aw && all(abs(mono) < 0.12)) return;
+      d = AimDepth.Load(int3(0,0,0));
+    } else {
+      d = all(tiles>0) ? History.Load(int3((sceneSize/2)/4,0)).z : Depth.Load(int3(sceneSize/2,0));
+    }
     float4 clip = float4(0,0,d,1);
     surface = max(0,-dot(wRow,clip)/dot(zRow,clip));
     targetInvZ = 0;
+    if (otherSightEye && all(abs(mono) < 0.12)) {
+      // The string or the bow can lie in front of the target in just this eye.
+      // All triangles of the sight dot test its shared optical axis.
+      float2 projected = float2(scale.y*(scale.z-surface),0);
+      uint2 pixel = uint2(clamp((projected*float2(.5,-.5)+.5)*sceneSize,0,float2(sceneSize)-1));
+      float4 hit = float4(projected,Depth.Load(int3(pixel,0)),1);
+      float blocker = -dot(wRow,hit)/dot(zRow,hit);
+      // A stale right-eye sample after a turn can also be in front of the
+      // current target. Require agreement to within two screen pixels.
+      if (abs(scale.y*(blocker-surface))*sceneSize.x > 4) return;
+    }
   }
-  float invZ = surface > targetInvZ ? surface*1.005 : targetInvZ;
+  float invZ = otherSightEye ? surface : surface > targetInvZ ? surface*1.005 : targetInvZ;
 #ifdef RICH
 #ifndef LEVEL
   // Use the projected local origin of the whole text mesh so every glyph chooses
@@ -191,6 +220,15 @@ bool stream_available(ID3D11DeviceContext* ctx) {
 }  // namespace
 
 void markers_init(ID3D11Device* dev) {
+  if constexpr (title::origins) {
+    D3D11_TEXTURE2D_DESC pixel{};
+    pixel.Width = pixel.Height = pixel.MipLevels = pixel.ArraySize = pixel.SampleDesc.Count = 1;
+    pixel.Format = DXGI_FORMAT_R32_FLOAT;
+    dev->CreateTexture2D(&pixel, nullptr, &aim_pixel);
+    pixel.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    if (SUCCEEDED(dev->CreateTexture2D(&pixel, nullptr, &aim_reference)))
+      dev->CreateShaderResourceView(aim_reference.Get(), nullptr, &aim_view);
+  }
   const char* defines[] = {"",
                            "#define PLAIN\n",
                            "#define RICH\n",
@@ -332,8 +370,8 @@ MarkerDraw markers_begin(ID3D11DeviceContext* ctx, ShaderClass shader) {
   ctx->GSGetConstantBuffers(13, 1, &cb);
   ctx->PSGetShaderResources(title::origins ? 28 : 26, 1, &depth);
   if (gs || cb || !depth) return MarkerDraw::Game;
-  ID3D11ShaderResourceView* old[3]{};
-  ctx->GSGetShaderResources(125, 3, old);
+  ID3D11ShaderResourceView* old[4]{};
+  ctx->GSGetShaderResources(kFirstMarkerSrv, kMarkerSrvs, old);
   bool occupied = false;
   for (auto* v : old)
     if (v) {
@@ -374,7 +412,35 @@ MarkerDraw markers_begin(ID3D11DeviceContext* ctx, ShaderClass shader) {
   if (logo) role = MarkerRole::Logo;
   if (rich) role = MarkerRole::Label;
   if (reticle) role = MarkerRole::Reticle;
-  if (!cam_bind_marker(ctx, role, &record)) return MarkerDraw::Game;
+  ComPtr<ID3D11Texture2D> aim_source;
+  D3D11_BOX center{};
+  if (reticle && aim_pixel && aim_view) {
+    ComPtr<ID3D11Resource> resource;
+    depth->GetResource(&resource);
+    D3D11_SHADER_RESOURCE_VIEW_DESC view{};
+    depth->GetDesc(&view);
+    if (view.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D && view.Format == DXGI_FORMAT_R32_FLOAT &&
+        SUCCEEDED(resource.As(&aim_source))) {
+      D3D11_TEXTURE2D_DESC desc{};
+      aim_source->GetDesc(&desc);
+      if (desc.MipLevels == 1 && desc.ArraySize == 1 && !(desc.BindFlags & D3D11_BIND_DEPTH_STENCIL)) {
+        const UINT x = desc.Width / 2, y = desc.Height / 2;
+        center = {x, y, 0, x + 1, y + 1, 1};
+      } else {
+        aim_source.Reset();
+      }
+    }
+  }
+  int sight_eye = -1;
+  if (!cam_bind_marker(ctx, role, &record, aim_source.Get() != nullptr, &sight_eye)) return MarkerDraw::Game;
+  ID3D11ShaderResourceView* target = nullptr;
+  if (sight_eye >= 0 && aim_source) {
+    ctx->CopySubresourceRegion(aim_pixel.Get(), 0, 0, 0, 0, aim_source.Get(), 0, &center);
+    // Left is rendered first. Right-sight aiming can use its last completed
+    // frame only after the game has actually drawn this sight in that eye.
+    if (sight_eye == 0 || previous_aim_eye.load(std::memory_order_relaxed) == sight_eye)
+      target = aim_view.Get();
+  }
   if (record) {
     layout = plain ? PlainLogo : Logo;
     ctx->CopyResource(anchors.Get(), empty_anchors.Get());
@@ -383,10 +449,26 @@ MarkerDraw markers_begin(ID3D11DeviceContext* ctx, ShaderClass shader) {
   }
   if (rich && probe_requested.exchange(false)) ctx->CopyResource(probe_buffer.Get(), anchors.Get());
   auto history = marker_history_sample(depth.Get());
-  ID3D11ShaderResourceView* views[] = {history.Get(), rich ? anchor_view.Get() : nullptr, depth.Get()};
+  ID3D11ShaderResourceView* views[] = {target, history.Get(), rich ? anchor_view.Get() : nullptr, depth.Get()};
   ctx->GSSetShader(shaders[layout].Get(), nullptr, 0);
-  ctx->GSSetShaderResources(125, 3, views);
+  ctx->GSSetShaderResources(kFirstMarkerSrv, kMarkerSrvs, views + (kFirstMarkerSrv - 124));
   return record ? MarkerDraw::RecordLogo : MarkerDraw::Shift;
+}
+
+void markers_note_aim_draw(int eye) {
+  captured_aim_eye.store(eye, std::memory_order_relaxed);
+}
+
+void markers_save_aim_depth(ID3D11DeviceContext* ctx, int eye) {
+  const int captured = eye == 0 ? captured_aim_eye.load(std::memory_order_relaxed) :
+                                  captured_aim_eye.exchange(-1, std::memory_order_relaxed);
+  if (captured == eye) ctx->CopyResource(aim_reference.Get(), aim_pixel.Get());
+  if (eye == 1) previous_aim_eye.store(captured, std::memory_order_relaxed);
+}
+
+void markers_reset_aim_depth() {
+  captured_aim_eye.store(-1, std::memory_order_relaxed);
+  previous_aim_eye.store(-1, std::memory_order_relaxed);
 }
 
 void markers_end(ID3D11DeviceContext* ctx, MarkerDraw draw) {
@@ -395,10 +477,10 @@ void markers_end(ID3D11DeviceContext* ctx, MarkerDraw draw) {
     ctx->SOSetTargets(0, nullptr, nullptr);
     if (!title::origins && probe_requested.exchange(false)) ctx->CopyResource(probe_buffer.Get(), anchors.Get());
   }
-  ID3D11ShaderResourceView* views[3]{};
+  ID3D11ShaderResourceView* views[4]{};
   ID3D11Buffer* cb[2]{};
   ctx->GSSetShader(nullptr, nullptr, 0);
-  ctx->GSSetShaderResources(125, 3, views);
+  ctx->GSSetShaderResources(kFirstMarkerSrv, kMarkerSrvs, views);
   ctx->GSSetConstantBuffers(12, 2, cb);
 }
 }  // namespace aco

@@ -267,8 +267,12 @@ player origin. This measures the camera rig. The model's eye dominance cannot be
 Lab run r29 showed the dot inside the selected aperture for each setting at 32.5 mm separation
 and 4 m convergence.
 
-The Predator Bow dot uses the depth at the centre of the selected eye's view. That eye keeps
-the native sight line. The other eye sees the corresponding 3D point. The bow and Senu reticles
+Pharos samples the centre depth while the Predator Bow HUD draws in the sight eye and projects
+that point into the other eye. If the bowstring or another surface blocks the target there, only
+the sight eye sees the dot. The left eye renders first. For right-eye aim the left view uses the
+previous right-eye sample and checks its projection against the current scene within two render
+pixels. The first frame of right-eye aim uses a single dot until that depth is available.
+The bow and Senu reticles
 sample the centre ray independently of tagged world icons. The ordinary bow draws its
 spread marks with two separate 32×16 sprites. Each uses the same ray as the center dot,
 preserving the spread the game displays as the bow is drawn.

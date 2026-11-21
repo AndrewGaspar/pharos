@@ -400,6 +400,7 @@ void stereo_on_present(IDXGISwapChain* sc, PFN_GetBuffer real_get_buffer) {
   if (!want) {
     if (rig::armed()) rig::abort_capture("D3D11 replay backend unavailable");
     marker_history_reset();
+    markers_reset_aim_depth();
     cursor_set_active(false);
     tmp_frame_end(false, nullptr, 0);
     rec_free(f);
@@ -467,6 +468,7 @@ void stereo_on_present(IDXGISwapChain* sc, PFN_GetBuffer real_get_buffer) {
     double t0 = now_ms();
     S.imm->CopyResource(S.eye[0], bb);
     const bool right_reference = cam_right_aim();
+    markers_save_aim_depth(S.imm, 0);
     if (!right_reference) marker_history_filter(S.imm1, S.own_state);
     cursor_save_left(S.imm);
     tmp_before_right(S.imm);
@@ -483,6 +485,7 @@ void stereo_on_present(IDXGISwapChain* sc, PFN_GetBuffer real_get_buffer) {
     rec_replay(f, S.imm, skip);
     g_eye.store(0, std::memory_order_relaxed);
     S.imm->CopyResource(S.eye[1], bb);
+    markers_save_aim_depth(S.imm, 1);
     if (right_reference) marker_history_filter(S.imm1, S.own_state);
     tmp_after_right(S.imm);
     marker_history_publish(S.imm);
@@ -512,6 +515,7 @@ void stereo_on_present(IDXGISwapChain* sc, PFN_GetBuffer real_get_buffer) {
     S.bytes_sum += rec_frame_bytes(f);
   } else {
     marker_history_reset();
+    markers_reset_aim_depth();
     cursor_set_active(false);
     if (why && why != S.last_bad) {
       ACO_LOG("stereo: frame not replayed: %s", why);

@@ -20,6 +20,7 @@
 #include "core/vtidx.h"
 #include "stereo/record.h"
 #include "stereo/cursor.h"
+#include "stereo/markers.h"
 #include "stereo/stereo.h"
 #include "world/teleport.h"
 #include "world/marker_targets.h"
@@ -288,6 +289,7 @@ std::shared_ptr<Chunk> new_chunk() {
 // {9c4f2d8e-1b7a-4e3c-8f5d-2a6b0c9e7d14}
 const GUID kCamGuid = {0x9c4f2d8e, 0x1b7a, 0x4e3c, {0x8f, 0x5d, 0x2a, 0x6b, 0x0c, 0x9e, 0x7d, 0x14}};
 struct ClChunks final : IUnknown {
+  int captured_sight_eye = -1;
   std::atomic<ULONG> refs{1};
   std::vector<std::shared_ptr<Chunk>> chunks;
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
@@ -324,6 +326,7 @@ struct Shadow {
 
 struct MarkerView { F4 z, w, scale; };
 struct CamCtx {
+  int captured_sight_eye = -1;
   bool marker_view = false;
   bool marker_screen = false;
   bool edge_group = false;
@@ -1159,6 +1162,8 @@ void cam_finish_command_list(ID3D11DeviceContext* ctx, ID3D11CommandList* cl) {
   cs->last_main.valid = false;
   if (cs->chunks.empty()) return;
   auto* h = new ClChunks;
+  h->captured_sight_eye = cs->captured_sight_eye;
+  cs->captured_sight_eye = -1;
   h->chunks = std::move(cs->chunks);
   cs->chunks.clear();
   if (cl) cl->SetPrivateDataInterface(kCamGuid, h);
@@ -1333,6 +1338,7 @@ void cam_before_execute(ID3D11DeviceContext* imm, ID3D11CommandList* cl, int eye
   if (FAILED(cl->GetPrivateData(kCamGuid, &size, &u)) || !u) return;
   auto* h = static_cast<ClChunks*>(u);
   for (auto& ch : h->chunks) upload_chunk(imm, *ch, eye);
+  if (h->captured_sight_eye == eye) markers_note_aim_draw(eye);
   u->Release();
 }
 
@@ -1410,7 +1416,7 @@ UINT put_targets(CamCtx* cs) {
   return put_slot(cs, &block, &block, sizeof(block));
 }
 
-bool cam_bind_marker(ID3D11DeviceContext* ctx, MarkerRole role, bool* record_logo) {
+bool cam_bind_marker(ID3D11DeviceContext* ctx, MarkerRole role, bool* record_logo, bool can_capture_aim, int* sight_eye) {
   if (ctx == g_imm) return false;
   CamCtx* cs = ctx_state(ctx);
   if (!cs) return false;
@@ -1433,7 +1439,14 @@ bool cam_bind_marker(ID3D11DeviceContext* ctx, MarkerRole role, bool* record_log
     target_offset = cs->target_offset;
     MarkerView eyes[] = {cs->marker[0], cs->marker[1]};
     if (cs->marker_screen && role == MarkerRole::EdgeText) eyes[0].scale.w = eyes[1].scale.w = -1;
-    if ((cs->marker_screen || !title::origins) && role == MarkerRole::Reticle) eyes[0].scale.w = eyes[1].scale.w = 2;
+    if ((cs->marker_screen || !title::origins) && role == MarkerRole::Reticle) {
+      eyes[0].scale.w = eyes[1].scale.w = 2;
+      if (title::origins && (eyes[0].scale.y == 0) != (eyes[1].scale.y == 0)) {
+        *sight_eye = eyes[0].scale.y == 0 ? 0 : 1;
+        eyes[1 - *sight_eye].scale.w = 3;
+        if (can_capture_aim) cs->captured_sight_eye = *sight_eye;
+      }
+    }
     offset = put_slot(cs, &eyes[0], &eyes[1], sizeof(MarkerView));
   }
   Microsoft::WRL::ComPtr<ID3D11DeviceContext1> ctx1;

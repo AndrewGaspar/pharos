@@ -62,7 +62,7 @@ void cam_bind_panel_plane(ID3D11DeviceContext* ctx, UINT offset);
 
 // Bind per-eye geometry shader constants for a matching UI pass.
 enum class MarkerRole { Ordinary, Edge, EdgeText, Bracket, Logo, Label, Reticle };
-bool cam_bind_marker(ID3D11DeviceContext* ctx, MarkerRole role, bool* record_logo);
+bool cam_bind_marker(ID3D11DeviceContext* ctx, MarkerRole role, bool* record_logo, bool can_capture_aim, int* sight_eye);
 bool cam_right_aim();
 struct MarkerCamera { float pos[3], look[3], m00; };
 MarkerCamera cam_marker_view();
