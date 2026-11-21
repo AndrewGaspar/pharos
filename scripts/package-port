@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Assemble a port and its per-install shader signatures for a disposable lab.
+set -euo pipefail
+if [[ $# != 2 ]]; then echo "usage: $0 odyssey|valhalla GAME_INSTALL" >&2; exit 2; fi
+case $1 in
+  odyssey) target=aegis; proxy=d3d11;;
+  valhalla) target=bifrost; proxy=d3d12;;
+  *) echo "expected odyssey or valhalla" >&2; exit 2;;
+esac
+root=$(cd "$(dirname "$0")/.." && pwd)
+build=$root/build
+cmake -S "$root" -B "$build" -G Ninja -DCMAKE_TOOLCHAIN_FILE="$root/cmake/mingw-w64.cmake"
+cmake --build "$build" --target "$target"
+out=$build/ports/$target/mod
+mkdir -p "$out"
+"$root/tools/lab/port-shaders" "$1" "$2" "$out/shaders.tsv"
+cp "$build/ports/$target/$proxy.dll" "$out/"
+sdk=$root/third_party/DLSS-310.9.16/lib/Windows_x86_64/rel
+cp "$sdk/nvngx_dlss.dll" "$sdk/nvngx_dlssg.dll" "$out/"
+echo "$out"

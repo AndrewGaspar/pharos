@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""Build a shader lookup table for Aegis or Bifrost from an installed game's shader bank."""
+import argparse
+import struct
+from pathlib import Path
+
+
+def unpack(data, offset, count=1):
+    return struct.unpack_from(f"<{count}I", data, offset)
+
+
+def cstring(data, offset):
+    return data[offset:data.index(b"\0", offset)].decode("ascii")
+
+
+def chunks(blob):
+    size, count = unpack(blob, 24, 2)
+    if blob[:4] != b"DXBC" or size != len(blob):
+        raise ValueError("invalid DXBC container")
+    for off in unpack(blob, 32, count):
+        length, = unpack(blob, off + 4)
+        if off + 8 + length > size:
+            raise ValueError("invalid DXBC chunk")
+        yield blob[off:off + 4], blob[off + 8:off + 8 + length]
+
+
+def camera_fields(rdef):
+    wanted = {"viewmatrix", "viewtoworld", "projmatrix", "viewprojmatrix",
+              "worldviewprojprevframe", "clipxyztoviewpos", "subpixeljitter",
+              "lowressize", "fullressize", "maxviewdepthparams"}
+    def members(type_offset, base, depth):
+        if depth > 8:
+            return
+        cls, _, _, _, _, count, offset = struct.unpack_from("<6HI", rdef, type_offset)
+        if cls != 5:
+            return
+        for i in range(count):
+            name, child, relative = unpack(rdef, offset + i * 12, 3)
+            field = cstring(rdef, name)
+            if field.lower() in wanted:
+                yield f"{field}@{base + relative}"
+            yield from members(child, base + relative, depth + 1)
+
+    count, start = unpack(rdef, 0, 2)
+    for i in range(count):
+        name, nvars, offset = unpack(rdef, start + i * 24, 3)
+        cb = cstring(rdef, name)
+        if cb not in {"TemporalAA_cbuffer", "PassParams_cbuffer", "InstanceParams_cbuffer"}:
+            continue
+        for j in range(nvars):
+            _, base, _, _, var_type = unpack(rdef, offset + j * 40, 5)
+            for field in members(var_type, base, 0):
+                yield f"{cb.split('_')[0]}.{field}"
+
+
+def odyssey(data):
+    pos = 0
+    # Odyssey appends a 16-byte bank digest after the concatenated containers.
+    while len(data) - pos != 16 and pos < len(data):
+        size, = unpack(data, pos + 24)
+        blob = data[pos:pos + size]
+        for tag, rdef in chunks(blob):
+            if tag != b"RDEF":
+                continue
+            _, _, count, start, target = unpack(rdef, 0, 5)
+            stage = {0xffff: "PS", 0xfffe: "VS", 0x4353: "CS"}.get(target >> 16)
+            bindings = {}
+            for i in range(count):
+                name, kind, _, _, _, slot, _, _ = unpack(rdef, start + 32 * i, 8)
+                prefix = {0: "b", 3: "s", 4: "u", 6: "u", 8: "u", 9: "u", 10: "u", 11: "u"}.get(kind, "t")
+                bindings[cstring(rdef, name)] = f"{prefix}{slot}"
+            if "TemporalAA_ColorAccumulation" in bindings:
+                role = "temporal-resolve" if "TemporalAA_Color" in bindings else "temporal-history"
+            elif "ConvertLinearZParams_DepthBufferSampler" in bindings:
+                role = "linear-depth"
+            elif "UICompositingParameters_cbuffer" in bindings:
+                role = "ui-composite"
+            else:
+                continue
+            if stage:
+                slots = [f"{v}={k}" for k, v in bindings.items()]
+                yield blob[4:20], stage + "/" + role, " ".join(slots + list(camera_fields(rdef)))
+        pos += size
+
+
+def register_ranges(blob):
+    # SM5.1 declarations carry the register-space number even with RDEF stripped.
+    # The immediate indices of each range operand are its ID, first and last slot.
+    register = {0x58: "t", 0x59: "b", 0x5a: "s", 0x9c: "u", 0x9d: "u",
+                0x9e: "u", 0xa1: "t", 0xa2: "t"}
+    for tag, body in chunks(blob):
+        if tag != b"SHEX" or unpack(body, 0)[0] & 0xff != 0x51:
+            continue
+        length, = unpack(body, 4)
+        if length * 4 != len(body):
+            raise ValueError("invalid SM5.1 token count")
+        offset = 2
+        while offset < length:
+            token, = unpack(body, 4 * offset)
+            op = token & 0x7ff
+            count = (token >> 24) & 0x7f
+            if op == 0x35:  # custom data carries its length in the next word
+                count, = unpack(body, 4 * (offset + 1))
+            if not count or offset + count > length:
+                raise ValueError("invalid SM5.1 instruction")
+            if op in register:
+                args = unpack(body, 4 * (offset + 1), count - 1)
+                if len(args) < 5 or ((args[0] >> 20) & 3) != 3 or args[0] >> 22:
+                    raise ValueError("unsupported SM5.1 descriptor-range operand")
+                first, last, space = args[2], args[3], args[-1]
+                slot = str(first) if first == last else f"{first}-{last}"
+                size = f"[{args[-2]}x16B]" if op == 0x59 else ""
+                yield f"{register[op]}{slot}/space{space}{size}"
+            offset += count
+
+
+def valhalla(data):
+    if data[:4] != b"SBIN":
+        raise ValueError("expected a Valhalla SBIN file")
+    pos, count = unpack(data, 4, 2)
+    sources = {"temporalaa.hlsl", "convertlinearz.hlsl", "uicompositing.hlsl",
+               "fsr.hlsl", "motionvectordebug.hlsl", "upscaleutils.hlsl"}
+    for _ in range(count):
+        header, size = unpack(data, pos, 2)
+        length, = unpack(data, pos + 24)
+        if header != length + 28 or size < 32 or pos + header + size > len(data):
+            raise ValueError(f"invalid SBIN record at {pos}")
+        name = bytes(b ^ b"SBIN"[i % 4] for i, b in enumerate(data[pos + 28:pos + header]))
+        stage, source, permutation = name.rstrip(b"\0").decode("ascii").split(":", 2)
+        blob = data[pos + header:pos + header + size]
+        if blob[:4] != b"DXBC" or unpack(blob, 24)[0] != size:
+            raise ValueError(f"invalid shader at {pos}")
+        pos += header + size
+        if source.lower() in sources:
+            entry = permutation.rsplit(", ", 1)[-1]
+            yield blob[4:20], f"{stage}/{source}/{entry}", " ".join([permutation, *register_ranges(blob)])
+    if pos != len(data):
+        raise ValueError("unexpected trailing SBIN records")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("game", choices=["odyssey", "valhalla"])
+    parser.add_argument("install", type=Path)
+    parser.add_argument("output", type=Path)
+    args = parser.parse_args()
+    bank, scan = ("ShaderDataDX11.bin", odyssey) if args.game == "odyssey" else ("ShaderDataDX12.bin", valhalla)
+    rows = sorted(set(scan((args.install / bank).read_bytes())))
+    if not rows:
+        parser.exit(1, f"No matching shaders in {bank}\n")
+    args.output.write_text("".join(f"{key.hex()}\t{role}\t{detail}\n" for key, role, detail in rows))
+    print(f"{args.game}: {len(rows)} shader entries in {args.output}")
+
+
+if __name__ == "__main__":
+    main()

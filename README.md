@@ -4,6 +4,8 @@ A from-source mod for **Assassin's Creed Origins** (PC, v1.62): NVIDIA DLSS 4.5 
 place of the game's TAA, NVIDIA Reflex, DLSS Frame Generation / Multi Frame Generation, and denser
 city crowds. Named after the Lighthouse of Alexandria.
 
+Development ports for Odyssey (Aegis) and Valhalla (Bifrost) are documented in [the port notes](docs/PORTS.md).
+
 Built with mingw; it loads as a `d3d11.dll` proxy. The exe is Denuvo + VMProtect protected and is
 never modified on disk: rendering changes happen at the D3D11 API level, and the world tweaks
 (crowds, LOD, cloth) adjust engine data and object vtables in memory at runtime.

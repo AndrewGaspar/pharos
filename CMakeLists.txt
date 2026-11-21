@@ -11,6 +11,7 @@ set(DLSS_SDK ${CMAKE_SOURCE_DIR}/third_party/DLSS-310.9.16 CACHE PATH "NVIDIA DL
 
 # d3d11.dll proxy: loaded from the game directory, forwards to the system d3d11 (DXVK under Proton).
 add_library(aco_d3d11 SHARED
+  src/core/d3d11_forward.cpp
   src/core/log.cpp
   src/core/lab.cpp
   src/core/hook.cpp
@@ -61,3 +62,20 @@ target_compile_definitions(aco_d3d11 PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICOD
 target_compile_options(aco_d3d11 PRIVATE -Wall -Wno-unknown-pragmas -fno-strict-aliasing)
 target_link_options(aco_d3d11 PRIVATE -static -static-libgcc -static-libstdc++ -Wl,--enable-stdcall-fixup)
 target_link_libraries(aco_d3d11 PRIVATE dxguid uuid ole32 shell32 advapi32 ws2_32)
+
+# Build each port explicitly. The default package is still Origins.
+function(add_anvil_port name executable proxy)
+  add_library(${name} SHARED EXCLUDE_FROM_ALL src/ports/common.cpp src/core/log.cpp
+    src/core/hook.cpp src/dlss/ngx.cpp ${ARGN})
+  set_target_properties(${name} PROPERTIES OUTPUT_NAME ${proxy} PREFIX ""
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/ports/${name}"
+    ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/ports/${name}/lib")
+  target_include_directories(${name} PRIVATE src ${DLSS_SDK}/include)
+  target_compile_definitions(${name} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE
+    __USE_MINGW_ANSI_STDIO=1 PORT_NAME="${name}" PORT_EXE=L"${executable}")
+  target_compile_options(${name} PRIVATE -Wall -Wno-unknown-pragmas)
+  target_link_options(${name} PRIVATE -static -static-libgcc -static-libstdc++)
+  target_link_libraries(${name} PRIVATE dxguid uuid advapi32)
+endfunction()
+add_anvil_port(aegis ACOdyssey d3d11 src/ports/aegis.cpp src/ports/aegis_sr.cpp src/core/d3d11_forward.cpp src/core/vtidx.cpp src/d3d11.def)
+add_anvil_port(bifrost ACValhalla d3d12 src/ports/bifrost.cpp src/ports/bifrost_slots.cpp src/ports/bifrost.def)

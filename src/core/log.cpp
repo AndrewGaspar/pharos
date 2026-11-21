@@ -33,10 +33,10 @@ const std::wstring& out_dir() {
   return g_out;
 }
 
-void log_init() {
+void log_init(const wchar_t* filename) {
   std::lock_guard lock(g_mutex);
   if (g_file) return;
-  std::wstring path = out_dir() + L"\\pharos.log";
+  std::wstring path = out_dir() + L"\\" + std::wstring(filename);
   // In the Quiver lab this is the run's folder: the instance manifest names it log_file=run:pharos.log
   // (for `quiver lab set --wait`).
   g_file = _wfopen(path.c_str(), L"w");
