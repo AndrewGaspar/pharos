@@ -280,6 +280,14 @@ bool panel_begin(ID3D11DeviceContext* ctx, ShaderClass shader, UINT* caption_off
   ctx->VSGetShader(&vs, nullptr, nullptr);
   const bool intro = shader == ShaderClass::UiTourIntro;
   const auto hash = shader_hash(vs.Get());
+  if (!title::origins) {
+    if (shader != ShaderClass::UiSprite || hash != 0x76b57ce1598793e5ULL) return false;
+    const auto art = texture_at(ctx, 70);
+    return art.Usage == D3D11_USAGE_IMMUTABLE && art.MipLevels == 1 &&
+           page(art, 1920, 1080, DXGI_FORMAT_BC7_UNORM) &&
+           page(texture_at(ctx, 69), 4, 4, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) && !texture_at(ctx, 71).Width &&
+           cam_begin_panel(ctx, false, caption_offset);
+  }
   if (shader == ShaderClass::UiSprite && hash == 0x12b61097a3a0b0e7ULL) {
     return page(texture_at(ctx, 70), 1920, 1080, DXGI_FORMAT_BC1_UNORM) &&
            page(texture_at(ctx, 71), 128, 128, DXGI_FORMAT_BC1_UNORM) && cam_begin_panel(ctx, true, caption_offset);

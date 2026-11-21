@@ -945,9 +945,11 @@ unsigned cam_filter(ID3D11DeviceContext* ctx, CamStage stage, UINT start, UINT n
       // Its instance transforms must keep the same projection in both eyes.
       if (!title::origins && !src[kEyePos].x && !src[kEyePos].y && !src[kEyePos].z) {
         cs->main.valid = false;
-        if (stage == kVS && cfg.stereo_markers) {
-          std::lock_guard lock(g_main_mutex);
+        if (stage == kVS) {
           cs->marker_screen = true;
+          memcpy(cs->ui_camera, src, kPassParamsBytes);
+          if (!cfg.stereo_markers) continue;
+          std::lock_guard lock(g_main_mutex);
           cs->marker_view = g_scene_m00 != 0;
           cs->target_offset = UINT(-1);
           memcpy(cs->marker_vp, g_scene_vp, sizeof(cs->marker_vp));
@@ -1305,7 +1307,10 @@ bool cam_begin_panel(ID3D11DeviceContext* ctx, bool menu, UINT* caption_offset) 
       for (int eye = 0; eye < 2; ++eye) {
         memcpy(eyes[eye], mono, kPassParamsBytes);
         F4* vp = eyes[eye] + kVNTP;
-        for (int row = 0; row < 2; ++row)
+        // Odyssey clips the scrollable caption to a fixed vertical rectangle.
+        // Its horizontal guard band must preserve the native line baselines.
+        const int guard_rows = title::origins ? 2 : 1;
+        for (int row = 0; row < guard_rows; ++row)
           for (int col = 0; col < 4; ++col) (&vp[row].x)[col] *= 1.0f + shift;
         add_row(vp[0], vp[3], eye == 0 ? shift : -shift);
       }
