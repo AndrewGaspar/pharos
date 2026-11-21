@@ -1,17 +1,30 @@
 # Assassin's Creed Origins (AnvilNext 2.0, v1.62) — rendering notes
 
-Everything here was derived from frame captures taken with this mod's tracer (`touch <out>/capture`)
-and from reflection data still embedded in the game's DXBC shaders. Resource names below are the
+The rendering notes use frame captures from this mod's tracer (`touch <out>/capture`)
+and reflection data embedded in the game's DXBC shaders. Resource names below are the
 HLSL names from that reflection data.
 
 ## Executable
 
-- `ACOrigins.exe` is protected by Denuvo (`.arch`, `.srdata`, `.xtls`) and VMProtect
-  (`.vmp0`, `.vmp1`). We therefore don't patch code; everything happens at the D3D11 API level.
 - Imports only `D3D11CreateDevice` and `CreateDXGIFactory1`; a `d3d11.dll` next to the exe is
   loaded instead of the system one (Proton: `WINEDLLOVERRIDES=d3d11=n,b`).
 - Creates 3 D3D11 devices (two probes, then the real one) and 9 deferred contexts. Almost all
   rendering is recorded on deferred contexts and executed on the immediate context.
+
+## Launch-screen content check
+
+On Origins 1.62, the content-loading worker waits three engine frames at each of three
+points in a batch of local add-on records. At 10 FPS each delay costs about 300 ms,
+even when streaming has already finished. Pharos shortens these waits for the title
+screen's request once the engine has acquired the assets, finished preparation or
+acknowledged publication on the game thread, respectively. It verifies the original
+instructions before enabling the change. Unsupported preparations and batches whose
+completion cannot be established use the game's original deadline.
+
+In a Quiver lab with 28 packages, the time from pressing A to the main menu fell
+from 64 to 35 seconds at 10 FPS and from 33 to 18 seconds at 20 FPS. The worker
+used 234–235 engine frames, down from 519–522 on v21. All 255 add-on records and
+all three registered entries matched across the four runs.
 
 ## Frame structure (post-processing end of the frame)
 

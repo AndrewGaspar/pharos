@@ -50,6 +50,7 @@ set(D3D11_RENDER_SOURCES
   src/proxy.cpp
   src/d3d11.def)
 add_library(aco_d3d11 SHARED ${D3D11_RENDER_SOURCES}
+  src/core/content_loader.cpp
   src/core/tlsext.cpp
   src/core/memtool.cpp
   src/world/world.cpp

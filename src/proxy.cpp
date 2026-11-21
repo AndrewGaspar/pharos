@@ -20,6 +20,7 @@
 #include "core/lab.h"
 #include "core/vtidx.h"
 #include "core/config.h"
+#include "core/content_loader.h"
 #include "core/ctxhooks.h"
 #include "core/latency.h"
 #include "reflex/reflex.h"
@@ -269,6 +270,7 @@ void on_device(ID3D11Device* dev, const char* via) {
   if (g_device_installed.exchange(true)) {
     ACO_LOG("additional device created; hooks are per-class so it is covered");
   }
+  if constexpr (title::origins) install_content_loader_fix();
   ctxhooks_install_device(dev);
   install_factory_hooks(dev);
   reflex_on_device(dev);
