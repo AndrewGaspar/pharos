@@ -16,6 +16,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -59,15 +60,77 @@ std::string env(const char* name) {
   return unix_env(name);
 }
 
-std::string socket_path() {
-  std::string sig = env("HYPRLAND_INSTANCE_SIGNATURE");
-  if (sig.empty()) return {};
+std::string instance_root() {
   std::string xdg = env("XDG_RUNTIME_DIR");
   if (xdg.empty()) return {};
-  std::string p = "Z:" + xdg + "/hypr/" + sig + "/.socket.sock";
+  std::string p = "Z:" + xdg + "/hypr/";
   for (auto& c : p)
     if (c == '/') c = '\\';
   return p;
+}
+
+SOCKET connect_instance(const std::string& dir) {
+  std::string path = dir + "\\.socket.sock";
+  SockaddrUn a{};
+  if (path.size() >= sizeof(a.sun_path)) return INVALID_SOCKET;
+  SOCKET s = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (s == INVALID_SOCKET) return s;
+  a.sun_family = AF_UNIX;
+  memcpy(a.sun_path, path.c_str(), path.size());
+  if (connect(s, reinterpret_cast<sockaddr*>(&a), sizeof a) == 0) return s;
+  closesocket(s);
+  return INVALID_SOCKET;
+}
+
+// A long-lived launcher can hand the game a signature from the previous desktop session.
+// hyprctl's instance lock records the compositor PID and Wayland socket on separate lines.
+// Recover only on the game's own display, and cache only an instance we actually connected to.
+SOCKET connect_compositor() {
+  static std::mutex mu;
+  static std::string working;
+  std::lock_guard lock(mu);
+  const std::string root = instance_root();
+  const std::string sig = env("HYPRLAND_INSTANCE_SIGNATURE");
+  if (root.empty() || sig.empty()) return INVALID_SOCKET;
+  const std::string preferred = root + sig;
+  if (!working.empty()) {
+    SOCKET s = connect_instance(working);
+    if (s != INVALID_SOCKET) return s;
+  }
+  if (working != preferred) {
+    SOCKET s = connect_instance(preferred);
+    if (s != INVALID_SOCKET) {
+      working = preferred;
+      return s;
+    }
+  }
+  working.clear();
+  std::string display = env("WAYLAND_DISPLAY");
+  if (display.empty()) return INVALID_SOCKET;
+  const std::string runtime = env("XDG_RUNTIME_DIR") + "/";
+  if (display.compare(0, runtime.size(), runtime) == 0) display.erase(0, runtime.size());
+  WIN32_FIND_DATAA entry{};
+  HANDLE it = FindFirstFileA((root + "*").c_str(), &entry);
+  if (it == INVALID_HANDLE_VALUE) return INVALID_SOCKET;
+  SOCKET s = INVALID_SOCKET;
+  do {
+    if (!(entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || entry.cFileName[0] == '.') continue;
+    std::string dir = root + entry.cFileName;
+    if (dir == preferred) continue;
+    std::ifstream info(dir + "\\hyprland.lock");
+    std::string pid, socket_name;
+    if (!std::getline(info, pid) || !std::getline(info, socket_name)) continue;
+    if (socket_name != display && socket_name != runtime + display) continue;
+    s = connect_instance(dir);
+    if (s != INVALID_SOCKET) {
+      working = dir;
+      ACO_LOG("hyprland: recovered compositor %s for Wayland display %s (inherited %s)",
+              entry.cFileName, display.c_str(), sig.c_str());
+      break;
+    }
+  } while (FindNextFileA(it, &entry));
+  FindClose(it);
+  return s;
 }
 
 // Find `"key": ` after `from` and before `end` in a JSON text; returns the position of the value.
@@ -270,25 +333,20 @@ void thread_main() {
 
 }  // namespace
 
-bool hypr_available() { return !socket_path().empty(); }
+bool hypr_available() { return !env("HYPRLAND_INSTANCE_SIGNATURE").empty() && !instance_root().empty(); }
 
 std::string hypr_request(const std::string& req) {
   static bool wsa = [] {
     WSADATA w;
     return WSAStartup(MAKEWORD(2, 2), &w) == 0;
   }();
-  std::string path = socket_path();
-  if (!wsa || path.empty() || path.size() >= sizeof(SockaddrUn::sun_path)) return {};
-  SOCKET s = socket(1 /* AF_UNIX */, SOCK_STREAM, 0);
+  if (!wsa) return {};
+  SOCKET s = connect_compositor();
   if (s == INVALID_SOCKET) return {};
-  SockaddrUn a{};
-  a.sun_family = 1;
-  memcpy(a.sun_path, path.c_str(), path.size());
   std::string out;
   DWORD tmo = 2000;
   setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tmo), sizeof tmo);
-  if (connect(s, reinterpret_cast<sockaddr*>(&a), sizeof a) == 0 &&
-      send(s, req.data(), int(req.size()), 0) == int(req.size())) {
+  if (send(s, req.data(), int(req.size()), 0) == int(req.size())) {
     char buf[8192];
     int n;
     while ((n = recv(s, buf, sizeof buf, 0)) > 0) out.append(buf, size_t(n));

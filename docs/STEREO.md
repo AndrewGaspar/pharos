@@ -233,6 +233,13 @@ Under DXVK, `sbs` can't reach full resolution in a 1920 window yet:
 ported from torchbearer. `mode = auto` turns stereo on while HypXRland reports the game's monitor as
 `"stereo": "sbs"`.
 
+If Quiver stays open across a compositor restart, a new game can inherit the retired
+`HYPRLAND_INSTANCE_SIGNATURE`. Pharos first tries that instance. If the connection fails,
+it checks the instance locks in `$XDG_RUNTIME_DIR/hypr` for the game's `WAYLAND_DISPLAY`
+and connects there before choosing a swapchain. A successful fallback writes
+`hyprland: recovered compositor` in `pharos.log`. If a previous launch already selected the
+frame-generation back buffer, a fresh game launch is required to switch to stereo.
+
 **Frame Generation is off for the session once `[stereo] mode` isn't `off`.** It presents generated
 frames from its own back buffer.
 
