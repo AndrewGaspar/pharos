@@ -327,8 +327,10 @@ MarkerDraw markers_begin(ID3D11DeviceContext* ctx, ShaderClass shader) {
   if (occupied) return MarkerDraw::Game;
   const auto atlas = texture_at(ctx, 70);
   const bool bracket = sprite && page(atlas, 64, 64, DXGI_FORMAT_BC3_UNORM);
-  const bool reticle =
-      plain && (page(atlas, 32, 32, DXGI_FORMAT_BC3_UNORM) || page(atlas, 128, 128, DXGI_FORMAT_BC4_UNORM));
+  // The ordinary bow draws its left and right spread bars as separate 32x16 sprites.
+  const bool reticle = plain && (page(atlas, 32, 32, DXGI_FORMAT_BC3_UNORM) ||
+                                 page(atlas, 32, 16, DXGI_FORMAT_BC3_UNORM) ||
+                                 page(atlas, 128, 128, DXGI_FORMAT_BC4_UNORM));
   // Level numerals (f4b81a7a) follow a plain 128x128 shield batch.
   const bool shield = plain && page(atlas, 128, 128, DXGI_FORMAT_BC3_UNORM);
   const bool label_background = shield || bracket || (sprite && page(atlas, 16, 16, DXGI_FORMAT_BC3_UNORM_SRGB));

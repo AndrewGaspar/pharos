@@ -262,7 +262,9 @@ and 4 m convergence.
 
 The Predator Bow dot uses the depth at the centre of the selected eye's view. That eye keeps
 the native sight line. The other eye sees the corresponding 3D point. The bow and Senu reticles
-sample the centre ray independently of tagged world icons.
+sample the centre ray independently of tagged world icons. The ordinary bow draws its
+spread marks with two separate 32×16 sprites. Each uses the same ray as the center dot,
+preserving the spread the game displays as the bow is drawn.
 
 `stereo.markers` reads the world positions returned by the game's position, entity, custom
 marker and dynamic location icon controllers on Origins 1.62. Sprite positions are compressed
@@ -295,6 +297,12 @@ resumes. The frame statistics record held pairs and mono fallbacks separately. D
 
 ## Not done / known issues
 
+- **Intermittent purple-white flash.** In an Alexandria capture from r36, Senu and the HUD
+  remained visible while the landscape in the left eye washed out. The right eye retained
+  its normal colors. After the v18 change to stereo history tracking, r41 and r42 showed
+  normal brightness in both eyes on the same transition. In r42, 24 movement captures
+  with DLSS and 24 with game TAA covered walking and flight. The reported flash did not
+  recur. Its cause remains unconfirmed.
 - **Full resolution needs DXVK to honour the larger-swapchain switch** (above).
 - **Occlusion and frustum culling use the left eye's camera.** HZB culling and the per-instance
   culling constants aren't redirected, so objects at the right edge of the right eye could be culled
