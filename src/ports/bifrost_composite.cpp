@@ -8,6 +8,7 @@
 #include "core/hook.h"
 #include "ports/common.h"
 #include "ports/bifrost_sr.h"
+#include "ports/bifrost_eye.h"
 #include "ports/bifrost_present.h"
 
 using namespace aco;
@@ -94,8 +95,11 @@ ComPtr<ID3D12RootSignature> alternate(ID3D12Device* dev, ID3D12RootSignature* ro
   n = d.NumParameters;
   if (n > 16) return {};
   std::vector<D3D12_ROOT_PARAMETER> params(d.pParameters, d.pParameters + n);
-  for (const auto& p : params)
-    if (p.ParameterType != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) return {};
+  UINT camera = eye::enabled() ? eye::root_index(root) : UINT_MAX;
+  for (UINT i = 0; i < n; ++i) {
+    if (i == camera && params[i].ParameterType == D3D12_ROOT_PARAMETER_TYPE_CBV) continue;
+    if (params[i].ParameterType != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) return {};
+  }
   D3D12_ROOT_PARAMETER image{}, dimensions{};
   image.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
   image.Descriptor = {0, 77};
@@ -147,7 +151,8 @@ void prepare_composite(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELINE_STATE_DE
   ACO_LOG("Bifrost: native UI pipeline accepts alternate scene in root %u", n);
 }
 bool composite(ID3D12GraphicsCommandList* list, ID3D12Resource* native, ID3D12PipelineState* pso,
-               ID3D12RootSignature* root, const UINT64* tables, const std::function<void()>& draw) {
+               ID3D12RootSignature* root, const UINT64* tables, UINT camera_index, UINT64 camera_address,
+               const std::function<void()>& draw) {
   if (!native || !pso || !root) return false;
   auto output = output_for(native);
   if (!output) {
@@ -170,7 +175,10 @@ bool composite(ID3D12GraphicsCommandList* list, ID3D12Resource* native, ID3D12Pi
     set_root(list, r);
     set_pso(list, p);
     for (UINT i = 0; i < n; ++i)
-      if (tables[i]) set_table(list, i, {tables[i]});
+      if (i == camera_index)
+        list->SetGraphicsRootConstantBufferView(i, camera_address);
+      else if (tables[i])
+        set_table(list, i, {tables[i]});
   };
   auto d = output->GetDesc();
   UINT pitch =

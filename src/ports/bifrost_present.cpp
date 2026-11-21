@@ -17,6 +17,8 @@
 #include "fg/camera.h"
 #include "ports/bifrost_scene.h"
 #include "ports/bifrost_replay.h"
+#include "ports/bifrost_eye.h"
+#include "ports/bifrost_stereo.h"
 #include "ports/bifrost_sr.h"
 #include "ports/bifrost_verify.h"
 #include "ports/common.h"
@@ -30,6 +32,7 @@ extern const size_t execute, resize1;
 namespace bifrost {
 namespace {
 const GUID session_tag{0x4266010b, 0xa117, 0x43a1, {0xb9, 0x41, 0xad, 0x64, 0x23, 0x04, 0x31, 0xc9}};
+const GUID eye_tag{0x276e3ecd, 0x1f80, 0x4042, {0xb4, 0x73, 0xda, 0xf3, 0x0c, 0x40, 0xdf, 0x22}};
 const GUID frame_tag{0x4266010b, 0xa117, 0x43a1, {0xb9, 0x41, 0xad, 0x64, 0x23, 0x04, 0x31, 0xca}};
 const GUID composite_tag{0x4266010b, 0xa117, 0x43a1, {0xb9, 0x41, 0xad, 0x64, 0x23, 0x04, 0x31, 0xcb}};
 struct Composite {
@@ -71,7 +74,7 @@ Fn ngx_proc(const char* name) {
 class Session final : public IUnknown {
  public:
   explicit Session(ID3D12CommandQueue* q) : queue(q) {
-    fg_enabled = GetPrivateProfileIntW(L"fg", L"enabled", 1, ini_file().c_str()) != 0;
+    fg_enabled = !eye::enabled() && option(L"fg", L"enabled", 1);
     hudless = option(L"fg", L"hudless", 1) && !option(L"upscaler", L"compare", 0);
     verify = GetPrivateProfileIntW(L"fg", L"verify", 0, ini_file().c_str()) != 0;
   }
@@ -92,7 +95,7 @@ class Session final : public IUnknown {
   template <class Resize>
   HRESULT resize(IDXGISwapChain* chain, Resize&& resize_buffers) {
     std::lock_guard guard(lock);
-    if (!drain()) return DXGI_ERROR_DEVICE_RESET;
+    if (!drain() || !stereo.drain()) return DXGI_ERROR_DEVICE_RESET;
     HRESULT hr = resize_buffers();
     if (SUCCEEDED(hr)) {
       DXGI_SWAP_CHAIN_DESC d{};
@@ -101,6 +104,7 @@ class Session final : public IUnknown {
           SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(&dev))))
         display_size(dev.Get(), d.BufferDesc.Width, d.BufferDesc.Height);
       reset_history = true;
+      stereo.invalidate();
       refresh_checked = false;
       period = {};
       next_flip = {};
@@ -115,11 +119,21 @@ class Session final : public IUnknown {
     if (flags & (DXGI_PRESENT_TEST | DXGI_PRESENT_DO_NOT_WAIT | DXGI_PRESENT_RESTART)) return flip();
     replay::present();
     finish_sr_frame(queue.Get());
-    if (!fg_enabled) return flip();
+    if (!fg_enabled && !eye::alternating()) return flip();
     Scene scene;
     {
       std::lock_guard handoff_guard(handoff);
       scene = recorded_scene(queue.Get());
+    }
+    if (eye::alternating()) {
+      bool fresh = scene.info.serial && scene.info.serial != seen;
+      stereo.present(chain, queue.Get(), fresh ? scene.info.eye : -1);
+      seen = scene.info.serial;
+      if (fresh) {
+        int next = 1 - scene.info.eye;
+        queue->SetPrivateData(eye_tag, sizeof(next), &next);
+      }
+      return flip();
     }
     if (!scene.info.serial || scene.info.serial == seen || !scene.motion || !scene.depth) {
       reset_history = true;
@@ -381,6 +395,7 @@ class Session final : public IUnknown {
   }
   NVSDK_NGX_Result (*evaluate)(ID3D12GraphicsCommandList*, const NVSDK_NGX_Handle*, const NVSDK_NGX_Parameter*,
                                void*){};
+  StereoOutput stereo;
   VerifyFrames verifier;
   UINT generated_count = 1;
   bool fg_enabled{}, verify{}, hudless{};
@@ -443,6 +458,14 @@ void WINAPI execute(ID3D12CommandQueue* q, UINT count, ID3D12CommandList* const*
   UINT bytes = sizeof(attached);
   if (FAILED(q->GetPrivateData(session_tag, &bytes, &attached)) || !attached) return original(q, count, lists);
   std::lock_guard submit_guard(submissions);
+  int eye_index = 0;
+  if (eye::enabled()) {
+    UINT length = sizeof(eye_index);
+    q->GetPrivateData(eye_tag, &length, &eye_index);
+    Scene camera;
+    for (UINT i = 0; i < count && !camera.info.serial; ++i) camera = recorded_scene(lists[i]);
+    eye::prepare(count, lists, camera.info.camera.valid ? camera.info.camera.view_to_world[0] : nullptr, eye_index);
+  }
   static std::atomic<unsigned> trace_count{};
   if (trace_count.load(std::memory_order_relaxed) < 24) {
     for (UINT i = 0; i < count; ++i) {
@@ -461,6 +484,7 @@ void WINAPI execute(ID3D12CommandQueue* q, UINT count, ID3D12CommandList* const*
     UINT bytes = sizeof(size);
     if (FAILED(lists[i]->GetPrivateData(frame_tag, &bytes, &size)) || !size.width) continue;
     auto scene = recorded_scene(lists[i]);
+    scene.info.eye = eye_index;
     original(q, i + 1 - start, lists + start);
     start = i + 1;
     if (scene.output && !upscale(q, scene)) scene.output.Reset();
@@ -497,7 +521,7 @@ void attach(IUnknown* creator, IDXGISwapChain* chain) {
       queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT)
     return;
   DXGI_SWAP_CHAIN_DESC desc{};
-  if (GetPrivateProfileIntW(L"upscaler", L"enabled", 1, ini_file().c_str()) && SUCCEEDED(chain->GetDesc(&desc)))
+  if (option(L"upscaler", L"enabled", 1) && SUCCEEDED(chain->GetDesc(&desc)))
     attach_sr(queue.Get(), desc.BufferDesc.Width, desc.BufferDesc.Height);
   auto* session = new Session(queue.Get());
   const auto hr = chain->SetPrivateDataInterface(session_tag, session);

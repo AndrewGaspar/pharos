@@ -9,6 +9,7 @@
 #include "core/log.h"
 #include "dlss/ngx.h"
 #include "ports/bifrost_scene.h"
+#include "ports/bifrost_eye.h"
 
 using Microsoft::WRL::ComPtr;
 using namespace aco;
@@ -20,7 +21,8 @@ namespace {
 constexpr GUID key(unsigned n) {
   return {0xa61c4df1, 0x4690, 0x4206, {0x83, 0x61, 0x36, 0x30, 0x4e, 0xc8, 0x10, BYTE(n)}};
 }
-constexpr GUID output_key = key(1), display_buffer_key = key(2), queue_key = key(3), display_key = key(4);
+constexpr GUID output_key = key(1), display_buffer_key = key(2), queue_key = key(3), display_key = key(4),
+               right_key = key(5);
 constexpr auto read_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 struct Size {
   UINT width{}, height{};
@@ -286,9 +288,11 @@ void attach_sr(ID3D12CommandQueue* q, UINT width, UINT height) {
   ComPtr<ID3D12Device> dev;
   if (FAILED(q->GetDevice(IID_PPV_ARGS(&dev)))) return;
   display_size(dev.Get(), width, height);
-  auto* sr = new Upscaler(q);
-  q->SetPrivateDataInterface(queue_key, sr);
-  sr->Release();
+  for (int i = 0; i < (eye::alternating() ? 2 : 1); ++i) {
+    auto* sr = new Upscaler(q);
+    q->SetPrivateDataInterface(i ? right_key : queue_key, sr);
+    sr->Release();
+  }
 }
 void prepare_output(ID3D12Resource* native, Scene& scene) {
   if (!native) return;
@@ -325,11 +329,15 @@ ComPtr<ID3D12Resource> display_buffer(ID3D12Resource* output) {
   return associated<ID3D12Resource>(output, display_buffer_key);
 }
 bool upscale(ID3D12CommandQueue* queue, const Scene& scene) {
-  auto sr = associated<IUnknown>(queue, queue_key);
+  auto sr = associated<IUnknown>(queue, eye::alternating() && scene.info.eye ? right_key : queue_key);
   return sr && static_cast<Upscaler*>(sr.Get())->eval(scene);
 }
 void finish_sr_frame(ID3D12CommandQueue* queue) {
   auto sr = associated<IUnknown>(queue, queue_key);
   if (sr) static_cast<Upscaler*>(sr.Get())->finish();
+  if (eye::alternating()) {
+    auto right = associated<IUnknown>(queue, right_key);
+    if (right) static_cast<Upscaler*>(right.Get())->finish();
+  }
 }
 }  // namespace bifrost

@@ -17,6 +17,7 @@
 #include "ports/bifrost_scene.h"
 #include "ports/bifrost_composite.h"
 #include "ports/bifrost_replay.h"
+#include "ports/bifrost_eye.h"
 
 using aco::orig;
 using Microsoft::WRL::ComPtr;
@@ -55,6 +56,8 @@ struct Bindings {
   UINT64 roots[16]{};
   ID3D12RootSignature* signature{};
   Slot graphics_camera, compute_camera;
+  UINT64 graphics_eye_address{};
+  UINT graphics_eye{UINT_MAX}, compute_eye{UINT_MAX};
   DrawState draw;
 };
 struct View {
@@ -206,23 +209,39 @@ void WINAPI set_heaps(ID3D12GraphicsCommandList* list, UINT count, ID3D12Descrip
   st.heap = h;
   save(list, st);
 }
-void note_camera(ID3D12GraphicsCommandList* list, const Bindings& st, Slot slot, UINT root,
+void note_camera(ID3D12GraphicsCommandList* list, Bindings& st, bool compute, UINT root,
                  D3D12_GPU_DESCRIPTOR_HANDLE h) {
+  const auto slot = compute ? st.compute_camera : st.graphics_camera;
   if (!slot.count || root != slot.root || !st.heap.stride || h.ptr < st.heap.gpu) return;
   auto offset = h.ptr - st.heap.gpu + UINT64(slot.offset) * st.heap.stride;
   if (offset >= st.heap.length) return;
-  std::lock_guard guard(lock);
-  auto v = descriptors.find(st.heap.cpu + offset);
-  if (v != descriptors.end() && v->second.kind == 'b') replay::camera(list, v->second.id, UINT(v->second.width));
+  View view{};
+  {
+    std::lock_guard guard(lock);
+    auto v = descriptors.find(st.heap.cpu + offset);
+    if (v != descriptors.end() && v->second.kind == 'b') view = v->second;
+  }
+  if (view.id && replay::tracking()) replay::camera(list, view.id, UINT(view.width));
+  UINT parameter = compute ? st.compute_eye : st.graphics_eye;
+  if (parameter != UINT_MAX) {
+    auto va = eye::bind(list, view.id, UINT(view.width));
+    if (compute)
+      list->SetComputeRootConstantBufferView(parameter, va);
+    else {
+      st.graphics_eye_address = va;
+      list->SetGraphicsRootConstantBufferView(parameter, va);
+    }
+  }
 }
 void WINAPI compute_table(ID3D12GraphicsCommandList* list, UINT i, D3D12_GPU_DESCRIPTOR_HANDLE h) {
   orig<decltype(compute_table)>(list, port::set_ctable)(list, i, h);
   auto st = get<ID3D12GraphicsCommandList, Bindings>(list, list_tag);
-  note_camera(list, st, st.compute_camera, i, h);
+  note_camera(list, st, true, i, h);
 }
 void WINAPI compute_root(ID3D12GraphicsCommandList* list, ID3D12RootSignature* sig) {
   orig<decltype(compute_root)>(list, port::set_croot)(list, sig);
   auto st = get<ID3D12GraphicsCommandList, Bindings>(list, list_tag);
+  st.compute_eye = eye::root_index(sig);
   st.compute_camera = get<ID3D12RootSignature, Layout>(sig, layout_tag).pass.cbv;
   save(list, st);
 }
@@ -230,7 +249,7 @@ void WINAPI table(ID3D12GraphicsCommandList* list, UINT i, D3D12_GPU_DESCRIPTOR_
   orig<decltype(table)>(list, port::set_gtable)(list, i, h);
   if (i >= 16) return;
   auto st = get<ID3D12GraphicsCommandList, Bindings>(list, list_tag);
-  if (replay::tracking()) note_camera(list, st, st.graphics_camera, i, h);
+  if (eye::enabled() || replay::tracking()) note_camera(list, st, false, i, h);
   st.roots[i] = h.ptr;
   save(list, st);
 }
@@ -239,7 +258,10 @@ void WINAPI root(ID3D12GraphicsCommandList* list, ID3D12RootSignature* sig) {
   auto st = get<ID3D12GraphicsCommandList, Bindings>(list, list_tag);
   if (st.signature != sig) {
     std::fill(std::begin(st.roots), std::end(st.roots), 0);
-    if (replay::tracking()) st.graphics_camera = get<ID3D12RootSignature, Layout>(sig, layout_tag).pass.cbv;
+    st.graphics_eye_address = 0;
+    if (eye::enabled()) st.graphics_eye = eye::root_index(sig);
+    if (eye::enabled() || replay::tracking())
+      st.graphics_camera = get<ID3D12RootSignature, Layout>(sig, layout_tag).pass.cbv;
     st.signature = sig;
     st.draw.signature = sig;
     save(list, st);
@@ -287,8 +309,8 @@ void WINAPI scissors(ID3D12GraphicsCommandList* list, UINT n, const D3D12_RECT* 
   save(list, st);
 }
 bool inspect(ID3D12GraphicsCommandList* list, const std::function<void()>& draw) {
-  replay::draw(list);
   auto st = get<ID3D12GraphicsCommandList, Bindings>(list, list_tag);
+  replay::draw(list);
   auto e = st.pass.entry;
   if (!e) return false;
   std::unique_lock guard(lock);
@@ -358,7 +380,9 @@ bool inspect(ID3D12GraphicsCommandList* list, const std::function<void()>& draw)
       if (scene->second.kind == 't') {
         auto* native = reinterpret_cast<ID3D12Resource*>(scene->second.id);
         guard.unlock();
-        if (composite(list, native, st.draw.pso, st.signature, st.roots, draw)) return true;
+        if (composite(list, native, st.draw.pso, st.signature, st.roots, st.graphics_eye, st.graphics_eye_address,
+                      draw))
+          return true;
         guard.lock();
       }
     }
@@ -435,7 +459,7 @@ void observe_descriptors(ID3D12Device* dev) {
 }
 void observe_commands(ID3D12GraphicsCommandList* list) {
 #define HOOK(slot, ...) aco::hook_vtable(list, port::slot, reinterpret_cast<void*>(__VA_ARGS__))
-  if (replay::tracking()) {
+  if (eye::enabled() || replay::tracking()) {
     HOOK(set_ctable, compute_table);
     HOOK(set_croot, compute_root);
     replay::observe(list);

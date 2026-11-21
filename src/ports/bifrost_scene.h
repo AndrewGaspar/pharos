@@ -19,6 +19,7 @@ struct DrawState {
 };
 struct FrameInfo {
   UINT64 serial{};
+  int eye{};
   UINT width{}, height{};
   float jitter[2]{};
   aco::FgCamera camera{};

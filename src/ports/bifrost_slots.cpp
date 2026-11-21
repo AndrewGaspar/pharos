@@ -4,6 +4,7 @@
 
 #include <cstddef>
 namespace port {
+extern const size_t reset_allocator = offsetof(ID3D12CommandAllocatorVtbl, Reset) / sizeof(void*);
 extern const size_t barrier = offsetof(ID3D12GraphicsCommandListVtbl, ResourceBarrier) / sizeof(void*);
 extern const size_t dispatch = offsetof(ID3D12GraphicsCommandListVtbl, Dispatch) / sizeof(void*);
 extern const size_t end_query = offsetof(ID3D12GraphicsCommandListVtbl, EndQuery) / sizeof(void*);
