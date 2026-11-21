@@ -20,7 +20,15 @@ The optional final angular speed limit defaults to zero. A positive value limits
 
 After eight warm-up presents, Pharos writes `capture.bin`. The eight-byte header is `PHARRIG1`. Each tick contains its zero-based uint32 index and seven float32 values for `world_from_body` in translation/XYZW order. When `tick % stride < shutter_samples`, the pose is followed by one float32 relative linear luminance per output pixel. All data is little-endian. A reader can tail the file and wait for complete records. Use `(tick + 0.5) / hz` as the midpoint time of a tick. Set `paced` to 1 to aim for wall-clock real time. A slow readback or writer slows the simulation and preserves the sampling sequence.
 
+During rig capture the D3D11 recorder keeps in-progress dynamic buffer uploads in a CPU shadow. If an upload spans a Present, each sensor view can replay the last committed GPU contents. The game’s Unmap commits the new contents. A physical mapping that prevents replay can still invalidate an exposure.
+
 The session ends with an atomically published `status` containing `ok` or an error. A missing anchor, missing HDR pass, unreplayable image tick or failed write invalidates the capture. A process exit leaves an incomplete session. Keep only sessions with a successful status, the expected sequence and length, and valid external clock telemetry.
+
+## Bounded live transport
+
+A client can select `PHAROS_RIG_RING_1` as the configuration magic. Before publishing the request, it creates and maps `capture.ring` in the session directory. The layout starts with the eight bytes `PHARRNG1`, then four aligned little-endian uint64 fields at offsets 8, 16, 24 and 32. They carry capacity in bytes, total bytes published, total bytes consumed and a reader cancellation flag. Initially both cursors and the flag are zero. The data region starts at byte 64 and occupies exactly the specified capacity (up to 64 MiB). The byte stream has the same header and tick layout as file capture.
+
+One producer and one reader share the mapping. Each cursor is a monotonically increasing byte count. Its offset in the data region is the count modulo capacity. Use interprocess acquire loads and release stores. Pharos publishes only after copying, and the reader advances its cursor only after consuming the bytes. When the ring fills, the game waits for space. The producer rejects a disconnected reader or a full ring with no progress for 30 seconds. A reader sets the cancellation flag before detaching. Successful EOF requires both a drained ring and a successful session status. The client can release the mapping and remove its backing file after capture. Computation and disk use in downstream consumers depend on what they choose to retain.
 
 ## Rendering and adding a title
 

@@ -1,4 +1,5 @@
 #include "rig/capture.h"
+#include "rig/ring.h"
 
 #include <wrl/client.h>
 #include <fcntl.h>
@@ -45,6 +46,10 @@ struct Session {
   std::vector<Camera> cameras;
   std::vector<float> luminance;
   File output{nullptr, fclose};
+  std::unique_ptr<RingWriter> ring;
+  bool write(const void* data, size_t bytes) {
+    return ring ? ring->write(data, bytes) : fwrite(data, 1, bytes, output.get()) == bytes;
+  }
   Clock::time_point start;
 };
 Session run;
@@ -76,11 +81,11 @@ bool configure() {
   File f{_wfopen((run.dir + L"\\config").c_str(), L"r"), fclose};
   char name[64]{}, magic[32]{};
   unsigned views = 0, pixels = 0;
-  if (!f ||
-      fscanf(f.get(), "%31s%63s%u%u%u%u%u%u%u", magic, name, &run.hz, &run.count, &run.stride, &run.shutter,
-             &run.paced, &views, &pixels) != 9 ||
-      std::string(magic) != "PHAROS_RIG_1")
+  if (!f || fscanf(f.get(), "%31s%63s%u%u%u%u%u%u%u", magic, name, &run.hz, &run.count, &run.stride, &run.shutter,
+                   &run.paced, &views, &pixels) != 9)
     return false;
+  bool streamed = std::string(magic) == "PHAROS_RIG_RING_1";
+  if (!streamed && std::string(magic) != "PHAROS_RIG_1") return false;
   auto anchor = anchors.find(name);
   if (anchor == anchors.end() || !run.hz || run.hz > 2000 || !run.count || !run.stride || !run.shutter ||
       run.shutter > run.stride || !views || views > 32 || !pixels || pixels > 8000000 ||
@@ -106,6 +111,10 @@ bool configure() {
     run.cameras[r.view].pixels.push_back({i, r.u, r.v});
   }
   if (fgetc(rays.get()) != EOF) return false;
+  if (streamed) {
+    run.ring = RingWriter::open(run.dir + L"\\capture.ring");
+    return run.ring && run.write("PHARRIG1", 8);
+  }
   // CREATE_NEW reserves a session directory against accidental reuse.
   HANDLE handle = CreateFileW((run.dir + L"\\capture.bin").c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
                               CREATE_NEW, 0, nullptr);
@@ -229,6 +238,10 @@ void scene_color(ID3D11DeviceContext* ctx) {
   if (stored.Width == d.Width && stored.Height == d.Height) ctx->CopyResource(color.Get(), texture.Get());
 }
 void capture(ID3D11DeviceContext* ctx, const std::function<void()>& replay, const char* unavailable) {
+  if (run.ring && run.ring->cancelled()) {
+    finish("stream reader disconnected");
+    return;
+  }
   if (run.warm) {
     --run.warm;
     return;
@@ -275,11 +288,10 @@ void capture(ID3D11DeviceContext* ctx, const std::function<void()>& replay, cons
       }
     }
   }
-  FILE* out = run.output.get();
   static_assert(sizeof(body) == 28);
-  if (fwrite(&run.tick, 4, 1, out) != 1 || fwrite(&body, sizeof(body), 1, out) != 1 ||
-      (image && fwrite(run.luminance.data(), 4, run.luminance.size(), out) != run.luminance.size()) ||
-      fflush(out) != 0) {
+  if (!run.write(&run.tick, 4) || !run.write(&body, sizeof(body)) ||
+      (image && !run.write(run.luminance.data(), 4 * run.luminance.size())) ||
+      (run.output && fflush(run.output.get()) != 0)) {
     finish("capture write failed");
     return;
   }

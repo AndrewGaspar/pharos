@@ -2,12 +2,14 @@
 
 #include <windows.h>
 
-#include <cstring>
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
+#include <cstring>
 #include <map>
-#include <string>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -613,7 +615,11 @@ struct OpenMap {
   void* real;
   UINT rp, dp;
   size_t size;
+  DWORD thread;
 };
+std::condition_variable g_uploaded;
+unsigned g_finishing_maps = 0;
+std::atomic<unsigned> g_detached{0};
 std::map<std::pair<ID3D11Resource*, UINT>, OpenMap> g_open;
 
 size_t map_size(ID3D11Resource* res, UINT sub, const D3D11_MAPPED_SUBRESOURCE& m) {
@@ -628,16 +634,17 @@ size_t map_size(ID3D11Resource* res, UINT sub, const D3D11_MAPPED_SUBRESOURCE& m
 
 }  // namespace
 
-void rec_map(ID3D11Resource* res, UINT sub, D3D11_MAP type, UINT flags, D3D11_MAPPED_SUBRESOURCE* m) {
-  if (type != D3D11_MAP_WRITE_DISCARD && type != D3D11_MAP_WRITE_NO_OVERWRITE) return;  // readbacks, staging writes
-  if (!m || !m->pData) return;
+bool rec_map(ID3D11Resource* res, UINT sub, D3D11_MAP type, UINT flags, D3D11_MAPPED_SUBRESOURCE* m, bool detached) {
+  if (type != D3D11_MAP_WRITE_DISCARD && type != D3D11_MAP_WRITE_NO_OVERWRITE)
+    return false;  // readbacks, staging writes
+  if (!m || !m->pData) return false;
   size_t size = map_size(res, sub, *m);
   if (!size) {
     rec_unsupported("Map of a texture with an unknown format");
-    return;
+    return false;
   }
   std::lock_guard lock(g_mutex);
-  if (!g_cur) return;
+  if (!g_cur) return false;
   MapShadow& sh = g_shadows[{res, sub}];
   bool fresh = sh.s.size() != size || sh.epoch != g_epoch || sh.res.p != res;
   if (fresh) {
@@ -653,18 +660,47 @@ void rec_map(ID3D11Resource* res, UINT sub, D3D11_MAP type, UINT flags, D3D11_MA
     }
   }
   sh.last_frame = g_frame_no;
-  g_open[{res, sub}] = OpenMap{type, flags, m->pData, m->RowPitch, m->DepthPitch, size};
+  g_open[{res, sub}] =
+      OpenMap{type, flags, detached ? nullptr : m->pData, m->RowPitch, m->DepthPitch, size, GetCurrentThreadId()};
+  if (detached) {
+    ++g_detached;
+    // The initial NO_OVERWRITE mapping stays physical until the hook releases
+    // it after seeding the shadow. A discard maps a separate scratch resource.
+    if (type == D3D11_MAP_WRITE_NO_OVERWRITE) ++g_finishing_maps;
+  }
   m->pData = sh.s.data();
+  return true;
 }
 
-void rec_unmap(ID3D11Resource* res, UINT sub) {
+D3D11_MAP rec_detached_type(ID3D11Resource* res, UINT sub, bool begin_commit) {
+  if (!g_detached.load(std::memory_order_relaxed)) return D3D11_MAP(0);
   std::lock_guard lock(g_mutex);
   auto it = g_open.find({res, sub});
-  if (it == g_open.end()) return;
+  if (it == g_open.end() || it->second.real) return D3D11_MAP(0);
+  if (begin_commit) ++g_finishing_maps;
+  return it->second.type;
+}
+
+bool rec_unmap(ID3D11Resource* res, UINT sub, bool notify, void* destination) {
+  std::lock_guard lock(g_mutex);
+  auto it = g_open.find({res, sub});
+  if (it == g_open.end()) return false;
+  if (!it->second.real)
+    notify = true;  // Counted before the native commit began.
+  else if (notify)
+    ++g_finishing_maps;
   OpenMap o = it->second;
   g_open.erase(it);
+  if (!o.real) {
+    --g_detached;
+    o.real = destination;
+    if (!o.real) {
+      if (g_cur) g_cur->bad = "failed to commit dynamic upload";
+      return notify;
+    }
+  }
   auto sit = g_shadows.find({res, sub});
-  if (sit == g_shadows.end()) return;
+  if (sit == g_shadows.end()) return notify;
   MapShadow& sh = sit->second;
   size_t lo = 0, hi = o.size;
   if (o.type == D3D11_MAP_WRITE_NO_OVERWRITE) {
@@ -678,7 +714,7 @@ void rec_unmap(ID3D11Resource* res, UINT sub) {
     memcpy(static_cast<uint8_t*>(o.real) + lo, sh.s.data() + lo, hi - lo);
     memcpy(sh.m.data() + lo, sh.s.data() + lo, hi - lo);
   }
-  if (!g_cur) return;
+  if (!g_cur) return notify;
   auto blob = std::make_shared<std::vector<uint8_t>>(sh.s.begin() + lo, sh.s.begin() + hi);
   g_cur->bytes += hi - lo;
   {
@@ -697,6 +733,13 @@ void rec_unmap(ID3D11Resource* res, UINT sub) {
     if (!blob->empty()) memcpy(static_cast<uint8_t*>(m.pData) + off, blob->data(), blob->size());
     c->Unmap(r.p, sub);
   });
+  return notify;
+}
+
+void rec_unmapped() {
+  std::lock_guard lock(g_mutex);
+  --g_finishing_maps;
+  g_uploaded.notify_one();
 }
 
 namespace {
@@ -1090,17 +1133,33 @@ void rec_start() {
   // Drop shadows of buffers not mapped for a while (releases the resources).
   if (g_frame_no % 256 == 0)
     for (auto it = g_shadows.begin(); it != g_shadows.end();)
-      it = g_frame_no - it->second.last_frame > 256 ? g_shadows.erase(it) : std::next(it);
+      it = g_frame_no - it->second.last_frame > 256 && !g_open.count(it->first) ? g_shadows.erase(it) : std::next(it);
   g_rec_on.store(true, std::memory_order_release);
 }
 
-RecFrame* rec_stop() {
-  std::lock_guard lock(g_mutex);
+RecFrame* rec_stop(bool wait_for_uploads) {
+  std::unique_lock lock(g_mutex);
+  // A streaming worker may still be copying a dynamic resource at Present.
+  // Complete that upload before replaying this tick. A map held by the presenting
+  // thread itself cannot finish while it is waiting here.
+  auto ready = [] { return !g_finishing_maps && g_open.size() == g_detached.load(std::memory_order_relaxed); };
+  if (wait_for_uploads && !ready() && std::none_of(g_open.begin(), g_open.end(), [](const auto& entry) {
+        return entry.second.real && entry.second.thread == GetCurrentThreadId();
+      })) {
+    g_uploaded.wait_for(lock, std::chrono::milliseconds(250), ready);
+  }
   g_rec_on.store(false, std::memory_order_release);
   RecFrame* f = g_cur;
   g_cur = nullptr;
   if (f) g_stopped_at = g_frame_no;
-  if (f && !g_open.empty() && !f->bad) f->bad = "Map still open at Present";
+  if (f && !ready() && !f->bad) {
+    f->bad = "Map still open at Present";
+    if (wait_for_uploads)
+      for (const auto& [key, o] : g_open)
+        if (o.real)
+          ACO_LOG("rig: physical map held at Present: %zu bytes, map %u, thread %lu (Present %lu)", o.size,
+                  unsigned(o.type), o.thread, GetCurrentThreadId());
+  }
   return f;
 }
 

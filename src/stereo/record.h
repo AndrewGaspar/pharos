@@ -40,8 +40,12 @@ void rec_unsupported(const char* what);  // the frame can't be replayed
 // Uploads.
 // rec_map may replace m->pData with a shadow; rec_unmap must then run for every Unmap on the
 // immediate context (also when not recording) so the shadow reaches the real mapping.
-void rec_map(ID3D11Resource* res, UINT sub, D3D11_MAP type, UINT flags, D3D11_MAPPED_SUBRESOURCE* m);
-void rec_unmap(ID3D11Resource* res, UINT sub);
+bool rec_map(ID3D11Resource* res, UINT sub, D3D11_MAP type, UINT flags, D3D11_MAPPED_SUBRESOURCE* m, bool detached);
+// A detached upload lives in the CPU shadow until the game commits it. Set
+// begin_commit at game Unmap and call rec_unmapped after the native Unmap.
+D3D11_MAP rec_detached_type(ID3D11Resource* res, UINT sub, bool begin_commit = false);
+bool rec_unmap(ID3D11Resource* res, UINT sub, bool notify, void* destination);
+void rec_unmapped();
 void rec_update(ID3D11Resource* res, UINT sub, const D3D11_BOX* box, const void* data, UINT rowpitch, UINT depthpitch,
                 UINT copy_flags, bool is1);
 
@@ -75,7 +79,7 @@ void rec_install_cb_hooks(ID3D11DeviceContext* ctx);
 // Frame control (render thread, from Present).
 struct RecFrame;
 void rec_start();                 // begin recording a frame (drops anything recorded so far)
-RecFrame* rec_stop();             // stop and hand over the frame (nullptr if not recording)
+RecFrame* rec_stop(bool wait_for_uploads);  // stop and hand over the frame (nullptr if not recording)
 bool rec_frame_ok(const RecFrame* f, const char** why);
 size_t rec_frame_size(const RecFrame* f);
 size_t rec_frame_bytes(const RecFrame* f);

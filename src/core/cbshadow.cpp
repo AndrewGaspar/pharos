@@ -1,13 +1,17 @@
 #include "core/cbshadow.h"
+#include "rig/capture.h"
 
 #include <windows.h>
 #include <d3d11.h>
+#include <wrl/client.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "core/hook.h"
@@ -96,10 +100,77 @@ uint32_t shadow_size(ID3D11Resource* res) {
   return d.ByteWidth;
 }
 
+// A streaming upload can span Presents. Map a separate discard buffer before
+// handing the game's caller its cached shadow. Commit to the real resource on
+// the game's Unmap, keeping earlier GPU commands replayable during the upload.
+ID3D11Buffer* discard_scratch(ID3D11DeviceContext* ctx, UINT bytes) {
+  using Microsoft::WRL::ComPtr;
+  thread_local ComPtr<ID3D11Buffer> scratch;
+  thread_local ID3D11DeviceContext* owner = nullptr;
+  thread_local UINT capacity = 0;
+  if (owner != ctx || capacity < bytes || !scratch) {
+    ComPtr<ID3D11Device> device;
+    ctx->GetDevice(&device);
+    D3D11_BUFFER_DESC d{};
+    d.ByteWidth = std::max(bytes, 65536u);
+    d.Usage = D3D11_USAGE_DYNAMIC;
+    d.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    d.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    ComPtr<ID3D11Buffer> buffer;
+    if (FAILED(device->CreateBuffer(&d, nullptr, &buffer))) return nullptr;
+    scratch = std::move(buffer);
+    owner = ctx;
+    capacity = d.ByteWidth;
+  }
+  return scratch.Get();
+}
+
+void STDMETHODCALLTYPE hk_Unmap(ID3D11DeviceContext*, ID3D11Resource*, UINT);
 HRESULT STDMETHODCALLTYPE hk_Map(ID3D11DeviceContext* self, ID3D11Resource* res, UINT sub, D3D11_MAP type, UINT flags,
                                  D3D11_MAPPED_SUBRESOURCE* out) {
-  HRESULT hr = orig<decltype(hk_Map)>(self, Context_Map)(self, res, sub, type, flags, out);
-  if (SUCCEEDED(hr) && out && ACO_REC_WANT(self)) rec_map(res, sub, type, flags, out);
+  auto map = orig<decltype(hk_Map)>(self, Context_Map);
+  auto unmap = orig<decltype(hk_Unmap)>(self, Context_Unmap);
+  if (g_rec_replaying && self == g_rec_imm && rec_detached_type(res, sub)) return map(self, res, sub, type, flags, out);
+  bool record = ACO_REC_WANT(self);
+  bool detached = false;
+  UINT width = 0;
+  ID3D11Resource* target = res;
+  if (record && rig::armed() && out && res && sub == 0 && !flags &&
+      (type == D3D11_MAP_WRITE_DISCARD || type == D3D11_MAP_WRITE_NO_OVERWRITE)) {
+    D3D11_RESOURCE_DIMENSION dim;
+    res->GetType(&dim);
+    if (dim == D3D11_RESOURCE_DIMENSION_BUFFER) {
+      D3D11_BUFFER_DESC d;
+      static_cast<ID3D11Buffer*>(res)->GetDesc(&d);
+      if (d.Usage == D3D11_USAGE_DYNAMIC && (d.CPUAccessFlags & D3D11_CPU_ACCESS_WRITE)) {
+        width = d.ByteWidth;
+        // NO_OVERWRITE can seed a fresh shadow from the original mapping.
+        // Closing it immediately preserves the original contents.
+        if (type == D3D11_MAP_WRITE_DISCARD) {
+          if (auto* scratch = discard_scratch(self, width)) target = scratch;
+          detached = target != res;
+        } else
+          detached = true;
+      }
+    }
+  }
+  HRESULT hr = map(self, target, sub, type, flags, out);
+  if (FAILED(hr) && target != res) {
+    target = res;
+    detached = false;
+    hr = map(self, res, sub, type, flags, out);
+  }
+  if (SUCCEEDED(hr) && out && record) {
+    bool copied = rec_map(res, sub, type, flags, out, detached);
+    if (detached && copied) {
+      unmap(self, target, sub);
+      if (type == D3D11_MAP_WRITE_NO_OVERWRITE) rec_unmapped();
+      out->RowPitch = out->DepthPitch = width;
+    } else if (target != res) {
+      unmap(self, target, sub);
+      hr = map(self, res, sub, type, flags, out);
+    }
+  }
   if (SUCCEEDED(hr) && out) cam_map(self, res, type, out);
   if (SUCCEEDED(hr) && out && (type == D3D11_MAP_WRITE_DISCARD || type == D3D11_MAP_WRITE_NO_OVERWRITE)) {
     mapstats_note(res, false);
@@ -126,8 +197,19 @@ HRESULT STDMETHODCALLTYPE hk_Map(ID3D11DeviceContext* self, ID3D11Resource* res,
 }
 
 void STDMETHODCALLTYPE hk_Unmap(ID3D11DeviceContext* self, ID3D11Resource* res, UINT sub) {
+  auto unmap = orig<decltype(hk_Unmap)>(self, Context_Unmap);
+  auto pending = self == g_rec_imm ? rec_detached_type(res, sub, !g_rec_replaying) : D3D11_MAP(0);
+  if (pending && g_rec_replaying) {
+    unmap(self, res, sub);
+    return;
+  }
   cam_unmap(self, res);
-  if (self == g_rec_imm) rec_unmap(res, sub);
+  D3D11_MAPPED_SUBRESOURCE dst{};
+  if (pending) {
+    auto map = orig<decltype(hk_Map)>(self, Context_Map);
+    if (FAILED(map(self, res, sub, pending, 0, &dst))) ACO_LOG("rig: could not commit dynamic buffer upload");
+  }
+  const bool notify = self == g_rec_imm && rec_unmap(res, sub, rig::armed(), dst.pData);
   if (shadow_size(res)) {
     std::lock_guard lock(g_mutex);
     auto it = g_shadows.find({self, res});
@@ -137,11 +219,17 @@ void STDMETHODCALLTYPE hk_Unmap(ID3D11DeviceContext* self, ID3D11Resource* res, 
       g_last_writer[res] = self;
     }
   }
-  orig<decltype(hk_Unmap)>(self, Context_Unmap)(self, res, sub);
+  if (!pending || dst.pData) unmap(self, res, sub);
+  if (notify) rec_unmapped();
 }
 
 void STDMETHODCALLTYPE hk_UpdateSubresource(ID3D11DeviceContext* self, ID3D11Resource* res, UINT sub, const D3D11_BOX* box,
                                             const void* data, UINT rowpitch, UINT depthpitch) {
+  if (g_rec_replaying && self == g_rec_imm && rec_detached_type(res, sub)) {
+    orig<decltype(hk_UpdateSubresource)>(self, Context_UpdateSubresource)(self, res, sub, box, data, rowpitch,
+                                                                          depthpitch);
+    return;
+  }
   if (ACO_REC_WANT(self)) rec_update(res, sub, box, data, rowpitch, depthpitch, 0, false);
   cam_update(self, res, box, data);
   if (data) {

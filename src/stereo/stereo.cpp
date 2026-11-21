@@ -394,7 +394,7 @@ void stereo_on_present(IDXGISwapChain* sc, PFN_GetBuffer real_get_buffer) {
   bool stereo_display = cfg.stereo_mode == "sbs" || (cfg.stereo_mode == "auto" && display_stereo);
   bool want = (rig::armed() || stereo_display) && S.dev && S.imm1 && !S.failed && !fg12_proxy_on();
   bool wide = sc == S.wide_sc;
-  RecFrame* f = rec_stop();
+  RecFrame* f = rec_stop(rig::armed());
   TemporalPresentScope compositor;
   cam_on_present(want);
   if (!want) {
