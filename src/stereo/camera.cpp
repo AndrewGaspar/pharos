@@ -1337,7 +1337,7 @@ bool cam_bind_marker(ID3D11DeviceContext* ctx, MarkerRole role, bool* record_log
     if (!cs->marker_view || cs->panel) return false;
     if (cs->marker_screen) {
       const bool follow = cs->edge_group && (role == MarkerRole::Bracket || role == MarkerRole::Logo);
-      cs->edge_group = role == MarkerRole::Edge;
+      cs->edge_group = role == MarkerRole::Edge || role == MarkerRole::EdgeText;
       if (!cs->edge_group && !follow && role != MarkerRole::Reticle) return false;
     } else {
       cs->edge_group = false;
@@ -1349,7 +1349,8 @@ bool cam_bind_marker(ID3D11DeviceContext* ctx, MarkerRole role, bool* record_log
     if (cs->target_offset == UINT(-1)) cs->target_offset = put_targets(cs);
     target_offset = cs->target_offset;
     MarkerView eyes[] = {cs->marker[0], cs->marker[1]};
-    if (role == MarkerRole::Reticle && cs->marker_screen) eyes[0].scale.w = eyes[1].scale.w = 2;
+    if (cs->marker_screen && role == MarkerRole::EdgeText) eyes[0].scale.w = eyes[1].scale.w = -1;
+    if (cs->marker_screen && role == MarkerRole::Reticle) eyes[0].scale.w = eyes[1].scale.w = 2;
     offset = put_slot(cs, &eyes[0], &eyes[1], sizeof(MarkerView));
   }
   Microsoft::WRL::ComPtr<ID3D11DeviceContext1> ctx1;

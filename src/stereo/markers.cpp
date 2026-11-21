@@ -85,10 +85,13 @@ void main(triangle Vertex vs[3], inout TriangleStream<OUTPUT> outStream) {
   mono.x -= scale.x*(scale.z-nativeInvZ);
   float targetInvZ=0, bestError=1e20;
   bool reticle = scale.w == 2;
+  // The screen-edge font also draws the range below the middle of the compass.
+  // Keep that label on its authored HUD plane along with the compass ticks.
+  bool compassLabel = scale.w == -1 && abs(mono.x) < 0.24 && mono.y > 0.77 && mono.y < 0.90;
   [loop] for (uint t=0; t<numTargets && !reticle; ++t) {
     float4 target=targets[t];
     float2 direction=target.xy;
-    if (scale.w == 0) {
+    if (scale.w <= 0) {
       float edge=max(abs(direction.x),abs(direction.y));
       if (edge<0.95) continue;
       direction/=edge;
@@ -140,7 +143,7 @@ void main(triangle Vertex vs[3], inout TriangleStream<OUTPUT> outStream) {
 #endif
   [unroll] for (uint i=0;i<3;i++) {
     Vertex v=vs[i];
-    if (!reticle || all(abs(mono) < 0.12)) v.p.x += scale.x*(1-v.p.w*scale.z) + scale.y*v.p.w*(scale.z-invZ);
+    if (!compassLabel && (!reticle || all(abs(mono) < 0.12))) v.p.x += scale.x*(1-v.p.w*scale.z) + scale.y*v.p.w*(scale.z-invZ);
 #ifdef LOGO
     Recorded rec;
     rec.vertex=v;
@@ -338,7 +341,7 @@ MarkerDraw markers_begin(ID3D11DeviceContext* ctx, ShaderClass shader) {
                     anchor_view && stream_available(ctx);
   bool record = false;
   MarkerRole role = MarkerRole::Ordinary;
-  if (edge) role = MarkerRole::Edge;
+  if (edge) role = hash == 0xd8d8858e469845bcULL ? MarkerRole::EdgeText : MarkerRole::Edge;
   if (bracket) role = MarkerRole::Bracket;
   if (logo) role = MarkerRole::Logo;
   if (rich) role = MarkerRole::Label;

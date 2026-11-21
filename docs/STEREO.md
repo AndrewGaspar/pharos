@@ -270,7 +270,9 @@ by the UI. At the Sphinx a 53 m tour label had a native billboard depth of 9.27 
 shader associates the sprite with a projected world target and limits its depth to the first
 visible obstruction. It places an obstructed marker just in front of that surface. Screen-edge
 arrows sample the clamped screen position. An unrecognised target uses the visible surface.
-Transparent objects without depth writes cannot be identified from this buffer.
+Transparent objects without depth writes cannot be identified from this buffer. The centered
+compass distance uses the native HUD plane. At 1280×720 in Alexandria, its left-to-right
+displacement matched the compass icon and city name at −4 packed pixels.
 
 A quarter-resolution history holds newly visible foreground depth for 120 ms and eases back
 as an obstruction clears. Stereo replay uses the same history for both eyes. The icon batch
