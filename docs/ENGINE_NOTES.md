@@ -21,10 +21,21 @@ acknowledged publication on the game thread, respectively. It verifies the origi
 instructions before enabling the change. Unsupported preparations and batches whose
 completion cannot be established use the game's original deadline.
 
-In a Quiver lab with 28 packages, the time from pressing A to the main menu fell
-from 64 to 35 seconds at 10 FPS and from 33 to 18 seconds at 20 FPS. The worker
-used 234–235 engine frames, down from 519–522 on v21. All 255 add-on records and
-all three registered entries matched across the four runs.
+On v23, the worker also recognizes completed `TagDLCAddon` preparation. It checks
+that all three retained resources and the child handles consumed by the game thread
+are ready. The game thread still runs the publication callback.
+
+| Measured rate | v21 press A to menu | v22 | v23 | Worker frames, v21 → v23 |
+| --- | ---: | ---: | ---: | ---: |
+| 10 FPS | 64.1–64.5 s | 34.2–34.8 s | 30.9–31.4 s | 522 → 199 |
+| 20 FPS | 32.3–32.9 s | 18.0–18.4 s | 16.9–17.4 s | 519 → 207 |
+
+Each range spans the last screenshot before the menu and the first screenshot with
+it visible. All runs used the same 28 installed packages and produced matching
+results for all 255 add-on records and three registered entries. The retained
+resources and child handles of all 16 tag add-ons matched between v22 and v23.
+Actual asset publication and queued callbacks still run on game updates, so the
+remaining check takes longer at lower frame rates.
 
 ## Frame structure (post-processing end of the frame)
 
