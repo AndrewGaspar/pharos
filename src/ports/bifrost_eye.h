@@ -18,6 +18,7 @@ UINT root_index(ID3D12RootSignature* root);
 void allocator(ID3D12GraphicsCommandList* list, ID3D12CommandAllocator* allocator);
 D3D12_GPU_VIRTUAL_ADDRESS bind(ID3D12GraphicsCommandList* list, UINT64 original, UINT bytes);
 void refresh();
+bool right_depth_eye();
 UINT64 marker_buffer(ID3D12GraphicsCommandList* list, UINT64 eye_camera, MarkerKind kind, const MarkerDepth& depth);
 void prepare(UINT count, ID3D12CommandList* const* lists, const FrameInfo* frame, int eye);
 }  // namespace bifrost::eye

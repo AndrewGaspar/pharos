@@ -4,7 +4,7 @@
 #include <functional>
 
 namespace bifrost {
-enum class MarkerKind { None, World, Reticle, MapCursor };
+enum class MarkerKind { None, World, Reticle, MapCursor, BowDot };
 struct MarkerDepth {
   Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
   UINT width{}, height{}, pitch{}, slice_bytes{};
@@ -16,7 +16,7 @@ struct MarkerCapture {
   void record(ID3D12GraphicsCommandList* list, ID3D12CommandQueue* queue);
   void finish();
 };
-void capture_marker_depth(ID3D12GraphicsCommandList* list, ID3D12Device* dev, ID3D12Resource* depth);
+void capture_marker_depth(ID3D12GraphicsCommandList* list, ID3D12Device* dev, ID3D12Resource* depth, bool right_eye);
 MarkerKind prepare_marker_pipeline(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc,
                                    ID3D12PipelineState* original);
 bool draw_marker(ID3D12GraphicsCommandList* list, ID3D12PipelineState* original, UINT camera_slot,

@@ -41,7 +41,7 @@ struct HudShaders {
 std::atomic<bool> capture_hud{};
 std::atomic<UINT64> hidden_hud{};
 std::atomic<UINT64> hidden_page{};
-std::atomic<bool> map_seen{}, map_active{};
+std::atomic<bool> map_seen{}, map_active{}, bars_seen{}, bars_active{}, dot_seen{}, dot_active{};
 bool trace_hud() {
   static const bool enabled = GetEnvironmentVariableW(L"QUIVER_LAB", nullptr, 0) && option(L"stereo", L"trace_hud", 0);
   return enabled;
@@ -484,9 +484,14 @@ bool inspect(ID3D12GraphicsCommandList* list, const std::function<void()>& draw)
             kind = MarkerKind::Reticle;
           else if (st.pass.marker == MarkerKind::World && p.width == 160 && p.height == 80)
             kind = MarkerKind::World;
-          else if (st.pass.marker == MarkerKind::World && p.width == 32 && p.height == 16)
+          else if (st.pass.marker == MarkerKind::World && p.width == 32 && p.height == 16) {
+            bars_seen.store(true, std::memory_order_relaxed);
             kind = MarkerKind::Reticle;
-          else if (st.pass.marker == MarkerKind::World && (p.width == 256 || p.width == 64) && p.width == p.height &&
+          } else if (st.pass.marker == MarkerKind::World && p.width == 16 && p.height == 16 &&
+                     !map_active.load(std::memory_order_relaxed)) {
+            dot_seen.store(true, std::memory_order_relaxed);
+            kind = MarkerKind::BowDot;
+          } else if (st.pass.marker == MarkerKind::World && (p.width == 256 || p.width == 64) && p.width == p.height &&
                    map_active.load(std::memory_order_relaxed))
             kind = MarkerKind::MapCursor;
         }
@@ -642,8 +647,14 @@ void tag_hud(ID3D12Device* dev, ID3D12PipelineState* pso, const D3D12_GRAPHICS_P
   shader(d.PS, sh.ps, L"ps");
   pso->SetPrivateData(hud_tag, sizeof(sh), &sh);
 }
+bool bow_dot_present() { return dot_active.load(std::memory_order_relaxed); }
+bool bow_bars_present() { return bars_active.load(std::memory_order_relaxed); }
 void hud_capture_present() {
-  if (dual::enabled()) map_active = map_seen.exchange(false);
+  if (dual::enabled()) {
+    map_active = map_seen.exchange(false);
+    bars_active = bars_seen.exchange(false);
+    dot_active = dot_seen.exchange(false);
+  }
   if (!trace_hud()) return;
   static const auto trigger = aco::out_dir() + L"\\capture-hud";
   static const auto skip = aco::out_dir() + L"\\skip-hud";

@@ -12,6 +12,7 @@
 #include "ports/bifrost_camera.h"
 #include "ports/bifrost_present.h"
 #include "ports/bifrost_uploads.h"
+#include "ports/bifrost_resources.h"
 #include "ports/common.h"
 #include "ports/bifrost_dual.h"
 #include "ports/bifrost_lists.h"
@@ -28,6 +29,7 @@ using Microsoft::WRL::ComPtr;
 constexpr GUID key(BYTE n) { return {0xca84218f, 0x1f50, 0x4e11, {0x80, 0xab, 0x50, 0xbb, 0xbb, 0x15, 0xf6, n}}; }
 constexpr GUID root_tag = key(1), arena_tag = key(2), notes_tag = key(3);
 float metres = .0325f, convergence = 4;
+std::atomic<int> aim_bias{1}; // +1 anchors the left eye, -1 the right.
 std::atomic<bool> markers_enabled{true}, cursor_enabled{true};
 float number(const std::wstring& text, float fallback) {
   wchar_t* end{};
@@ -209,6 +211,7 @@ UINT64 bind(ID3D12GraphicsCommandList* list, UINT64 address, UINT bytes) {
   notes->ranges[address] = r;
   return r.shadow;
 }
+bool right_depth_eye() { return aim_bias.load(std::memory_order_relaxed) < 0; }
 void refresh() {
   // Queue submissions are serialized. Read both eye settings together so they
   // take effect for the same simulation step.
@@ -220,6 +223,8 @@ void refresh() {
   if (distance.empty()) distance = option_text(L"stereo", L"separation_mm", L"32.5");
   metres = .001f * number(distance, 32.5f);
   convergence = number(option_text(L"stereo", L"convergence", L"4"), 4);
+  auto aim = option_text(L"stereo", L"aim_eye", L"left");
+  aim_bias = aim == L"right" ? -1 : aim == L"center" ? 0 : 1;
   markers_enabled = option(L"stereo", L"markers", 1) != 0;
   cursor_enabled = option_text(L"stereo", L"cursor", L"depth") == L"depth";
 }
@@ -229,7 +234,9 @@ struct Vec4 {
 struct MarkerBlock {
   float clip_z[4], clip_w[4];
   Vec4 scale;
-  UINT dimensions[4], count, padding[3];
+  UINT dimensions[4], count;
+  float ray_scale;
+  UINT padding[2];
   Vec4 targets[aco::kMaxMarkerTargets];
 };
 UINT64 marker_buffer(ID3D12GraphicsCommandList* list, UINT64 camera, MarkerKind kind, const MarkerDepth& depth) {
@@ -257,7 +264,7 @@ UINT64 marker_buffer(ID3D12GraphicsCommandList* list, UINT64 camera, MarkerKind 
                          Notes::Marker{mem, view, {depth.width, depth.height, depth.pitch, depth.slice_bytes}, kind});
   return mem.shadow;
 }
-void fill_markers(const Notes::Marker& marker, const FrameInfo& frame, const float* view, float separation) {
+void fill_markers(const Notes::Marker& marker, const FrameInfo& frame, const float* view, float separation, float ray_offset, bool first_person) {
   MarkerBlock block{};
   const auto& inv = frame.camera.clip_to_view;
   if (frame.camera.valid && std::abs(inv[0][0]) > .001f) {
@@ -265,7 +272,9 @@ void fill_markers(const Notes::Marker& marker, const FrameInfo& frame, const flo
     memcpy(block.clip_w, inv[3], 16);
     memcpy(block.dimensions, marker.dimensions, sizeof(block.dimensions));
     const float scale = separation / std::abs(inv[0][0]);
+    block.ray_scale = ray_offset / std::abs(inv[0][0]);
     block.scale = {0, scale, convergence > 0 ? 1 / convergence : 0, float(marker.kind)};
+    if (marker.kind == MarkerKind::BowDot && !first_person && !bow_bars_present()) block.scale.w = 0;
     if (view) {
       auto original = read_constants(marker.camera.original, marker.camera.bytes);
       if (scene_camera_matches(original.data(), UINT(original.size() * sizeof(float)), view))
@@ -297,13 +306,21 @@ void prepare(UINT count, ID3D12CommandList* const* lists, const FrameInfo* frame
   const float* camera = frame ? frame->camera.view_to_world[0] : nullptr;
   static const int single = option(L"stereo", L"preview_eye", 2) == 1 ? 0 : 1;
   int which = alternating() || dual::enabled() ? eye : single;
-  const float separation = dual::healthy() ? (which == 0 ? -metres : metres) : 0;
+  // The first-person Needler camera has an 18-degree vertical FOV and
+  // a 0.10 m near plane. The raven uses a 30-degree FOV and 0.80 m.
+  const auto& inv = latest.camera.clip_to_view;
+  const bool first_person = dual::enabled() && bow_dot_present() && latest.camera.valid &&
+                            inv[1][1] > .05f && inv[1][1] < .21f && std::abs(inv[3][2] - 10.f) < .5f;
+  const int bias = first_person ? aim_bias.load(std::memory_order_relaxed) : 0;
+  const float spacing = dual::healthy() ? metres : 0;
+  const float separation = spacing * ((which == 0 ? -1 : 1) + bias);
+  const float ray_offset = spacing * ((right_depth_eye() ? 1 : -1) + bias);
   unsigned moved = 0;
   std::map<UINT64, Range> ranges;
   for (UINT i = 0; i < count; ++i) {
     if (auto notes = associated<Notes>(lists[i], notes_tag)) {
       for (const auto& [_, r] : notes->ranges) ranges.try_emplace(r.shadow, r);
-      for (const auto& [_, m] : notes->markers) fill_markers(m, latest, camera, separation);
+      for (const auto& [_, m] : notes->markers) fill_markers(m, latest, camera, separation, ray_offset, first_person);
     }
   }
   for (const auto& [_, r] : ranges) {

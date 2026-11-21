@@ -1,7 +1,7 @@
 [[page]]
 id = "valhalla"
 title = "Valhalla"
-options = ["stereo.cursor", "stereo.markers", "upscaler.preset"]
+options = ["stereo.cursor", "stereo.markers", "stereo.aim_eye", "upscaler.preset"]
 
 [option."stereo.cursor"]
 type = "enum"
@@ -13,7 +13,14 @@ apply = "live"
 [option."stereo.markers"]
 type = "bool"
 label = "World marker and aiming depth"
-help = "Places Synin’s scanning ring on the aimed surface and the tracked location diamonds at the target or first obstruction."
+help = "Places bow reticles and Synin’s scanning ring on the aimed surface and the tracked location diamonds at the target or first obstruction."
+apply = "live"
+
+[option."stereo.aim_eye"]
+type = "enum"
+label = "Predator Bow aiming eye"
+values = [{value="left", label="Left eye"}, {value="right", label="Right eye"}, {value="center", label="Centred"}]
+help = "Lines up the first-person sight with the selected eye. The opposite eye keeps the binocular separation."
 apply = "live"
 
 [option."upscaler.preset"]

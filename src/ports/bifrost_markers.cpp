@@ -31,7 +31,7 @@ constexpr char shader[] = R"(
 ByteAddressBuffer depth : register(t0,space80);
 cbuffer Marker : register(b0,space80) {
   float4 clipZ, clipW, scale;
-  uint4 size; uint count; float4 targets[192];
+  uint4 size; uint count; float rayScale; float4 targets[192];
 }
 struct Vertex {
   float4 p : SV_Position;
@@ -47,7 +47,7 @@ float invDepth(float2 ndc) {
   float z=0;
   uint newest=depth.Load(0);
   // Reversed Z. Keep an obstruction across small silhouette movements and
-  // across the three most recent rendered frames. Both eyes use the left ray.
+  // across the three most recent rendered frames. Both eyes use the same depth image.
   [unroll] for (int y=-1;y<=1;y++)
     [unroll] for (int x=-1;x<=1;x++) {
       int2 p=clamp(pixel+int2(x,y),0,int2(size.xy)-1);
@@ -67,7 +67,7 @@ void main(triangle Vertex v[3], inout TriangleStream<Vertex> stream) {
   float2 mono=(min(a,min(b,c))+max(a,max(b,c)))*.5;
   float nativeInv=3/(v[0].p.w+v[1].p.w+v[2].p.w);
   mono.x-=scale.x*(scale.z-nativeInv);
-  bool aim=scale.w==2, cursor=scale.w==3;
+  bool dotOnly=scale.w==4, aim=scale.w==2 || dotOnly, cursor=scale.w==3;
   float best=.045*.045, target=0;
   [loop] for (uint t=0;t<count;t++) {
     float4 p=targets[t];
@@ -79,9 +79,9 @@ void main(triangle Vertex v[3], inout TriangleStream<Vertex> stream) {
   // If the native billboard used the scene camera, its clip W is already a
   // world distance. Flat UI quads have an arbitrary W and use the surface.
   if (!aim && !cursor && target==0 && scale.x!=0) target=max(0,nativeInv);
-  bool active=(!aim && !cursor) || all(abs(mono)<.12);
+  bool active=(!aim && !cursor) || all(abs(mono)<(dotOnly ? .012 : .12));
   if (scale.w!=0 && active) {
-    float2 ray=aim ? float2(0,0) : mono-float2(abs(scale.y)*(scale.z-target),0);
+    float2 ray=aim ? float2(0,0) : mono+float2(rayScale*(scale.z-target),0);
     float surface=invDepth(ray);
     float chosen=surface>target ? surface*1.005 : target;
     [unroll] for (uint i=0;i<3;i++)
@@ -163,7 +163,7 @@ void MarkerCapture::finish() {
   readback.Reset();
   source.Reset();
 }
-void capture_marker_depth(ID3D12GraphicsCommandList* list, ID3D12Device* dev, ID3D12Resource* depth) {
+void capture_marker_depth(ID3D12GraphicsCommandList* list, ID3D12Device* dev, ID3D12Resource* depth, bool right_eye) {
   const auto d = depth->GetDesc();
   std::lock_guard guard(depth_lock);
   bool resized = depth_device != dev || latest.width != d.Width || latest.height != d.Height;
@@ -212,8 +212,11 @@ void capture_marker_depth(ID3D12GraphicsCommandList* list, ID3D12Device* dev, ID
   dst.pResource = buffer;
   dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
   dst.PlacedFootprint.Footprint = {DXGI_FORMAT_R32_FLOAT, latest.width, latest.height, 1, latest.pitch};
+  static bool previous_right;
+  const bool refill = resized || previous_right != right_eye;
+  previous_right = right_eye;
   unsigned newest = 0;
-  for (unsigned i = 0; i < (resized ? history : 1); ++i) {
+  for (unsigned i = 0; i < (refill ? history : 1); ++i) {
     newest = next_slice;
     dst.PlacedFootprint.Offset = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT + UINT64(next_slice) * latest.slice_bytes;
     list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);

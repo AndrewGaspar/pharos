@@ -12,4 +12,6 @@ void read_layout(ID3D12RootSignature* root, const D3D12_VERSIONED_ROOT_SIGNATURE
 void tag_inputs(ID3D12PipelineState* pso, ID3D12RootSignature* root, port::Entry& entry);
 void tag_hud(ID3D12Device* dev, ID3D12PipelineState* pso, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc);
 void hud_capture_present();
+bool bow_dot_present();
+bool bow_bars_present();
 }  // namespace bifrost
