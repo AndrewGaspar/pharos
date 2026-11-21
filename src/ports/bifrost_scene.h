@@ -25,9 +25,9 @@ struct FrameInfo {
 };
 struct Scene {
   FrameInfo info;
-  Microsoft::WRL::ComPtr<ID3D12Resource> color, motion, depth;
+  Microsoft::WRL::ComPtr<ID3D12Resource> color, motion, depth, output;
 };
-bool record_scene(ID3D12GraphicsCommandList* list, const DrawState& state, const FrameInfo& info);
+bool record_scene(ID3D12GraphicsCommandList* list, const DrawState& state, const FrameInfo& info, ID3D12Resource* native);
 Scene recorded_scene(ID3D12Object* object);
 void forward_scene(ID3D12Object* dst, const Scene& scene);
 void clear_scene(ID3D12GraphicsCommandList* list);

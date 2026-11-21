@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <array>
+#include <algorithm>
 #include <thread>
 #include <mutex>
 
@@ -15,6 +16,8 @@
 #include "dlss/ngx.h"
 #include "fg/camera.h"
 #include "ports/bifrost_scene.h"
+#include "ports/bifrost_replay.h"
+#include "ports/bifrost_sr.h"
 #include "ports/bifrost_verify.h"
 #include "ports/common.h"
 
@@ -22,7 +25,7 @@ using Microsoft::WRL::ComPtr;
 using namespace aco;
 extern "C" IMAGE_DOS_HEADER __ImageBase;
 namespace port {
-extern const size_t execute;
+extern const size_t execute, resize1;
 }
 namespace bifrost {
 namespace {
@@ -42,6 +45,8 @@ const std::wstring& ini_file() {
   }();
   return ini;
 }
+// Preserve submission ordering when an engine batch is split around TAA.
+std::recursive_mutex submissions;
 struct Extent {
   UINT width{}, height{};
 };
@@ -66,6 +71,8 @@ Fn ngx_proc(const char* name) {
 class Session final : public IUnknown {
  public:
   explicit Session(ID3D12CommandQueue* q) : queue(q) {
+    fg_enabled = GetPrivateProfileIntW(L"fg", L"enabled", 1, ini_file().c_str()) != 0;
+    hudless = option(L"fg", L"hudless", 1) && !option(L"upscaler", L"compare", 0);
     verify = GetPrivateProfileIntW(L"fg", L"verify", 0, ini_file().c_str()) != 0;
   }
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** out) override {
@@ -82,12 +89,33 @@ class Session final : public IUnknown {
     if (!n) delete this;
     return n;
   }
+  template <class Resize>
+  HRESULT resize(IDXGISwapChain* chain, Resize&& resize_buffers) {
+    std::lock_guard guard(lock);
+    if (!drain()) return DXGI_ERROR_DEVICE_RESET;
+    HRESULT hr = resize_buffers();
+    if (SUCCEEDED(hr)) {
+      DXGI_SWAP_CHAIN_DESC d{};
+      ComPtr<ID3D12Device> dev;
+      if (option(L"upscaler", L"enabled", 1) && SUCCEEDED(chain->GetDesc(&d)) &&
+          SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(&dev))))
+        display_size(dev.Get(), d.BufferDesc.Width, d.BufferDesc.Height);
+      reset_history = true;
+      refresh_checked = false;
+      period = {};
+      next_flip = {};
+    }
+    return hr;
+  }
   // Fullscreen flip-model chains expose the current physical buffer to D3D12.
   // Queue both copies around the extra flip so the second present carries the untouched real frame.
   template <class Flip>
   HRESULT present(IDXGISwapChain* chain, UINT flags, Flip&& flip) {
     std::lock_guard guard(lock);
     if (flags & (DXGI_PRESENT_TEST | DXGI_PRESENT_DO_NOT_WAIT | DXGI_PRESENT_RESTART)) return flip();
+    replay::present();
+    finish_sr_frame(queue.Get());
+    if (!fg_enabled) return flip();
     Scene scene;
     {
       std::lock_guard handoff_guard(handoff);
@@ -124,6 +152,12 @@ class Session final : public IUnknown {
     ngx::Params p(raw_params);
     p.reset();
     p.set(NVSDK_NGX_DLSSG_Parameter_Backbuffer, real_frame.Get());
+    const bool use_hudless = hudless && scene.output && scene.output->GetDesc().Format == bd.Format;
+    if (use_hudless) {
+      p.set(NVSDK_NGX_DLSSG_Parameter_HUDLess, scene.output.Get());
+      p.set(NVSDK_NGX_DLSSG_Parameter_HUDLessSubrectWidth, wanted.width);
+      p.set(NVSDK_NGX_DLSSG_Parameter_HUDLessSubrectHeight, wanted.height);
+    }
     p.set(NVSDK_NGX_DLSSG_Parameter_Depth, scene.depth.Get());
     p.set(NVSDK_NGX_DLSSG_Parameter_MVecs, scene.motion.Get());
     p.set(NVSDK_NGX_DLSSG_Parameter_OutputInterpolated, generated.Get());
@@ -154,37 +188,47 @@ class Session final : public IUnknown {
     p.set(NVSDK_NGX_DLSSG_Parameter_InputBackbufferSubrectHeight, wanted.height);
     p.set(NVSDK_NGX_DLSSG_Parameter_OutputInterpolatedSubrectWidth, wanted.width);
     p.set(NVSDK_NGX_DLSSG_Parameter_OutputInterpolatedSubrectHeight, wanted.height);
-    p.set(NVSDK_NGX_DLSSG_Parameter_MultiFrameCount, 1u);
-    p.set(NVSDK_NGX_DLSSG_Parameter_MultiFrameIndex, 1u);
-    auto r = evaluate(list.Get(), feature, p.get(), nullptr);
-    if (frame_id <= 3 || frame_id % 300 == 0)
-      ACO_LOG("Bifrost: FG evaluate #%u %s, jitter %.3f %.3f, camera %.2f %.2f %.2f, real %u generated %u", frame_id,
-              ngx::result_str(r), scene.info.jitter[0], scene.info.jitter[1], camera.pos[0], camera.pos[1],
-              camera.pos[2], real_presents, generated_presents);
-    if (NVSDK_NGX_FAILED(r)) {
-      list->Close();
-      reset_history = true;
-      return flip();
-    }
-    if (check) verifier.finish(list.Get(), generated.Get(), real_frame.Get());
-    bool insert = !reset_history;
-    reset_history = false;
-    if (insert) copy_to_buffer(bb.Get(), generated.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    if (!submit()) return flip();
-    slots[current].scene = scene;
-    if (check && wait_for(submitted)) verifier.report();
-    if (insert) {
-      pace(chain);
-      auto extra = flip();
-      if (extra != S_OK) {
+    p.set(NVSDK_NGX_DLSSG_Parameter_MultiFrameCount, generated_count);
+    const bool insert = !reset_history;
+    bool flipped = false;
+    for (unsigned i = 1; i <= generated_count; ++i) {
+      p.set(NVSDK_NGX_DLSSG_Parameter_MultiFrameIndex, i);
+      auto result = evaluate(list.Get(), feature, p.get(), nullptr);
+      if (i == 1 && (frame_id <= 3 || frame_id % 300 == 0))
+        ACO_LOG(
+            "Bifrost: FG evaluate #%u %s (%ux), jitter %.3f %.3f, camera %.2f %.2f %.2f, real %u generated %u, "
+            "HUD-less %d",
+            frame_id, ngx::result_str(result), generated_count + 1, scene.info.jitter[0], scene.info.jitter[1],
+            camera.pos[0], camera.pos[1], camera.pos[2], real_presents, generated_presents, use_hudless);
+      if (NVSDK_NGX_FAILED(result)) {
+        list->Close();
         reset_history = true;
-        return extra;
+        if (!flipped) return flip();
+        if (!begin()) return DXGI_ERROR_DEVICE_RESET;
+        break;
       }
-      ++generated_presents;
-      bb.Reset();
-      if (FAILED(sc->GetBuffer(sc->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&bb))) || !begin())
-        return DXGI_ERROR_DEVICE_RESET;
-
+      bool sample = check && i == (generated_count + 1) / 2;
+      if (sample) verifier.finish(list.Get(), generated.Get(), real_frame.Get());
+      if (insert) copy_to_buffer(bb.Get(), generated.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      if (!submit()) return DXGI_ERROR_DEVICE_RESET;
+      slots[current].scene = scene;
+      if (sample && wait_for(submitted)) verifier.report();
+      reset_history = false;
+      if (insert) {
+        pace(chain);
+        auto extra = flip();
+        if (extra != S_OK) {
+          reset_history = true;
+          return extra;
+        }
+        ++generated_presents;
+        flipped = true;
+        bb.Reset();
+        if (FAILED(sc->GetBuffer(sc->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&bb)))) return DXGI_ERROR_DEVICE_RESET;
+      }
+      if ((insert || i < generated_count) && !begin()) return DXGI_ERROR_DEVICE_RESET;
+    }
+    if (flipped) {
       copy_to_buffer(bb.Get(), real_frame.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
       if (!submit()) return DXGI_ERROR_DEVICE_RESET;
     }
@@ -248,7 +292,7 @@ class Session final : public IUnknown {
     p.set(NVSDK_NGX_DLSSG_Parameter_InternalWidth, wanted.render_width);
     p.set(NVSDK_NGX_DLSSG_Parameter_InternalHeight, wanted.render_height);
     p.set(NVSDK_NGX_DLSSG_Parameter_BackbufferFormat, UINT(wanted.format));
-    p.set(NVSDK_NGX_DLSSG_Parameter_MultiFrameCount, 1u);
+    p.set(NVSDK_NGX_DLSSG_Parameter_MultiFrameCount, generated_count);
     p.set(NVSDK_NGX_DLSSG_Parameter_DynamicResolution, 0u);
     const auto result = create(list.Get(), NVSDK_NGX_Feature_FrameGeneration, p.get(), &feature);
     const auto closed = list->Close();
@@ -289,6 +333,15 @@ class Session final : public IUnknown {
           FAILED(slot.commands->Close()))
         return false;
     }
+    auto caps = ngx_proc<Parameters>("NVSDK_NGX_D3D12_GetCapabilityParameters");
+    NVSDK_NGX_Parameter* limits{};
+    UINT maximum = 1;
+    if (caps && NVSDK_NGX_SUCCEED(caps(&limits)) && limits) {
+      ngx::Params(limits).get(NVSDK_NGX_DLSSG_Parameter_MultiFrameCountMax, &maximum);
+      destroy(limits);
+    }
+    UINT requested = GetPrivateProfileIntW(L"fg", L"count", 2, ini_file().c_str());
+    generated_count = std::clamp(requested, 2u, std::clamp(maximum, 1u, 5u) + 1) - 1;
     return NVSDK_NGX_SUCCEED(alloc(&raw_params)) && raw_params;
   }
   bool begin() {
@@ -329,7 +382,8 @@ class Session final : public IUnknown {
   NVSDK_NGX_Result (*evaluate)(ID3D12GraphicsCommandList*, const NVSDK_NGX_Handle*, const NVSDK_NGX_Parameter*,
                                void*){};
   VerifyFrames verifier;
-  bool verify{};
+  UINT generated_count = 1;
+  bool fg_enabled{}, verify{}, hudless{};
   bool refresh_checked{};
   std::chrono::nanoseconds period{};
   Clock::time_point next_flip{};
@@ -383,6 +437,12 @@ HRESULT WINAPI present1(IDXGISwapChain1* chain, UINT interval, UINT flags, const
   });
 }
 void WINAPI execute(ID3D12CommandQueue* q, UINT count, ID3D12CommandList* const* lists) {
+  auto original = orig<decltype(execute)>(q, port::execute);
+  replay::submitted(q, count, lists);
+  BOOL attached = FALSE;
+  UINT bytes = sizeof(attached);
+  if (FAILED(q->GetPrivateData(session_tag, &bytes, &attached)) || !attached) return original(q, count, lists);
+  std::lock_guard submit_guard(submissions);
   static std::atomic<unsigned> trace_count{};
   if (trace_count.load(std::memory_order_relaxed) < 24) {
     for (UINT i = 0; i < count; ++i) {
@@ -395,31 +455,64 @@ void WINAPI execute(ID3D12CommandQueue* q, UINT count, ID3D12CommandList* const*
                 scene.info.serial, ui.scene, ui.target);
     }
   }
-  orig<decltype(execute)>(q, port::execute)(q, count, lists);
-  for (UINT i = count; i > 0; --i) {
+  UINT start = 0;
+  for (UINT i = 0; i < count; ++i) {
     Extent size{};
     UINT bytes = sizeof(size);
-    if (SUCCEEDED(lists[i - 1]->GetPrivateData(frame_tag, &bytes, &size)) && size.width) {
-      const auto scene = recorded_scene(lists[i - 1]);
-      std::lock_guard guard(handoff);
-      forward_scene(q, scene);
-      q->SetPrivateData(frame_tag, sizeof(size), &size);
-      break;
-    }
+    if (FAILED(lists[i]->GetPrivateData(frame_tag, &bytes, &size)) || !size.width) continue;
+    auto scene = recorded_scene(lists[i]);
+    original(q, i + 1 - start, lists + start);
+    start = i + 1;
+    if (scene.output && !upscale(q, scene)) scene.output.Reset();
+    std::lock_guard guard(handoff);
+    forward_scene(q, scene);
   }
+  if (start < count) original(q, count - start, lists + start);
+}
+thread_local bool in_resize = false;
+template <class Fn>
+HRESULT on_resize(IDXGISwapChain* chain, Fn&& fn) {
+  ComPtr<IUnknown> owner;
+  UINT bytes = sizeof(void*);
+  if (in_resize || FAILED(chain->GetPrivateData(session_tag, &bytes, owner.GetAddressOf())) || !owner) return fn();
+  in_resize = true;
+  auto hr = static_cast<Session*>(owner.Get())->resize(chain, fn);
+  in_resize = false;
+  return hr;
+}
+HRESULT WINAPI resize(IDXGISwapChain* chain, UINT count, UINT w, UINT h, DXGI_FORMAT format, UINT flags) {
+  return on_resize(chain, [&] {
+    return orig<decltype(resize)>(chain, vt::SwapChain_ResizeBuffers)(chain, count, w, h, format, flags);
+  });
+}
+HRESULT WINAPI resize1(IDXGISwapChain3* chain, UINT count, UINT w, UINT h, DXGI_FORMAT format, UINT flags,
+                       const UINT* masks, IUnknown* const* queues) {
+  return on_resize(chain, [&] {
+    return orig<decltype(resize1)>(chain, port::resize1)(chain, count, w, h, format, flags, masks, queues);
+  });
 }
 void attach(IUnknown* creator, IDXGISwapChain* chain) {
   ComPtr<ID3D12CommandQueue> queue;
   if (!creator || !chain || FAILED(creator->QueryInterface(IID_PPV_ARGS(&queue))) ||
       queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT)
     return;
-  if (!GetPrivateProfileIntW(L"fg", L"enabled", 1, ini_file().c_str())) return;
+  DXGI_SWAP_CHAIN_DESC desc{};
+  if (GetPrivateProfileIntW(L"upscaler", L"enabled", 1, ini_file().c_str()) && SUCCEEDED(chain->GetDesc(&desc)))
+    attach_sr(queue.Get(), desc.BufferDesc.Width, desc.BufferDesc.Height);
   auto* session = new Session(queue.Get());
   const auto hr = chain->SetPrivateDataInterface(session_tag, session);
   session->Release();
   if (FAILED(hr)) return;
+  const BOOL attached = TRUE;
+  queue->SetPrivateData(session_tag, sizeof(attached), &attached);
   hook_vtable(queue.Get(), port::execute, reinterpret_cast<void*>(execute));
   hook_vtable(chain, vt::SwapChain_Present, reinterpret_cast<void*>(present));
+  hook_vtable(chain, vt::SwapChain_ResizeBuffers, reinterpret_cast<void*>(resize));
+  ComPtr<IDXGISwapChain3> sc3;
+  if (SUCCEEDED(chain->QueryInterface(IID_PPV_ARGS(&sc3)))) {
+    hook_vtable(sc3.Get(), vt::SwapChain_ResizeBuffers, reinterpret_cast<void*>(resize));
+    hook_vtable(sc3.Get(), port::resize1, reinterpret_cast<void*>(resize1));
+  }
   ComPtr<IDXGISwapChain1> sc1;
   if (SUCCEEDED(chain->QueryInterface(IID_PPV_ARGS(&sc1)))) {
     hook_vtable(sc1.Get(), vt::SwapChain_Present, reinterpret_cast<void*>(present));
@@ -440,6 +533,9 @@ HRESULT WINAPI swap_hwnd(IDXGIFactory2* f, IUnknown* device, HWND hwnd, const DX
   return hr;
 }
 }  // namespace
+UINT option(const wchar_t* section, const wchar_t* key, UINT fallback) {
+  return GetPrivateProfileIntW(section, key, fallback, ini_file().c_str());
+}
 void observe_factory(IUnknown* object) {
   ComPtr<IDXGIAdapter> adapter;
   ComPtr<IDXGIFactory> factory;

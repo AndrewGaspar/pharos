@@ -15,11 +15,13 @@
 #include "ports/bifrost_present.h"
 #include "ports/bifrost_resources.h"
 #include "ports/bifrost_scene.h"
+#include "ports/bifrost_composite.h"
+#include "ports/bifrost_replay.h"
 
 using aco::orig;
 using Microsoft::WRL::ComPtr;
 namespace port {
-extern const size_t topology, viewports, scissors;
+extern const size_t set_ctable, set_croot, topology, viewports, scissors;
 extern const size_t create_heap, make_srv, make_uav, make_cbv, make_rtv, copy_ranges, copy_simple, set_heaps,
     set_gtable, set_groot, set_targets, draw, draw_indexed, indirect, clear_state;
 }  // namespace port
@@ -52,6 +54,7 @@ struct Bindings {
   ID3D12DescriptorHeap* sampler{};
   UINT64 roots[16]{};
   ID3D12RootSignature* signature{};
+  Slot graphics_camera, compute_camera;
   DrawState draw;
 };
 struct View {
@@ -203,10 +206,31 @@ void WINAPI set_heaps(ID3D12GraphicsCommandList* list, UINT count, ID3D12Descrip
   st.heap = h;
   save(list, st);
 }
+void note_camera(ID3D12GraphicsCommandList* list, const Bindings& st, Slot slot, UINT root,
+                 D3D12_GPU_DESCRIPTOR_HANDLE h) {
+  if (!slot.count || root != slot.root || !st.heap.stride || h.ptr < st.heap.gpu) return;
+  auto offset = h.ptr - st.heap.gpu + UINT64(slot.offset) * st.heap.stride;
+  if (offset >= st.heap.length) return;
+  std::lock_guard guard(lock);
+  auto v = descriptors.find(st.heap.cpu + offset);
+  if (v != descriptors.end() && v->second.kind == 'b') replay::camera(list, v->second.id, UINT(v->second.width));
+}
+void WINAPI compute_table(ID3D12GraphicsCommandList* list, UINT i, D3D12_GPU_DESCRIPTOR_HANDLE h) {
+  orig<decltype(compute_table)>(list, port::set_ctable)(list, i, h);
+  auto st = get<ID3D12GraphicsCommandList, Bindings>(list, list_tag);
+  note_camera(list, st, st.compute_camera, i, h);
+}
+void WINAPI compute_root(ID3D12GraphicsCommandList* list, ID3D12RootSignature* sig) {
+  orig<decltype(compute_root)>(list, port::set_croot)(list, sig);
+  auto st = get<ID3D12GraphicsCommandList, Bindings>(list, list_tag);
+  st.compute_camera = get<ID3D12RootSignature, Layout>(sig, layout_tag).pass.cbv;
+  save(list, st);
+}
 void WINAPI table(ID3D12GraphicsCommandList* list, UINT i, D3D12_GPU_DESCRIPTOR_HANDLE h) {
   orig<decltype(table)>(list, port::set_gtable)(list, i, h);
   if (i >= 16) return;
   auto st = get<ID3D12GraphicsCommandList, Bindings>(list, list_tag);
+  if (replay::tracking()) note_camera(list, st, st.graphics_camera, i, h);
   st.roots[i] = h.ptr;
   save(list, st);
 }
@@ -215,6 +239,7 @@ void WINAPI root(ID3D12GraphicsCommandList* list, ID3D12RootSignature* sig) {
   auto st = get<ID3D12GraphicsCommandList, Bindings>(list, list_tag);
   if (st.signature != sig) {
     std::fill(std::begin(st.roots), std::end(st.roots), 0);
+    if (replay::tracking()) st.graphics_camera = get<ID3D12RootSignature, Layout>(sig, layout_tag).pass.cbv;
     st.signature = sig;
     st.draw.signature = sig;
     save(list, st);
@@ -261,10 +286,11 @@ void WINAPI scissors(ID3D12GraphicsCommandList* list, UINT n, const D3D12_RECT* 
   std::copy_n(v, st.draw.scissor_count, st.draw.scissors);
   save(list, st);
 }
-void inspect(ID3D12GraphicsCommandList* list) {
+bool inspect(ID3D12GraphicsCommandList* list, const std::function<void()>& draw) {
+  replay::draw(list);
   auto st = get<ID3D12GraphicsCommandList, Bindings>(list, list_tag);
   auto e = st.pass.entry;
-  if (!e) return;
+  if (!e) return false;
   std::unique_lock guard(lock);
   if (e->role == "PS/temporalaa.hlsl/PS_TemporalAA" &&
       (e->detail.starts_with("TemporalAATilesColorBoxYCoCgClampNoUpsample,") ||
@@ -288,9 +314,13 @@ void inspect(ID3D12GraphicsCommandList* list) {
         memcpy(info.camera.clip_to_view, camera.data() + 69 * 4, sizeof(info.camera.clip_to_view));
         memcpy(info.camera.prev_view_proj, camera.data() + 38 * 4, sizeof(info.camera.prev_view_proj));
         info.camera.valid = true;
+        const auto out = descriptors.find(st.draw.targets[0].ptr);
+        auto* native = out != descriptors.end() && out->second.kind == 'r'
+                           ? reinterpret_cast<ID3D12Resource*>(out->second.id)
+                           : nullptr;
         guard.unlock();
         record_frame_size(list, info.width, info.height);
-        record_scene(list, st.draw, info);
+        record_scene(list, st.draw, info, native);
         guard.lock();
       }
     }
@@ -323,10 +353,17 @@ void inspect(ID3D12GraphicsCommandList* list) {
   if (e->role == "PS/uicompositing.hlsl/PS_ShadePixel" && e->detail.starts_with("CompositeTextureInvSrcAlpha,")) {
     auto scene = descriptors.find(address(st, st.pass.resources.srv, 1)),
          out = descriptors.find(st.draw.targets[0].ptr);
-    if (scene != descriptors.end() && out != descriptors.end())
+    if (scene != descriptors.end() && out != descriptors.end()) {
       record_composite(list, scene->second.id, out->second.id);
+      if (scene->second.kind == 't') {
+        auto* native = reinterpret_cast<ID3D12Resource*>(scene->second.id);
+        guard.unlock();
+        if (composite(list, native, st.draw.pso, st.signature, st.roots, draw)) return true;
+        guard.lock();
+      }
+    }
   }
-  if (sampled.count(e)) return;
+  if (sampled.count(e)) return false;
   std::ostringstream s;
   auto append = [&](UINT64 addr, const char* name, UINT slot, char kind) {
     auto it = descriptors.find(addr);
@@ -345,11 +382,12 @@ void inspect(ID3D12GraphicsCommandList* list) {
     sampled.insert(e);
     ACO_LOG("submitted %s %s%s", e->role.c_str(), e->detail.c_str(), s.str().c_str());
   }
+  return false;
 }
 template <const size_t& slot, typename... Args>
 void WINAPI submit(ID3D12GraphicsCommandList* list, Args... args) {
-  inspect(list);
-  orig<decltype(submit<slot, Args...>)>(list, slot)(list, args...);
+  auto draw = [&] { orig<decltype(submit<slot, Args...>)>(list, slot)(list, args...); };
+  if (!inspect(list, draw)) draw();
 }
 void WINAPI clear(ID3D12GraphicsCommandList* list, ID3D12PipelineState* pso) {
   orig<decltype(clear)>(list, port::clear_state)(list, pso);
@@ -397,6 +435,11 @@ void observe_descriptors(ID3D12Device* dev) {
 }
 void observe_commands(ID3D12GraphicsCommandList* list) {
 #define HOOK(slot, ...) aco::hook_vtable(list, port::slot, reinterpret_cast<void*>(__VA_ARGS__))
+  if (replay::tracking()) {
+    HOOK(set_ctable, compute_table);
+    HOOK(set_croot, compute_root);
+    replay::observe(list);
+  }
   HOOK(topology, topology);
   HOOK(viewports, viewports);
   HOOK(scissors, scissors);

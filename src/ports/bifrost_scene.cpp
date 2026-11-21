@@ -2,10 +2,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <mutex>
 #include <d3dcompiler.h>
 
 #include "core/hook.h"
 #include "core/log.h"
+#include "ports/bifrost_sr.h"
 
 using Microsoft::WRL::ComPtr;
 namespace port {
@@ -56,6 +58,7 @@ constexpr GUID tag(unsigned n) {
 }
 constexpr GUID info_tag = tag(1), color_tag = tag(2), motion_tag = tag(3), depth_tag = tag(4), heap_tag = tag(5),
                pso_tag = tag(6), signature_tag = tag(7);
+constexpr GUID output_key = tag(8);
 constexpr DXGI_FORMAT formats[]{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_R32_FLOAT};
 template <class T>
 ComPtr<T> associated(ID3D12Object* o, REFGUID id) {
@@ -76,8 +79,8 @@ ComPtr<ID3DBlob> compile(const char* entry, const char* profile) {
   if (dll) FreeLibrary(dll);
   return code;
 }
-ComPtr<ID3D12PipelineState> pipeline(ID3D12Device* dev, ID3D12RootSignature* sig, ID3D12GraphicsCommandList* list) {
-  auto existing = associated<ID3D12PipelineState>(list, pso_tag);
+ComPtr<ID3D12PipelineState> pipeline(ID3D12Device* dev, ID3D12RootSignature* sig, ID3D12PipelineState* original) {
+  auto existing = associated<ID3D12PipelineState>(original, pso_tag);
   ID3D12RootSignature* previous{};
   UINT size = sizeof(previous);
   if (existing && SUCCEEDED(existing->GetPrivateData(signature_tag, &size, &previous)) && previous == sig)
@@ -105,13 +108,15 @@ ComPtr<ID3D12PipelineState> pipeline(ID3D12Device* dev, ID3D12RootSignature* sig
     return {};
   }
   pso->SetPrivateData(signature_tag, sizeof(sig), &sig);
-  list->SetPrivateDataInterface(pso_tag, pso.Get());
+  original->SetPrivateDataInterface(pso_tag, pso.Get());
   return pso;
 }
-bool targets(ID3D12Device* dev, ID3D12GraphicsCommandList* list, Scene& scene) {
-  scene.color = associated<ID3D12Resource>(list, color_tag);
-  scene.motion = associated<ID3D12Resource>(list, motion_tag);
-  scene.depth = associated<ID3D12Resource>(list, depth_tag);
+bool targets(ID3D12Device* dev, ID3D12Resource* native, Scene& scene) {
+  static std::mutex allocation;
+  std::lock_guard guard(allocation);
+  scene.color = associated<ID3D12Resource>(native, color_tag);
+  scene.motion = associated<ID3D12Resource>(native, motion_tag);
+  scene.depth = associated<ID3D12Resource>(native, depth_tag);
   if (scene.color && scene.motion && scene.depth) {
     auto d = scene.color->GetDesc();
     if (d.Width == scene.info.width && d.Height == scene.info.height) return true;
@@ -129,7 +134,10 @@ bool targets(ID3D12Device* dev, ID3D12GraphicsCommandList* list, Scene& scene) {
     dev->CreateRenderTargetView(res->Get(), nullptr, handle);
     handle.ptr += dev->GetDescriptorHandleIncrementSize(desc.Type);
   }
-  return SUCCEEDED(scene.color->SetPrivateDataInterface(heap_tag, heap.Get()));
+  return SUCCEEDED(scene.color->SetPrivateDataInterface(heap_tag, heap.Get())) &&
+         SUCCEEDED(native->SetPrivateDataInterface(color_tag, scene.color.Get())) &&
+         SUCCEEDED(native->SetPrivateDataInterface(motion_tag, scene.motion.Get())) &&
+         SUCCEEDED(native->SetPrivateDataInterface(depth_tag, scene.depth.Get()));
 }
 }  // namespace
 
@@ -157,27 +165,35 @@ void forward_scene(ID3D12Object* dst, const Scene& s) {
   dst->SetPrivateDataInterface(color_tag, s.color.Get());
   dst->SetPrivateDataInterface(motion_tag, s.motion.Get());
   dst->SetPrivateDataInterface(depth_tag, s.depth.Get());
+  dst->SetPrivateDataInterface(output_key, s.output.Get());
   dst->SetPrivateData(info_tag, sizeof(s.info), &s.info);
 }
 Scene recorded_scene(ID3D12Object* o) {
   Scene s{};
   UINT n = sizeof(s.info);
   if (FAILED(o->GetPrivateData(info_tag, &n, &s.info)) || !s.info.width) return {};
+  s.output = associated<ID3D12Resource>(o, output_key);
   s.color = associated<ID3D12Resource>(o, color_tag);
   s.motion = associated<ID3D12Resource>(o, motion_tag);
   s.depth = associated<ID3D12Resource>(o, depth_tag);
   return s;
 }
-void clear_scene(ID3D12GraphicsCommandList* list) { list->SetPrivateData(info_tag, 0, nullptr); }
-bool record_scene(ID3D12GraphicsCommandList* list, const DrawState& state, const FrameInfo& info) {
+void clear_scene(ID3D12GraphicsCommandList* list) {
+  UINT n = 0;
+  if (FAILED(list->GetPrivateData(info_tag, &n, nullptr)) || !n) return;
+  for (const auto& tag : {color_tag, motion_tag, depth_tag, output_key}) list->SetPrivateData(tag, 0, nullptr);
+  list->SetPrivateData(info_tag, 0, nullptr);
+}
+bool record_scene(ID3D12GraphicsCommandList* list, const DrawState& state, const FrameInfo& info,
+                  ID3D12Resource* native) {
   if (!state.topology || !state.signature || !state.pso || !state.viewport_count || !state.scissor_count) return false;
   ComPtr<ID3D12Device> dev;
   if (FAILED(list->GetDevice(IID_PPV_ARGS(&dev)))) return false;
-  const auto pso = pipeline(dev.Get(), state.signature, list);
+  const auto pso = pipeline(dev.Get(), state.signature, state.pso);
   static std::atomic<UINT64> sequence{};
   Scene s{info};
   s.info.serial = ++sequence;
-  if (!pso || !targets(dev.Get(), list, s)) return false;
+  if (!native || !pso || !targets(dev.Get(), native, s)) return false;
   const auto heap = associated<ID3D12DescriptorHeap>(s.color.Get(), heap_tag);
   if (!heap) return false;
   for (auto* res : {s.color.Get(), s.motion.Get(), s.depth.Get()})
@@ -206,6 +222,7 @@ bool record_scene(ID3D12GraphicsCommandList* list, const DrawState& state, const
   bind_pso(list, state.pso);
   for (auto* res : {s.color.Get(), s.motion.Get(), s.depth.Get()})
     transition(list, res, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  prepare_output(native, s);
   forward_scene(list, s);
   static std::atomic<bool> logged{};
   if (!logged.exchange(true))

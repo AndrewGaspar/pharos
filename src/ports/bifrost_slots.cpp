@@ -1,8 +1,14 @@
 #define CINTERFACE
 #include <d3d12.h>
+#include <dxgi1_4.h>
 
 #include <cstddef>
 namespace port {
+extern const size_t barrier = offsetof(ID3D12GraphicsCommandListVtbl, ResourceBarrier) / sizeof(void*);
+extern const size_t dispatch = offsetof(ID3D12GraphicsCommandListVtbl, Dispatch) / sizeof(void*);
+extern const size_t end_query = offsetof(ID3D12GraphicsCommandListVtbl, EndQuery) / sizeof(void*);
+extern const size_t resolve_queries = offsetof(ID3D12GraphicsCommandListVtbl, ResolveQueryData) / sizeof(void*);
+extern const size_t resize1 = offsetof(IDXGISwapChain3Vtbl, ResizeBuffers1) / sizeof(void*);
 extern const size_t topology = offsetof(ID3D12GraphicsCommandListVtbl, IASetPrimitiveTopology) / sizeof(void*);
 extern const size_t viewports = offsetof(ID3D12GraphicsCommandListVtbl, RSSetViewports) / sizeof(void*);
 extern const size_t scissors = offsetof(ID3D12GraphicsCommandListVtbl, RSSetScissorRects) / sizeof(void*);
@@ -20,6 +26,8 @@ extern const size_t indirect = offsetof(ID3D12GraphicsCommandListVtbl, ExecuteIn
 extern const size_t draw_indexed = offsetof(ID3D12GraphicsCommandListVtbl, DrawIndexedInstanced) / sizeof(void*);
 extern const size_t draw = offsetof(ID3D12GraphicsCommandListVtbl, DrawInstanced) / sizeof(void*);
 extern const size_t set_targets = offsetof(ID3D12GraphicsCommandListVtbl, OMSetRenderTargets) / sizeof(void*);
+extern const size_t set_ctable = offsetof(ID3D12GraphicsCommandListVtbl, SetComputeRootDescriptorTable) / sizeof(void*);
+extern const size_t set_croot = offsetof(ID3D12GraphicsCommandListVtbl, SetComputeRootSignature) / sizeof(void*);
 extern const size_t set_groot = offsetof(ID3D12GraphicsCommandListVtbl, SetGraphicsRootSignature) / sizeof(void*);
 extern const size_t set_gtable =
     offsetof(ID3D12GraphicsCommandListVtbl, SetGraphicsRootDescriptorTable) / sizeof(void*);

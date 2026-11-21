@@ -8,7 +8,9 @@
 #include "core/hook.h"
 #include "dlss/ngx.h"
 #include "ports/bifrost_present.h"
+#include "ports/bifrost_composite.h"
 #include "ports/bifrost_resources.h"
+#include "ports/bifrost_replay.h"
 #include "ports/common.h"
 
 using namespace aco;
@@ -107,6 +109,7 @@ HRESULT WINAPI root_signature(ID3D12Device* dev, UINT node, const void* bytes, S
       FAILED(static_cast<IUnknown*>(*out)->QueryInterface(IID_PPV_ARGS(&root))))
     return hr;
   auto* desc = reader->GetUnconvertedRootSignatureDesc();
+  bifrost::remember_root(root.Get(), bytes, size);
   bifrost::read_layout(root.Get(), *desc);
   std::string text;
   if (desc->Version == D3D_ROOT_SIGNATURE_VERSION_1_0)
@@ -135,6 +138,15 @@ void tag_pipeline(IUnknown* object, const D3D12_SHADER_BYTECODE& code, ID3D12Roo
 HRESULT WINAPI graphics(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc, REFIID iid, void** out) {
   auto hr = orig<decltype(graphics)>(dev, port::graphics_pso)(dev, desc, iid, out);
   if (SUCCEEDED(hr) && out && *out && desc) tag_pipeline(static_cast<IUnknown*>(*out), desc->PS, desc->pRootSignature);
+  if (SUCCEEDED(hr) && out && *out && desc) {
+    ComPtr<ID3D12PipelineState> pso;
+    if (SUCCEEDED(static_cast<IUnknown*>(*out)->QueryInterface(IID_PPV_ARGS(&pso)))) {
+      auto entry = port::binding(pso.Get());
+      if (entry && entry->role == "PS/uicompositing.hlsl/PS_ShadePixel" &&
+          entry->detail.starts_with("CompositeTextureInvSrcAlpha,"))
+        bifrost::prepare_composite(dev, *desc, pso.Get());
+    }
+  }
   return hr;
 }
 HRESULT WINAPI compute(ID3D12Device* dev, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, REFIID iid, void** out) {
@@ -160,6 +172,7 @@ void WINAPI bind(ID3D12GraphicsCommandList* list, ID3D12PipelineState* pso) {
 HRESULT WINAPI reset(ID3D12GraphicsCommandList* list, ID3D12CommandAllocator* allocator, ID3D12PipelineState* pso) {
   auto hr = orig<decltype(reset)>(list, port::reset_list)(list, allocator, pso);
   if (SUCCEEDED(hr)) {
+    bifrost::replay::reset(list);
     bifrost::clear_frame_size(list);
     bifrost::reset_inputs(list, pso);
     observe(pso);
@@ -175,6 +188,7 @@ HRESULT WINAPI command_list(ID3D12Device* dev, UINT node, D3D12_COMMAND_LIST_TYP
       hook_vtable(list.Get(), port::set_pso, reinterpret_cast<void*>(bind));
       hook_vtable(list.Get(), port::reset_list, reinterpret_cast<void*>(reset));
       bifrost::observe_commands(list.Get());
+      bifrost::replay::reset(list.Get());
       bifrost::reset_inputs(list.Get(), pso);
       observe(pso);
     }
