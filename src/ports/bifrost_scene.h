@@ -22,6 +22,7 @@ struct FrameInfo {
   int eye{};
   UINT width{}, height{};
   float jitter[2]{};
+  float world_to_clip[4][4]{};
   aco::FgCamera camera{};
 };
 struct Scene {

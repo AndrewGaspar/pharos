@@ -9,6 +9,7 @@
 #include "core/hook.h"
 #include "core/log.h"
 #include "dlss/ngx.h"
+#include "dlss/sr_settings.h"
 #include "ports/bifrost_scene.h"
 #include "ports/bifrost_eye.h"
 
@@ -30,6 +31,7 @@ struct Size {
   bool operator==(const Size&) const = default;
 };
 std::mutex surfaces;
+std::atomic<UINT> requested_preset{13};
 template <class T>
 ComPtr<T> associated(ID3D12Object* obj, REFGUID id) {
   ComPtr<T> out;
@@ -78,8 +80,9 @@ class Upscaler final : public IUnknown {
     if (!open()) return false;
     auto output = scene.output->GetDesc();
     Size render{scene.info.width, scene.info.height}, target{UINT(output.Width), output.Height};
-    if (!feature || render != input_size || target != output_size) {
-      if (!create_feature(render, target)) return false;
+    const UINT preset = requested_preset.load(std::memory_order_relaxed);
+    if (!feature || render != input_size || target != output_size || preset != feature_preset) {
+      if (!create_feature(render, target, preset)) return false;
     }
     auto* slot = begin();
     if (!slot) return false;
@@ -225,7 +228,7 @@ class Upscaler final : public IUnknown {
     }
     return NVSDK_NGX_SUCCEED(alloc(&raw)) && raw;
   }
-  bool create_feature(Size render, Size out) {
+  bool create_feature(Size render, Size out, UINT preset) {
     if (!wait(last)) return false;
     if (feature) {
       release(feature);
@@ -241,28 +244,19 @@ class Upscaler final : public IUnknown {
     p.set(NVSDK_NGX_Parameter_Height, render.height);
     p.set(NVSDK_NGX_Parameter_OutWidth, out.width);
     p.set(NVSDK_NGX_Parameter_OutHeight, out.height);
-    float ratio = float(render.width) / out.width;
-    int quality = ratio >= .99f   ? NVSDK_NGX_PerfQuality_Value_DLAA
-                  : ratio >= .66f ? NVSDK_NGX_PerfQuality_Value_MaxQuality
-                  : ratio >= .57f ? NVSDK_NGX_PerfQuality_Value_Balanced
-                  : ratio >= .49f ? NVSDK_NGX_PerfQuality_Value_MaxPerf
-                                  : NVSDK_NGX_PerfQuality_Value_UltraPerformance;
-    p.set(NVSDK_NGX_Parameter_PerfQualityValue, quality);
+    p.set(NVSDK_NGX_Parameter_PerfQualityValue, ngx::perf_quality_for(float(render.width) / out.width));
     p.set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags,
           int(NVSDK_NGX_DLSS_Feature_Flags_MVLowRes | NVSDK_NGX_DLSS_Feature_Flags_DepthInverted));
-    for (const char* name :
-         {NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality,
-          NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance,
-          NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance})
-      p.set(name, 13u);
+    ngx::set_sr_preset(p, preset);
     auto r = create(slot->list.Get(), NVSDK_NGX_Feature_SuperSampling, p.get(), &feature);
-    ACO_LOG("Bifrost: SR create %ux%u -> %ux%u: %s", render.width, render.height, out.width, out.height,
-            ngx::result_str(r));
+    ACO_LOG("Bifrost: SR create %ux%u -> %ux%u preset %u: %s", render.width, render.height, out.width, out.height,
+            preset, ngx::result_str(r));
     if (NVSDK_NGX_FAILED(r)) {
       slot->list->Close();
       return false;
     }
     if (!submit(*slot)) return false;
+    feature_preset = preset;
     input_size = render;
     output_size = out;
     reset_next = true;
@@ -272,6 +266,7 @@ class Upscaler final : public IUnknown {
   std::mutex lock;
   std::atomic<ULONG> refs{1};
   Size input_size{}, output_size{};
+  UINT feature_preset{};
   NVSDK_NGX_Result (*create)(ID3D12GraphicsCommandList*, NVSDK_NGX_Feature, NVSDK_NGX_Parameter*, NVSDK_NGX_Handle**){};
   NVSDK_NGX_Result (*evaluate)(ID3D12GraphicsCommandList*, const NVSDK_NGX_Handle*, const NVSDK_NGX_Parameter*,
                                void*){};
@@ -310,6 +305,9 @@ void attach_sr(ID3D12CommandQueue* q, UINT width, UINT height) {
     q->SetPrivateDataInterface(i ? right_key : queue_key, sr);
     sr->Release();
   }
+}
+void sr_preset(const std::wstring& value) {
+  requested_preset = ngx::preset_value(value);
 }
 void prepare_output(ID3D12Resource* native, Scene& scene) {
   if (!native) return;

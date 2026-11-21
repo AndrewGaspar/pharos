@@ -4,9 +4,9 @@
 #include <initializer_list>
 
 namespace bifrost {
-bool translate_camera(float* buffer, unsigned bytes, const float* scene_camera, float dv, float convergence) {
-  if (!scene_camera || bytes < 82 * 16 || !std::isfinite(dv)) return false;
-  auto c = reinterpret_cast<float (*)[4]>(buffer);
+bool scene_camera_matches(const float* buffer, unsigned bytes, const float* scene_camera) {
+  if (!buffer || !scene_camera || bytes < 82 * 16) return false;
+  auto c = reinterpret_cast<const float (*)[4]>(buffer);
   auto world = reinterpret_cast<const float (*)[4]>(scene_camera);
   // The flat UI has its own camera, and the shadow cameras can also be perspective.
   // Match the temporal pass by position and basis before editing any matrix.
@@ -15,7 +15,11 @@ bool translate_camera(float* buffer, unsigned bytes, const float* scene_camera, 
     for (int j = 0; j < 3; ++j)
       if (!(std::abs(c[6 + i][j] - world[i][j]) < .002f)) return false;
   }
-  if (!(std::abs(c[29][2] + 1) < .001f && std::abs(c[29][3]) < .001f && c[26][0] > .01f)) return false;
+  return std::abs(c[29][2] + 1) < .001f && std::abs(c[29][3]) < .001f && c[26][0] > .01f;
+}
+bool translate_camera(float* buffer, unsigned bytes, const float* scene_camera, float dv, float convergence) {
+  if (!std::isfinite(dv) || !scene_camera_matches(buffer, bytes, scene_camera)) return false;
+  auto c = reinterpret_cast<float (*)[4]>(buffer);
   float d[3], prev[3];
   float k = convergence > 0 ? dv * c[26][0] / convergence : 0;
   for (int i = 0; i < 3; ++i) {

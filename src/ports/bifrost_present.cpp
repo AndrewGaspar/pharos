@@ -15,6 +15,9 @@
 #include "core/function_key.h"
 #include "core/hyprland.h"
 #include "core/quiver.h"
+#include "ports/bifrost_resources.h"
+#include "world/marker_targets.h"
+#include "stereo/system_cursor.h"
 #include "ports/bifrost_wide.h"
 #include "core/vtidx.h"
 #include "dlss/ngx.h"
@@ -151,8 +154,10 @@ class Session final : public IUnknown {
     std::lock_guard guard(lock);
     if (flags & (DXGI_PRESENT_TEST | DXGI_PRESENT_DO_NOT_WAIT | DXGI_PRESENT_RESTART)) return flip();
     replay::present();
+    hud_capture_present();
     finish_sr_frame(queue.Get());
     controls();
+    if (dual::enabled()) marker_targets_frame(track_markers);
     if ((!fg_switch.value || eye::enabled()) && !eye::alternating() && !dual::enabled()) return flip();
     Scene scene;
     Pair pair{};
@@ -166,13 +171,13 @@ class Session final : public IUnknown {
     }
     if (dual::enabled()) {
       bool fresh = dual::healthy() && pair.left_serial && pair.left_serial == scene.info.serial && scene.info.serial != seen;
-      stereo.present(chain, queue.Get(), -1, fresh ? pair.right_target : 0);
+      if (!stereo.present(chain, queue.Get(), -1, fresh ? pair.right_target : 0)) stereo_system_cursor(nullptr);
       seen = scene.info.serial;
       return flip();
     }
     if (eye::alternating()) {
       bool fresh = scene.info.serial && scene.info.serial != seen;
-      stereo.present(chain, queue.Get(), fresh ? scene.info.eye : -1);
+      if (!stereo.present(chain, queue.Get(), fresh ? scene.info.eye : -1)) stereo_system_cursor(nullptr);
       seen = scene.info.serial;
       if (fresh) {
         int next = 1 - scene.info.eye;
@@ -308,6 +313,8 @@ class Session final : public IUnknown {
       next_poll = now + 1000;
       fg_switch.read(L"fg", L"F9", false);
       sr_switch.read(L"upscaler", L"F10", false);
+      sr_preset(option_text(L"upscaler", L"preset", L"M"));
+      if (dual::enabled()) track_markers = option(L"stereo", L"markers", 1) != 0;
       UINT target = option(L"fg", L"target_hz", 0);
       if (!target) target = option(L"fg", L"present_hz", 0);
       if (target != target_hz) {
@@ -497,6 +504,7 @@ class Session final : public IUnknown {
   Toggle fg_switch, sr_switch;
   ULONGLONG next_poll{};
   bool verify{}, hudless{};
+  bool track_markers = true;
   bool refresh_checked{};
   std::chrono::nanoseconds period{};
   Clock::time_point next_flip{};
@@ -585,7 +593,7 @@ void WINAPI execute(ID3D12CommandQueue* q, UINT count, ID3D12CommandList* const*
     if (!dual::enabled()) q->GetPrivateData(eye_tag, &length, &eye_index);
     Scene camera;
     for (UINT i = 0; i < count && !camera.info.serial; ++i) camera = recorded_scene(lists[i]);
-    auto* view = camera.info.camera.valid ? camera.info.camera.view_to_world[0] : nullptr;
+    auto* view = camera.info.camera.valid ? &camera.info : nullptr;
     eye::refresh();
     eye::prepare(count, lists, view, eye_index);
     if (!right.empty()) eye::prepare(UINT(right.size()), right.data(), view, 1);

@@ -3,11 +3,13 @@
 #include "ports/bifrost_wide.h"
 #include "ports/bifrost_present.h"
 #include <d3dcompiler.h>
+#include <algorithm>
 #include <cmath>
 #include <cwchar>
 #include "ports/bifrost_scene.h"
 #include "ports/common.h"
 #include "core/hook.h"
+#include "stereo/system_cursor.h"
 
 namespace port {
 extern const size_t execute, create_root, graphics_pso;
@@ -19,22 +21,57 @@ constexpr char hlsl[] = R"(
 Texture2D<float4> leftEye:register(t0);
 Texture2D<float4> rightEye:register(t1);
 SamplerState linearClamp:register(s0);
-cbuffer Display:register(b0) { uint show; uint swap; float differenceGain; }
-struct Coord {float4 position:SV_Position; float2 uv:TEXCOORD0;};
+cbuffer Display:register(b0) { uint show; uint swap; float differenceGain; float cursorRadius; float2 pointer; }
+struct Coord {float4 position:SV_Position; float2 uv:TEXCOORD0; nointerpolation float shift:TEXCOORD1;};
+// The finished eye images include the menu controls and popups in front of
+// the terrain. Measure disparity at the mouse hotspot on those same images.
+float patchError(int2 p,int halfShift,uint2 size) {
+ static const int2 offsets[9]={int2(0,0),int2(-2,0),int2(2,0),int2(0,-2),int2(0,2),
+   int2(-5,-3),int2(5,-3),int2(-5,3),int2(5,3)};
+ float err=0;
+ [unroll] for(uint i=0;i<9;i++) {
+   int2 v=p+offsets[i];
+   float3 l=leftEye.Load(int3(clamp(v-int2(halfShift,0),0,int2(size)-1),0)).rgb;
+   float3 r=rightEye.Load(int3(clamp(v+int2(halfShift,0),0,int2(size)-1),0)).rgb;
+   err+=dot(abs(l-r),float3(.299,.587,.114))*(i==0?4:i<5?2:1);
+ }
+ return err;
+}
 Coord vs(uint id:SV_VertexID) {
- Coord o; o.uv=float2((id<<1)&2,id&2);o.position=float4(o.uv*float2(2,-2)+float2(-1,1),0,1);return o;
+ Coord o; o.uv=float2((id<<1)&2,id&2);o.position=float4(o.uv*float2(2,-2)+float2(-1,1),0,1);
+ o.shift=0;
+ if(cursorRadius>0) {
+   uint2 size; leftEye.GetDimensions(size.x,size.y);
+   int2 p=int2(pointer*size);
+   float best=patchError(p,0,size);
+   if(best>.012) {
+     int limit=min(64,max(8,int(size.x*.035)));
+     [loop] for(int d=-limit;d<=limit;d++) {
+       float e=patchError(p,d,size)+.001*abs(d);
+       if(e<best) {best=e;o.shift=d;}
+     }
+   }
+ }
+ return o;
 }
 float4 ps(Coord v):SV_Target{
- if (show == 1) return leftEye.SampleLevel(linearClamp,v.uv,0);
- if (show == 2) return rightEye.SampleLevel(linearClamp,v.uv,0);
  if (show == 3) {
    float3 l=leftEye.SampleLevel(linearClamp,v.uv,0).rgb;
    float3 r=rightEye.SampleLevel(linearClamp,v.uv,0).rgb;
    return float4(saturate(abs(l-r)*differenceGain),1);
  }
- float2 uv=float2(frac(v.uv.x*2),v.uv.y);
- bool left=(v.uv.x<.5) != (swap!=0);
- return left ? leftEye.SampleLevel(linearClamp,uv,0) : rightEye.SampleLevel(linearClamp,uv,0);
+ float2 uv=show ? v.uv : float2(frac(v.uv.x*2),v.uv.y);
+ bool left=show ? show==1 : (v.uv.x<.5) != (swap!=0);
+ float4 color=left ? leftEye.SampleLevel(linearClamp,uv,0) : rightEye.SampleLevel(linearClamp,uv,0);
+ if(cursorRadius>0) {
+   uint2 size; leftEye.GetDimensions(size.x,size.y);
+   float d=length((uv-pointer)*size-float2(left?-v.shift:v.shift,0));
+   float edge=(1-smoothstep(cursorRadius+1,cursorRadius+2.5,d))*smoothstep(cursorRadius-3.5,cursorRadius-2,d);
+   float ring=(1-smoothstep(cursorRadius-.5,cursorRadius+.5,d))*smoothstep(cursorRadius-2.2,cursorRadius-1.2,d);
+   color.rgb=lerp(color.rgb,0,.92*max(edge,1-smoothstep(2.4,3.4,d)));
+   color.rgb=lerp(color.rgb,1,max(ring,1-smoothstep(1.2,2.2,d)));
+ }
+ return color;
 }
 )";
 ComPtr<ID3DBlob> compile(const char* fn, const char* target) {
@@ -42,8 +79,11 @@ ComPtr<ID3DBlob> compile(const char* fn, const char* target) {
   static const auto build = reinterpret_cast<decltype(&D3DCompile)>(dll ? GetProcAddress(dll, "D3DCompile") : nullptr);
   ComPtr<ID3DBlob> blob, errors;
   if (!build || FAILED(build(hlsl, sizeof(hlsl) - 1, "bifrost_stereo", nullptr, nullptr, fn, target,
-                             D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &blob, &errors)))
+                             D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &blob, &errors))) {
+    ACO_LOG("Bifrost: stereo shader %s: %s", fn,
+            errors ? static_cast<const char*>(errors->GetBufferPointer()) : "compiler unavailable");
     return {};
+  }
   return blob;
 }
 bool wait(ID3D12Fence* fence, UINT64 v) {
@@ -51,8 +91,12 @@ bool wait(ID3D12Fence* fence, UINT64 v) {
   auto done = fence->GetCompletedValue();
   return done != UINT64_MAX && (done >= v || SUCCEEDED(fence->SetEventOnCompletion(v, nullptr)));
 }
+constexpr auto eye_read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 }  // namespace
-StereoOutput::~StereoOutput() { drain(); }
+StereoOutput::~StereoOutput() {
+  aco::stereo_system_cursor(nullptr);
+  drain();
+}
 bool StereoOutput::drain() { return wait(fence.Get(), last); }
 bool StereoOutput::open(ID3D12Device* dev, const D3D12_RESOURCE_DESC& d) {
   if (!drain()) return false;
@@ -76,10 +120,10 @@ bool StereoOutput::open(ID3D12Device* dev, const D3D12_RESOURCE_DESC& d) {
     D3D12_ROOT_PARAMETER params[2]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     params[0].DescriptorTable = {1, &range};
-    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    params[1].Constants = {0, 0, 3};
-    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    params[1].Constants = {0, 0, 6};
+    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     D3D12_STATIC_SAMPLER_DESC sampler{};
     sampler.Filter = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
     sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
@@ -103,8 +147,8 @@ bool StereoOutput::open(ID3D12Device* dev, const D3D12_RESOURCE_DESC& d) {
   stride = dev->GetDescriptorHandleIncrementSize(heap.Type);
   auto handle = srv->GetCPUDescriptorHandleForHeapStart();
   for (auto& view : views) {
-    if (FAILED(make_texture(dev, UINT(d.Width), d.Height, d.Format, D3D12_RESOURCE_FLAG_NONE,
-                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, view.ReleaseAndGetAddressOf())))
+    if (FAILED(make_texture(dev, UINT(d.Width), d.Height, d.Format, D3D12_RESOURCE_FLAG_NONE, eye_read,
+                            view.ReleaseAndGetAddressOf())))
       return false;
     dev->CreateShaderResourceView(view.Get(), nullptr, handle);
     handle.ptr += dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -149,6 +193,7 @@ bool StereoOutput::present(IDXGISwapChain* chain, ID3D12CommandQueue* queue, int
   if (!wait(fence.Get(), s.done) || FAILED(s.allocator->Reset()) || FAILED(s.list->Reset(s.allocator.Get(), pso.Get())))
     return false;
   auto* cl = s.list.Get();
+  s.marker_capture.finish();
   auto handle = rtv->GetCPUDescriptorHandleForHeapStart();
   handle.ptr += slot * stride;
   auto target = wide::physical(chain, sc->GetCurrentBackBufferIndex());
@@ -162,9 +207,9 @@ bool StereoOutput::present(IDXGISwapChain* chain, ID3D12CommandQueue* queue, int
   if (both) transition(cl, right, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
   if (eye < 0) valid = 0;
   auto copy = [&](unsigned i) {
-    transition(cl, views[i].Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+    transition(cl, views[i].Get(), eye_read, D3D12_RESOURCE_STATE_COPY_DEST);
     cl->CopyResource(views[i].Get(), both && i ? right : bb.Get());
-    transition(cl, views[i].Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    transition(cl, views[i].Get(), D3D12_RESOURCE_STATE_COPY_DEST, eye_read);
   };
   for (int i = 0; i < 2; ++i)
     if (i == eye || !(valid & (1u << i))) copy(i);
@@ -185,14 +230,30 @@ bool StereoOutput::present(IDXGISwapChain* chain, ID3D12CommandQueue* queue, int
     auto mode = option_text(L"stereo", L"show", L"sbs");
     show = mode == L"left" ? 1u : mode == L"right" ? 2u : mode == L"diff" ? 3u : 0u;
     swap = option(L"stereo", L"swap", 0) != 0;
+    depth_cursor = option_text(L"stereo", L"cursor", L"depth") == L"depth";
     auto gain = option_text(L"stereo", L"diff_gain", L"16");
     wchar_t* end{};
     float value = std::wcstof(gain.c_str(), &end);
     difference_gain = end != gain.c_str() && !*end && std::isfinite(value) && value >= 0 ? value : 16;
     next_settings = now + 1000;
   }
-  struct { UINT show, swap; float gain; } display{show, swap, difference_gain};
-  cl->SetGraphicsRoot32BitConstants(1, 3, &display, 0);
+  struct {
+    UINT show, swap;
+    float gain, radius, x, y;
+  } display{show, swap, difference_gain};
+  DXGI_SWAP_CHAIN_DESC window{};
+  RECT client{};
+  POINT p{};
+  if (depth_cursor && show != 3 && SUCCEEDED(chain->GetDesc(&window)) && GetCursorPos(&p) &&
+      ScreenToClient(window.OutputWindow, &p) && GetClientRect(window.OutputWindow, &client) && PtInRect(&client, p) &&
+      aco::stereo_system_cursor(window.OutputWindow)) {
+    display.x = (p.x + .5f) / client.right;
+    display.y = (p.y + .5f) / client.bottom;
+    display.radius = std::max(8.f, height * .016f);
+  } else {
+    aco::stereo_system_cursor(nullptr);
+  }
+  cl->SetGraphicsRoot32BitConstants(1, 6, &display, 0);
   cl->OMSetRenderTargets(1, &handle, FALSE, nullptr);
   D3D12_VIEWPORT vp{0, 0, float(packed_width), float(height), 0, 1};
   D3D12_RECT rect{0, 0, LONG(packed_width), LONG(height)};
@@ -201,6 +262,7 @@ bool StereoOutput::present(IDXGISwapChain* chain, ID3D12CommandQueue* queue, int
   cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
   cl->DrawInstanced(3, 1, 0, 0);
   transition(cl, target.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+  s.marker_capture.record(cl, queue);
   if (FAILED(cl->Close())) return false;
   ID3D12CommandList* batch[]{cl};
   aco::orig<void WINAPI(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*)>(queue, port::execute)(queue, 1, batch);

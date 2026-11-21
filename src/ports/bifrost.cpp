@@ -167,6 +167,7 @@ HRESULT WINAPI graphics(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELINE_STATE_D
   if (SUCCEEDED(hr) && out && *out && desc) {
     ComPtr<ID3D12PipelineState> pso;
     if (SUCCEEDED(static_cast<IUnknown*>(*out)->QueryInterface(IID_PPV_ARGS(&pso)))) {
+      bifrost::tag_hud(dev, pso.Get(), *desc);
       auto entry = port::binding(pso.Get());
       if (entry && entry->role == "PS/uicompositing.hlsl/PS_ShadePixel" &&
           entry->detail.starts_with("CompositeTextureInvSrcAlpha,"))

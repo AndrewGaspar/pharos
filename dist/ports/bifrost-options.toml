@@ -1,0 +1,23 @@
+[[page]]
+id = "valhalla"
+title = "Valhalla"
+options = ["stereo.cursor", "stereo.markers", "upscaler.preset"]
+
+[option."stereo.cursor"]
+type = "enum"
+label = "Map and menu cursor"
+values = [{value="game", label="Game cursor"}, {value="depth", label="Follow the surface"}]
+help = "Places the mouse pointer on the visible map or control and the controller’s map ring at the terrain depth."
+apply = "live"
+
+[option."stereo.markers"]
+type = "bool"
+label = "World marker and aiming depth"
+help = "Places Synin’s scanning ring on the aimed surface and the tracked location diamonds at the target or first obstruction."
+apply = "live"
+
+[option."upscaler.preset"]
+type = "enum"
+label = "DLSS model preset"
+values = [{value="default", label="Driver default"}, {value="K", label="K"}, {value="L", label="L"}, {value="M", label="M"}]
+apply = "live"

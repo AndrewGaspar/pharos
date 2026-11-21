@@ -26,6 +26,7 @@
 #include "core/log.h"
 #include "dlss/kernels.h"
 #include "dlss/ngx.h"
+#include "dlss/sr_settings.h"
 #include "trace/trace.h"
 #include "trace/bloom_probe.h"
 
@@ -329,19 +330,6 @@ void blit(ID3D11ShaderResourceView* src, uint32_t src_w, uint32_t src_h, kernels
   c->CSSetUnorderedAccessViews(0, 1, &null_uav, nullptr);
 }
 
-unsigned preset_value(const std::string& p) {
-  if (p.size() == 1 && p[0] >= 'A' && p[0] <= 'Z') return static_cast<unsigned>(p[0] - 'A' + 1);
-  return NVSDK_NGX_DLSS_Hint_Render_Preset_Default;
-}
-
-int perf_quality_for(float ratio) {
-  if (ratio >= 0.99f) return NVSDK_NGX_PerfQuality_Value_DLAA;
-  if (ratio >= 0.66f) return NVSDK_NGX_PerfQuality_Value_MaxQuality;
-  if (ratio >= 0.57f) return NVSDK_NGX_PerfQuality_Value_Balanced;
-  if (ratio >= 0.49f) return NVSDK_NGX_PerfQuality_Value_MaxPerf;
-  return NVSDK_NGX_PerfQuality_Value_UltraPerformance;
-}
-
 bool ensure_feature(int eye, uint32_t rw, uint32_t rh, uint32_t dw, uint32_t dh) {
   const Config& cfg = config();
   auto& F = S.feat[eye];
@@ -360,16 +348,10 @@ bool ensure_feature(int eye, uint32_t rw, uint32_t rh, uint32_t dw, uint32_t dh)
   p.set(NVSDK_NGX_Parameter_Height, rh);
   p.set(NVSDK_NGX_Parameter_OutWidth, dw);
   p.set(NVSDK_NGX_Parameter_OutHeight, dh);
-  p.set(NVSDK_NGX_Parameter_PerfQualityValue, perf_quality_for(static_cast<float>(rw) / dw));
+  p.set(NVSDK_NGX_Parameter_PerfQualityValue, ngx::perf_quality_for(static_cast<float>(rw) / dw));
   p.set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, flags);
   p.set(NVSDK_NGX_Parameter_DLSS_Enable_Output_Subrects, 0);
-  unsigned preset = preset_value(cfg.preset);
-  for (const char* key :
-       {NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality,
-        NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance,
-        NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance,
-        NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraQuality})
-    p.set(key, preset);
+  ngx::set_sr_preset(p, ngx::preset_value(cfg.preset));
   F.handle = ngx::create_feature(S.imm, NVSDK_NGX_Feature_SuperSampling, p);
   ACO_LOG("upscaler: DLSS feature (eye %d) %ux%u -> %ux%u preset=%s flags=0x%x: %s", eye, rw, rh, dw, dh,
           cfg.preset.c_str(), flags, F.handle ? "ok" : "FAILED");

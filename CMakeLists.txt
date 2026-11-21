@@ -90,6 +90,9 @@ set_target_properties(aegis PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_
   ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/ports/aegis/lib")
 add_anvil_port(aegis-probe ACOdyssey d3d11 src/ports/aegis.cpp src/ports/aegis_sr.cpp src/core/d3d11_forward.cpp src/core/vtidx.cpp src/d3d11.def)
 add_anvil_port(bifrost ACValhalla d3d12
+  src/stereo/system_cursor.cpp
+  src/world/marker_targets.cpp
+  src/ports/bifrost_markers.cpp
   src/core/quiver.cpp
   src/core/hyprland.cpp
   src/ports/bifrost_wide.cpp
@@ -113,3 +116,4 @@ add_anvil_port(bifrost ACValhalla d3d12
   src/ports/bifrost_slots.cpp
   src/ports/bifrost.def)
 target_link_libraries(bifrost PRIVATE ws2_32)
+target_compile_definitions(bifrost PRIVATE BIFROST_VALHALLA)

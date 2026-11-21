@@ -98,7 +98,13 @@ ComPtr<ID3D12RootSignature> alternate(ID3D12Device* dev, ID3D12RootSignature* ro
   std::vector<D3D12_ROOT_PARAMETER> params(d.pParameters, d.pParameters + n);
   UINT camera = eye::enabled() ? eye::root_index(root) : UINT_MAX;
   for (UINT i = 0; i < n; ++i) {
-    if (i == camera && params[i].ParameterType == D3D12_ROOT_PARAMETER_TYPE_CBV) continue;
+    if (params[i].ParameterType == D3D12_ROOT_PARAMETER_TYPE_CBV && i == camera) continue;
+    const auto type = params[i].ParameterType;
+    if (dual::enabled() && camera <= eye::max_marker_camera_index &&
+        ((i == camera + 1 && type == D3D12_ROOT_PARAMETER_TYPE_CBV) ||
+         (i == camera + 2 && type == D3D12_ROOT_PARAMETER_TYPE_SRV)) &&
+        params[i].Descriptor.RegisterSpace == 80)
+      continue;
     if (params[i].ParameterType != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) return {};
   }
   D3D12_ROOT_PARAMETER image{}, dimensions{};

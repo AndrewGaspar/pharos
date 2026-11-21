@@ -15,6 +15,9 @@
 #include "ports/common.h"
 #include "ports/bifrost_dual.h"
 #include "ports/bifrost_lists.h"
+#include "ports/bifrost_markers.h"
+#include "ports/bifrost_scene.h"
+#include "world/marker_targets.h"
 
 namespace port {
 extern const size_t reset_allocator;
@@ -25,6 +28,7 @@ using Microsoft::WRL::ComPtr;
 constexpr GUID key(BYTE n) { return {0xca84218f, 0x1f50, 0x4e11, {0x80, 0xab, 0x50, 0xbb, 0xbb, 0x15, 0xf6, n}}; }
 constexpr GUID root_tag = key(1), arena_tag = key(2), notes_tag = key(3);
 float metres = .0325f, convergence = 4;
+std::atomic<bool> markers_enabled{true}, cursor_enabled{true};
 float number(const std::wstring& text, float fallback) {
   wchar_t* end{};
   float value = std::wcstof(text.c_str(), &end);
@@ -67,6 +71,7 @@ struct Arena final : Owner {
     BYTE* mapped{};
   };
   std::vector<Page> pages;
+  std::map<ID3D12Resource*, ComPtr<ID3D12Resource>> depth_buffers;
   unsigned cursor{};
   Range reserve(ID3D12Device* dev, UINT64 address, UINT bytes) {
     if (!bytes || bytes > 65536 || bytes % 256) return {};
@@ -98,6 +103,12 @@ struct Arena final : Owner {
 struct Notes final : Owner {
   ComPtr<Arena> arena;
   std::map<UINT64, Range> ranges;
+  struct Marker {
+    Range constants, camera;
+    UINT dimensions[4];
+    MarkerKind kind;
+  };
+  std::map<std::tuple<UINT64, ID3D12Resource*, MarkerKind>, Marker> markers;
 };
 HRESULT WINAPI reset(ID3D12CommandAllocator* a) {
   auto hr = aco::orig<decltype(reset)>(a, port::reset_allocator)(a);
@@ -105,6 +116,7 @@ HRESULT WINAPI reset(ID3D12CommandAllocator* a) {
   if (SUCCEEDED(hr))
     if (auto pool = associated<Arena>(a, arena_tag)) {
       pool->cursor = 0;
+      pool->depth_buffers.clear();
     }
   return hr;
 }
@@ -145,6 +157,16 @@ ComPtr<ID3DBlob> camera_root(const D3D12_ROOT_SIGNATURE_DESC& input, UINT& index
   index = UINT(params.size());
   params.push_back(camera);
   auto desc = input;
+  if (dual::enabled() && index <= max_marker_camera_index) {
+    D3D12_ROOT_PARAMETER marker{};
+    marker.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    marker.Descriptor = {0, 80};
+    marker.ShaderVisibility = D3D12_SHADER_VISIBILITY_GEOMETRY;
+    params.push_back(marker);
+    marker.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    params.push_back(marker);
+    desc.Flags &= ~D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS;
+  }
   desc.pParameters = params.data();
   desc.NumParameters = UINT(params.size());
   static auto fn = reinterpret_cast<decltype(&D3D12SerializeRootSignature)>(
@@ -198,17 +220,91 @@ void refresh() {
   if (distance.empty()) distance = option_text(L"stereo", L"separation_mm", L"32.5");
   metres = .001f * number(distance, 32.5f);
   convergence = number(option_text(L"stereo", L"convergence", L"4"), 4);
+  markers_enabled = option(L"stereo", L"markers", 1) != 0;
+  cursor_enabled = option_text(L"stereo", L"cursor", L"depth") == L"depth";
 }
-void prepare(UINT count, ID3D12CommandList* const* lists, const float* camera, int eye) {
+struct Vec4 {
+  float x, y, z, w;
+};
+struct MarkerBlock {
+  float clip_z[4], clip_w[4];
+  Vec4 scale;
+  UINT dimensions[4], count, padding[3];
+  Vec4 targets[aco::kMaxMarkerTargets];
+};
+UINT64 marker_buffer(ID3D12GraphicsCommandList* list, UINT64 camera, MarkerKind kind, const MarkerDepth& depth) {
+  if (!camera || !(kind == MarkerKind::MapCursor ? cursor_enabled : markers_enabled).load(std::memory_order_relaxed) ||
+      !depth.buffer)
+    return 0;
+  auto notes = associated<Notes>(list, notes_tag);
+  if (!notes) return 0;
+  const auto key = std::make_tuple(camera, depth.buffer.Get(), kind);
+  if (auto it = notes->markers.find(key); it != notes->markers.end()) return it->second.constants.shadow;
+  Range view{};
+  for (const auto& [_, r] : notes->ranges)
+    if (r.shadow == camera) {
+      view = r;
+      break;
+    }
+  if (!view.original) return 0;
+  ComPtr<ID3D12Device> dev;
+  if (FAILED(list->GetDevice(IID_PPV_ARGS(&dev)))) return 0;
+  auto mem = notes->arena->reserve(dev.Get(), 0, (sizeof(MarkerBlock) + 255u) & ~255u);
+  if (!mem.shadow) return 0;
+  memset(mem.mapped, 0, sizeof(MarkerBlock));
+  notes->arena->depth_buffers.try_emplace(depth.buffer.Get(), depth.buffer);
+  notes->markers.emplace(key,
+                         Notes::Marker{mem, view, {depth.width, depth.height, depth.pitch, depth.slice_bytes}, kind});
+  return mem.shadow;
+}
+void fill_markers(const Notes::Marker& marker, const FrameInfo& frame, const float* view, float separation) {
+  MarkerBlock block{};
+  const auto& inv = frame.camera.clip_to_view;
+  if (frame.camera.valid && std::abs(inv[0][0]) > .001f) {
+    memcpy(block.clip_z, inv[2], 16);
+    memcpy(block.clip_w, inv[3], 16);
+    memcpy(block.dimensions, marker.dimensions, sizeof(block.dimensions));
+    const float scale = separation / std::abs(inv[0][0]);
+    block.scale = {0, scale, convergence > 0 ? 1 / convergence : 0, float(marker.kind)};
+    if (view) {
+      auto original = read_constants(marker.camera.original, marker.camera.bytes);
+      if (scene_camera_matches(original.data(), UINT(original.size() * sizeof(float)), view))
+        block.scale.x = separation * original[26 * 4];
+    }
+    if (marker.kind == MarkerKind::World) {
+      aco::MarkerTarget points[aco::kMaxMarkerTargets];
+      size_t n = aco::marker_targets_read(points);
+      const auto& vp = frame.world_to_clip;
+      for (size_t i = 0; i < n; ++i) {
+        const auto& p = points[i];
+        auto project = [&](unsigned row) {
+          return vp[row][0] * p.x + vp[row][1] * p.y + vp[row][2] * p.z + vp[row][3];
+        };
+        const float w = project(3);
+        if (!(w > .05f)) continue;
+        const float y = project(1) / w, raised = w + 2 * vp[3][2];
+        const float lift = raised > .05f ? (project(1) + 2 * vp[1][2]) / raised - y : 0;
+        block.targets[block.count++] = {project(0) / w, y, 1 / w, lift};
+      }
+    }
+  }
+  memcpy(marker.constants.mapped, &block, sizeof(block));
+}
+void prepare(UINT count, ID3D12CommandList* const* lists, const FrameInfo* frame, int eye) {
   if (!enabled()) return;
+  static FrameInfo latest;
+  if (frame) latest = *frame;
+  const float* camera = frame ? frame->camera.view_to_world[0] : nullptr;
   static const int single = option(L"stereo", L"preview_eye", 2) == 1 ? 0 : 1;
   int which = alternating() || dual::enabled() ? eye : single;
   const float separation = dual::healthy() ? (which == 0 ? -metres : metres) : 0;
   unsigned moved = 0;
   std::map<UINT64, Range> ranges;
   for (UINT i = 0; i < count; ++i) {
-    if (auto notes = associated<Notes>(lists[i], notes_tag))
+    if (auto notes = associated<Notes>(lists[i], notes_tag)) {
       for (const auto& [_, r] : notes->ranges) ranges.try_emplace(r.shadow, r);
+      for (const auto& [_, m] : notes->markers) fill_markers(m, latest, camera, separation);
+    }
   }
   for (const auto& [_, r] : ranges) {
     auto c = read_constants(r.original, r.bytes);

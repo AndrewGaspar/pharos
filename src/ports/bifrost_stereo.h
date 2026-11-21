@@ -3,6 +3,7 @@
 #include <dxgi1_4.h>
 #include <wrl/client.h>
 #include <array>
+#include "ports/bifrost_markers.h"
 
 namespace bifrost {
 class StereoOutput {
@@ -19,6 +20,7 @@ class StereoOutput {
   struct Slot {
     Ptr<ID3D12CommandAllocator> allocator;
     Ptr<ID3D12GraphicsCommandList> list;
+    MarkerCapture marker_capture;
     UINT64 done{};
   };
   std::array<Slot, 4> slots;
@@ -32,6 +34,7 @@ class StereoOutput {
   UINT64 last{};
   unsigned valid{}, pairs{};
   UINT show{}, swap{};
+  bool depth_cursor = true;
   float difference_gain = 16;
   ULONGLONG next_settings{};
   bool open(ID3D12Device* dev, const D3D12_RESOURCE_DESC& desc);

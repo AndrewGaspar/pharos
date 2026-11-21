@@ -20,6 +20,7 @@
 #include "ports/bifrost_eye.h"
 #include "ports/bifrost_dual.h"
 #include "ports/bifrost_lists.h"
+#include "ports/bifrost_markers.h"
 
 using aco::orig;
 using Microsoft::WRL::ComPtr;
@@ -33,6 +34,18 @@ namespace {
 const GUID layout_tag{0xab064932, 0x44f0, 0x4321, {0xb2, 0x88, 0x11, 0x54, 0x26, 0xd8, 0x78, 0x90}};
 const GUID list_tag{0xb71ab932, 0x7635, 0x4a01, {0xb1, 0x88, 0x11, 0x54, 0x26, 0xd8, 0x78, 0x91}};
 const GUID pass_tag{0xb4102301, 0x98f0, 0x4391, {0xb2, 0x88, 0x11, 0x54, 0x26, 0xd8, 0x78, 0x92}};
+const GUID hud_tag{0xb4102301, 0x98f0, 0x4391, {0xb2, 0x88, 0x11, 0x54, 0x26, 0xd8, 0x78, 0x93}};
+struct HudShaders {
+  UINT64 vs{}, ps{};
+};
+std::atomic<bool> capture_hud{};
+std::atomic<UINT64> hidden_hud{};
+std::atomic<UINT64> hidden_page{};
+std::atomic<bool> map_seen{}, map_active{};
+bool trace_hud() {
+  static const bool enabled = GetEnvironmentVariableW(L"QUIVER_LAB", nullptr, 0) && option(L"stereo", L"trace_hud", 0);
+  return enabled;
+}
 
 struct Slot {
   UINT root{}, offset{}, count{};
@@ -41,11 +54,13 @@ struct Table {
   Slot cbv, srv;
 };
 struct Layout {
-  Table pass, temporal, composite;
+  Table pass, temporal, material, composite;
 };
 struct Pass {
   Table camera, resources;
   port::Entry* entry{};
+  MarkerKind marker{};
+  Slot material;
 };
 struct Heap {
   UINT64 gpu{}, cpu{}, length{};
@@ -99,6 +114,7 @@ Layout ranges(const Desc& desc) {
         offset = r.OffsetInDescriptorsFromTableStart;
       Table* t = r.RegisterSpace == 1   ? &l.pass
                  : r.RegisterSpace == 2 ? &l.temporal
+                 : r.RegisterSpace == 3 ? &l.material
                  : r.RegisterSpace == 4 ? &l.composite
                                         : nullptr;
       if (t && r.BaseShaderRegister == 0) {
@@ -416,7 +432,70 @@ void WINAPI scissors(ID3D12GraphicsCommandList* list, UINT n, const D3D12_RECT* 
 bool inspect(ID3D12GraphicsCommandList* list, const std::function<void()>& draw) {
   auto st = get<ID3D12GraphicsCommandList, Bindings>(list, list_tag);
   replay::draw(list);
+  if (capture_hud.load(std::memory_order_relaxed) || hidden_hud.load(std::memory_order_relaxed)) {
+    auto sh = get<ID3D12PipelineState, HudShaders>(st.draw.pso, hud_tag);
+    if (sh.ps && sh.ps == hidden_hud.load()) {
+      const auto page = hidden_page.load();
+      if (!page) return true;
+      auto layout = get<ID3D12RootSignature, Layout>(st.draw.signature, layout_tag);
+      std::lock_guard guard(lock);
+      auto it = descriptors.find(address(st, layout.material.srv, 0));
+      if (it != descriptors.end() &&
+          page == ((it->second.width << 32) | (UINT64(it->second.height) << 16) | UINT(it->second.format)))
+        return true;
+    }
+    if (sh.ps && capture_hud.load() && st.draw.num_targets == 1) {
+      auto layout = get<ID3D12RootSignature, Layout>(st.draw.signature, layout_tag);
+      std::lock_guard guard(lock);
+      auto rt = descriptors.find(st.draw.targets[0].ptr);
+      if (rt != descriptors.end() && rt->second.width >= 640 && rt->second.height >= 320) {
+        std::ostringstream assets;
+        for (auto [space, table] : {std::pair{1, layout.pass}, std::pair{2, layout.temporal},
+                                    std::pair{3, layout.material}, std::pair{4, layout.composite}}) {
+          for (UINT i = 0; i < std::min(table.srv.count, 16u); ++i) {
+            auto t = descriptors.find(address(st, table.srv, i));
+            if (t != descriptors.end() && t->second.kind == 't' && t->second.height > 1)
+              assets << " " << space << "/" << i << "=" << t->second.width << "x" << t->second.height << "/"
+                     << int(t->second.format);
+          }
+        }
+        ACO_LOG("Bifrost HUD: vs %016llx ps %016llx rt %llx %llux%u%s", sh.vs, sh.ps, rt->second.id, rt->second.width,
+                rt->second.height, assets.str().c_str());
+      }
+    }
+  }
   auto e = st.pass.entry;
+  if (st.pass.marker != MarkerKind::None && st.draw.num_targets == 1 && st.draw.viewport_count &&
+      st.draw.viewports[0].Width >= 640 && st.draw.viewports[0].Height >= 320) {
+    auto kind = st.pass.marker;
+    {
+      std::lock_guard guard(lock);
+      auto page = descriptors.find(address(st, st.pass.material, 0));
+      if (page == descriptors.end() || page->second.kind != 't')
+        kind = MarkerKind::None;
+      else {
+        auto& p = page->second;
+        kind = MarkerKind::None;
+        if (st.pass.marker == MarkerKind::Reticle && p.width == 1920 && p.height == 1080 &&
+            p.format == DXGI_FORMAT_BC4_UNORM)
+          map_seen.store(true, std::memory_order_relaxed);
+        if (p.format == DXGI_FORMAT_BC7_UNORM) {
+          if (st.pass.marker == MarkerKind::Reticle && p.width == 64 && p.height == 64)
+            kind = MarkerKind::Reticle;
+          else if (st.pass.marker == MarkerKind::World && p.width == 160 && p.height == 80)
+            kind = MarkerKind::World;
+          else if (st.pass.marker == MarkerKind::World && p.width == 32 && p.height == 16)
+            kind = MarkerKind::Reticle;
+          else if (st.pass.marker == MarkerKind::World && (p.width == 256 || p.width == 64) && p.width == p.height &&
+                   map_active.load(std::memory_order_relaxed))
+            kind = MarkerKind::MapCursor;
+        }
+      }
+    }
+    if (kind != MarkerKind::None &&
+        draw_marker(list, st.draw.pso, st.graphics_eye, st.graphics_eye_address, kind, draw))
+      return true;
+  }
   if (!e) return false;
   std::unique_lock guard(lock);
   if (e->role == "PS/temporalaa.hlsl/PS_TemporalAA" &&
@@ -440,6 +519,7 @@ bool inspect(ID3D12GraphicsCommandList* list, const std::function<void()>& draw)
         memcpy(info.camera.view_to_world, camera.data() + 6 * 4, sizeof(info.camera.view_to_world));
         memcpy(info.camera.clip_to_view, camera.data() + 69 * 4, sizeof(info.camera.clip_to_view));
         memcpy(info.camera.prev_view_proj, camera.data() + 38 * 4, sizeof(info.camera.prev_view_proj));
+        memcpy(info.world_to_clip, camera.data() + 30 * 4, sizeof(info.world_to_clip));
         info.camera.valid = true;
         const auto out = descriptors.find(st.draw.targets[0].ptr);
         auto* native = out != descriptors.end() && out->second.kind == 'r'
@@ -530,6 +610,58 @@ void WINAPI clear(ID3D12GraphicsCommandList* list, ID3D12PipelineState* pso) {
   if (auto* r = dual::list(list)) clear(r, pso);
 }
 }  // namespace
+void tag_hud(ID3D12Device* dev, ID3D12PipelineState* pso, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& d) {
+  if (dual::enabled()) {
+    auto kind = prepare_marker_pipeline(dev, d, pso);
+    if (kind != MarkerKind::None) {
+      auto pass = get<ID3D12PipelineState, Pass>(pso, pass_tag);
+      pass.marker = kind;
+      pass.material = get<ID3D12RootSignature, Layout>(d.pRootSignature, layout_tag).material.srv;
+      pso->SetPrivateData(pass_tag, sizeof(pass), &pass);
+    }
+  }
+  if (!trace_hud() || d.NumRenderTargets != 1 || !d.BlendState.RenderTarget[0].BlendEnable ||
+      d.VS.BytecodeLength < 20 || d.PS.BytecodeLength < 20)
+    return;
+  HudShaders sh{};
+  auto shader = [&](const D3D12_SHADER_BYTECODE& code, UINT64& id, const wchar_t* stage) {
+    const auto* blob = static_cast<const BYTE*>(code.pShaderBytecode);
+    memcpy(&id, blob + 4, sizeof(id));
+    wchar_t file[64];
+    swprintf(file, 64, L"\\hud-%016llx.%ls.dxbc", id, stage);
+    auto path = aco::out_dir() + file;
+    static std::mutex dump_lock;
+    std::lock_guard lock(dump_lock);
+    if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES)
+      if (auto f = _wfopen(path.c_str(), L"wb")) {
+        fwrite(blob, 1, code.BytecodeLength, f);
+        fclose(f);
+      }
+  };
+  shader(d.VS, sh.vs, L"vs");
+  shader(d.PS, sh.ps, L"ps");
+  pso->SetPrivateData(hud_tag, sizeof(sh), &sh);
+}
+void hud_capture_present() {
+  if (dual::enabled()) map_active = map_seen.exchange(false);
+  if (!trace_hud()) return;
+  static const auto trigger = aco::out_dir() + L"\\capture-hud";
+  static const auto skip = aco::out_dir() + L"\\skip-hud";
+  capture_hud = false;
+  static ULONGLONG next{};
+  auto now = GetTickCount64();
+  if (now < next) return;
+  next = now + 400;
+  capture_hud = DeleteFileW(trigger.c_str()) != 0;
+  UINT64 id{}, page{};
+  if (auto f = _wfopen(skip.c_str(), L"r")) {
+    unsigned w{}, h{}, format{};
+    if (fscanf(f, "%llx %u %u %u", &id, &w, &h, &format) == 4) page = (UINT64(w) << 32) | (UINT64(h) << 16) | format;
+    fclose(f);
+  }
+  hidden_page = page;
+  hidden_hud = id;
+}
 void read_layout(ID3D12RootSignature* root, const D3D12_VERSIONED_ROOT_SIGNATURE_DESC& d) {
   Layout l{};
   if (d.Version == D3D_ROOT_SIGNATURE_VERSION_1_0)

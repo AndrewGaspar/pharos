@@ -18,7 +18,13 @@ struct Controller {
   uintptr_t table, getter;
   GetPosition original = nullptr;
 };
-#ifdef AEGIS_ODYSSEY
+#if defined(BIFROST_VALHALLA)
+// Valhalla uses the same controller type IDs as Odyssey. Its position
+// getter returns a float4 from +0x200; all four slots are checked at runtime.
+Controller controllers[] = {
+    {0x4936520, 0x3176360}, {0x4936638, 0x31764d0}, {0x4936750, 0x3176320}, {0x4936868, 0x3176360}};
+constexpr unsigned kGetPosition = 28;
+#elif defined(AEGIS_ODYSSEY)
 // Odyssey's Position controller returns its authored float4 at +0x200.
 Controller controllers[] = {
     {0x444ef08, 0x2f83c90}, {0x444f010, 0x2f83d90}, {0x444f118, 0x2f83c00}, {0x444f220, 0x2f83c90}};

@@ -9,6 +9,8 @@
 #include "core/hook.h"
 #include "core/log.h"
 #include "ports/bifrost_sr.h"
+#include "ports/bifrost_markers.h"
+#include "ports/bifrost_lists.h"
 
 using Microsoft::WRL::ComPtr;
 namespace port {
@@ -187,6 +189,7 @@ void clear_scene(ID3D12GraphicsCommandList* list) {
 }
 bool record_scene(ID3D12GraphicsCommandList* list, const DrawState& state, const FrameInfo& info,
                   ID3D12Resource* native) {
+  const bool primary_eye = dual::enabled() && dual::list(list);
   dual::Internal internal;
   if (!state.topology || !state.signature || !state.pso || !state.viewport_count || !state.scissor_count) return false;
   ComPtr<ID3D12Device> dev;
@@ -225,6 +228,7 @@ bool record_scene(ID3D12GraphicsCommandList* list, const DrawState& state, const
   bind_pso(list, state.pso);
   for (auto* res : {s.color.Get(), s.motion.Get(), s.depth.Get()})
     transition(list, res, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  if (primary_eye) capture_marker_depth(list, dev.Get(), s.depth.Get());
   prepare_output(native, s);
   forward_scene(list, s);
   static std::atomic<bool> logged{};
