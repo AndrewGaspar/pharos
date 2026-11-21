@@ -329,8 +329,13 @@ MarkerDraw markers_begin(ID3D11DeviceContext* ctx, ShaderClass shader) {
   // Level numerals (f4b81a7a) follow a plain 128x128 shield batch.
   const bool shield = plain && page(atlas, 128, 128, DXGI_FORMAT_BC3_UNORM);
   const bool label_background = shield || bracket || (sprite && page(atlas, 16, 16, DXGI_FORMAT_BC3_UNORM_SRGB));
-  const bool logo = label_background && shaders[plain ? PlainLogo : Logo] && empty_anchors && anchor_view &&
-                    page(texture_at(ctx, 71), 128, 128, DXGI_FORMAT_BC1_UNORM) && stream_available(ctx);
+  // After the first guard, the level font leaves its 512px atlas mask bound
+  // through the next shield. Both bindings occur in the same command list.
+  const auto mask = label_background ? texture_at(ctx, 71) : D3D11_TEXTURE2D_DESC{};
+  const bool logo_mask = page(mask, 128, 128, DXGI_FORMAT_BC1_UNORM) ||
+                         (shield && page(mask, 512, 512, DXGI_FORMAT_BC1_UNORM));
+  const bool logo = label_background && logo_mask && shaders[plain ? PlainLogo : Logo] && empty_anchors &&
+                    anchor_view && stream_available(ctx);
   bool record = false;
   MarkerRole role = MarkerRole::Ordinary;
   if (edge) role = MarkerRole::Edge;
