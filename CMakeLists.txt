@@ -50,6 +50,7 @@ add_library(aco_d3d11 SHARED
   src/dlss/ngx.cpp
   src/dlss/kernels.cpp
   src/dlss/upscaler.cpp
+  src/trace/bloom_probe.cpp
   src/trace/trace.cpp
   src/proxy.cpp
   src/d3d11.def)

@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+"""Compare stereo images at the input, output and final composition of a Pharos lab run."""
+import argparse
+from pathlib import Path
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("capture", type=Path, help="run folder or bloom-pairs.bin")
+parser.add_argument("--from-frame", type=int, default=0)
+parser.add_argument("--to-frame", type=int)
+parser.add_argument("--sheet", type=Path, help="save thumbnails of the largest events")
+args = parser.parse_args()
+path = args.capture / "bloom-pairs.bin" if args.capture.is_dir() else args.capture
+layout = np.dtype([("frame", "<u8"), ("kind", "<u4"), ("rgba", "u1", (36, 128, 4))])
+# A file that is still recording, or whose game was stopped, can end mid-record.
+count = path.stat().st_size // layout.itemsize
+if not count:
+    parser.exit(1, "No complete samples.\n")
+data = np.memmap(path, dtype=layout, mode="r", shape=(count,))
+keep = data["frame"] >= args.from_frame
+if args.to_frame is not None:
+    keep &= data["frame"] <= args.to_frame
+frames = np.unique(data["frame"][keep])
+if len(frames) == 0:
+    parser.exit(1, "No samples in that interval.\n")
+
+# The two upscaler jobs and the finished eye pair can drop independently. A
+# held or mono fallback can have a final image without two new upscaler jobs.
+records = np.full((len(frames), 3), -1, dtype=int)
+means = np.full((len(frames), 3, 2, 3), np.nan)  # frame, stage, eye, RGB
+violet_percent = np.full((len(frames), 3, 2), np.nan)
+for kind in range(3):
+    indices = np.flatnonzero(keep & (data["kind"] == kind))
+    for start in range(0, len(indices), 128):
+        batch = indices[start:start + 128]
+        rows = np.searchsorted(frames, data["frame"][batch])
+        pixels = data["rgba"][batch, :, :, :3].reshape(-1, 36, 2, 64, 3)
+        rgb = pixels.mean((1, 3))
+        # A screen-wide pastel violet wash can develop gradually in both eyes.
+        # This colour range covered 74% of the affected r36 eye and <0.1% of its partner.
+        red, green, blue = np.moveaxis(pixels.astype(np.int16), -1, 0)
+        violet = (green >= 150) & (red >= green + 3) & (blue >= green + 3) & (np.abs(red - blue) <= 50)
+        coverage = 100 * violet.mean((1, 3))
+        records[rows, kind] = batch
+        if kind == 2:
+            means[rows, 2, :, :] = rgb
+            violet_percent[rows, 2, :] = coverage
+        else:
+            means[rows, :2, kind, :] = rgb
+            violet_percent[rows, :2, kind] = coverage
+
+print(f"{((records[:, 0] >= 0) & (records[:, 1] >= 0)).sum()} upscaler pairs, "
+      f"{(records[:, 2] >= 0).sum()} final pairs, engine frames {frames[0]}–{frames[-1]}")
+events = []
+
+
+def rank(label, changes, unit="/255"):
+    # Whole-frame averages suppress differences around individual HUD elements or
+    # stereo edges. Inspect the thumbnails to distinguish gameplay cuts from flashes.
+    score = np.nan_to_num(np.abs(changes), nan=0.0).reshape(len(frames), -1).max(1)
+    chosen = []
+    for k in np.argsort(score)[::-1]:
+        if score[k] == 0 or len(chosen) == 3:
+            break
+        if all(abs(int(frames[k]) - int(frames[j])) > 120 for j in chosen):
+            chosen.append(k)
+            if k not in events:
+                events.append(k)
+            print(f"{label:24s} frame {frames[k]:6}  {score[k]:5.1f}{unit}")
+
+
+rank("stereo difference", means[:, :, 0] - means[:, :, 1])
+rank("across upscaler", means[:, 1] - means[:, 0])
+rank("output to final", means[:, 2] - means[:, 1])
+# Compare each eye to itself as well. Catch a binocular flash, including one
+# that builds over several samples. Exclude gaps in that eye/stage's history.
+rise = np.zeros_like(means)
+for lag in (1, 12):
+    if lag >= len(frames):
+        continue
+    change = np.maximum(0, means[lag:] - means[:-lag])
+    change[frames[lag:] - frames[:-lag] != 4 * lag] = 0
+    rise[lag:] = np.fmax(rise[lag:], change)
+rank("scene brightening", rise)
+rank("pale violet coverage", violet_percent, "%")
+
+if args.sheet:
+    if not events:
+        events.append(0)
+    sheet = Image.new("RGB", (192 * 6, 128 * len(events)))
+    labels = ImageDraw.Draw(sheet)
+    for row, k in enumerate(events):
+        for stage, name in enumerate(("input", "output", "final")):
+            for eye in range(2):
+                kind, half = (eye, stage) if stage < 2 else (2, eye)
+                index = records[k, kind]
+                xy = (192 * (2 * stage + eye), 128 * row)
+                if index >= 0:
+                    rgb = data["rgba"][index, :, 64 * half:64 * (half + 1), :3]
+                    sheet.paste(Image.fromarray(rgb).resize((192, 108)), xy)
+                else:
+                    labels.text((xy[0] + 63, xy[1] + 49), "no sample", fill="gray")
+                labels.text((xy[0] + 3, xy[1] + 110), f"{frames[k]} {name} {'LR'[eye]}")
+    sheet.save(args.sheet)

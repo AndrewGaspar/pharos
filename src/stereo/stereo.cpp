@@ -14,6 +14,8 @@
 #include "fg/fg_d3d12.h"
 #include "core/log.h"
 #include "dlss/kernels.h"
+#include "dlss/upscaler.h"
+#include "trace/bloom_probe.h"
 #include "stereo/camera.h"
 #include "stereo/cursor.h"
 #include "stereo/markers.h"
@@ -495,6 +497,14 @@ void stereo_on_present(IDXGISwapChain* sc, PFN_GetBuffer real_get_buffer) {
       if (wide) compose_wide(sc, S.eye[cfg.stereo_swap], S.eye[!cfg.stereo_swap]);
       else compose(bb, false);
     } else if (wide && S.proxy) compose_wide(sc, S.proxy, S.proxy);
+  }
+  const uint64_t frame = upscaler_frame();
+  if (ready && bloom_probe_wants(frame)) {
+    ID3DDeviceContextState* prev = nullptr;
+    S.imm1->SwapDeviceContextState(S.own_state, &prev);
+    bloom_probe_sample(S.dev, S.imm, frame, kBloomFinishedEyes, S.eye_srv[0], S.eye_srv[1]);
+    S.imm1->SwapDeviceContextState(prev, nullptr);
+    if (prev) prev->Release();
   }
   tmp_frame_end(true, bb, rec_frame_size(f));
   if (bb) bb->Release();

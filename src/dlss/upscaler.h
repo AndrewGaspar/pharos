@@ -21,6 +21,7 @@ namespace aco {
 //  * UI composite draw: the TAA output SRV is swapped for the display-resolution DLSS output.
 void upscaler_init(ID3D11Device* dev, ID3D11DeviceContext* immediate);
 void upscaler_on_present(IDXGISwapChain* sc);
+uint64_t upscaler_frame();  // identifier used by TAA jobs for the pending Present
 
 // Called for draws whose pixel shader is one of the classified engine passes. `draw` issues the
 // original draw call. Returns true if the draw was handled (the caller must not draw again).

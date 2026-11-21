@@ -26,6 +26,7 @@
 #include "dlss/kernels.h"
 #include "dlss/ngx.h"
 #include "trace/trace.h"
+#include "trace/bloom_probe.h"
 
 namespace aco {
 
@@ -488,6 +489,8 @@ void run_job(const Job& job) {
   }
   if (!done) blit(srv_for(job.color), job.render_w, job.render_h, kernels::kBlitColor, 1.0f);
   S.gpu_timer.stop(S.imm, timer);
+  if (bloom_probe_wants(job.frame))
+    bloom_probe_sample(S.dev, S.imm, job.frame, stereo_eye(), srv_for(job.color), S.out_srv);
 
   S.imm1->SwapDeviceContextState(prev, nullptr);
   if (prev) prev->Release();
@@ -765,6 +768,7 @@ void upscaler_init(ID3D11Device* dev, ID3D11DeviceContext* immediate) {
   if (S.imm1) S.imm1->Release();
   S.dev1 = nullptr;
   S.imm1 = nullptr;
+  bloom_probe_init();
   S.dev = dev;
   S.imm = immediate;
   dev->QueryInterface(__uuidof(ID3D11Device1), reinterpret_cast<void**>(&S.dev1));
@@ -777,6 +781,8 @@ void upscaler_init(ID3D11Device* dev, ID3D11DeviceContext* immediate) {
   S.gpu_timer.init(dev);
   ACO_LOG("upscaler: init (device context state 0x%08lx)", hr);
 }
+
+uint64_t upscaler_frame() { return S.frame.load(std::memory_order_relaxed); }
 
 void upscaler_on_present(IDXGISwapChain* sc) {
   uint64_t f = S.frame.fetch_add(1) + 1;

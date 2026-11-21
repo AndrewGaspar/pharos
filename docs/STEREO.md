@@ -302,7 +302,36 @@ resumes. The frame statistics record held pairs and mono fallbacks separately. D
   its normal colors. After the v18 change to stereo history tracking, r41 and r42 showed
   normal brightness in both eyes on the same transition. In r42, 24 movement captures
   with DLSS and 24 with game TAA covered walking and flight. The reported flash did not
-  recur. Its cause remains unconfirmed.
+  recur. In r36 the left eye's mean blue level exceeded the right by about 123/255.
+  In the clear-air control shot of the same rooftops, corresponding patches had nearly
+  identical contrast. During the wash, contrast in 48 matched distant patches fell to a
+  median 17% of the right eye's. This makes depth-dependent lighting or fog worth checking.
+  The saved r36 images only show the final output, so the responsible pass is still unknown.
+
+  To capture a recurrence in a Quiver lab, set `env.PHAROS_BLOOM_PROBE=1` with
+  `quiver lab edit` before launch. Every fourth engine frame, the probe samples a
+  64×36 grid per eye from the tonemapped input, the upscaler output, and the finished
+  stereo images after HUD composition. Native TAA supplies the finished images only.
+  Readback skips busy staging slots. The run file stops below 512 MiB.
+  `tools/lab/bloom-report RUN_DIR --from-frame N --sheet events.jpg` ranks inter-eye
+  differences, changes between stages, brightening within each eye, and the fraction
+  of the scene with the pale violet colour seen in r36. Blank samples
+  are labelled in the contact sheet. A camera cut can also rank highly.
+  Clear the launch override with `quiver lab edit origins env.PHAROS_BLOOM_PROBE=`.
+
+  In r44, 2,678 matched v20 upscaler pairs covered movement and camera switches in
+  Alexandria, Memphis and the Black Desert. The strongest inter-eye differences came
+  from foreground geometry. In r45, an instrumented pre-v18-history-fix renderer
+  revisited the r36 rooftops and Senu hover. Its largest channel-mean difference
+  between eyes over 1,497 matched pairs was 3/255. In r46, selecting the debug depth
+  display left the colour input intact and turned the output and both finished eyes
+  grayscale, confirming the probe distinguishes a change introduced at the resolve.
+  In r47, Discovery Tour ran with a real-time clock, DLSS Balanced at 1114×626 to
+  1920×1080, and the active profile's LOD and population settings. Over 1,305 final
+  stereo pairs from Alexandria and Giza, the largest mean channel difference between
+  eyes at any sampled stage was 2.6/255. The strongest pale violet match was cloud
+  cover visible in both game inputs. At that frame DLSS changed each eye's mean RGB
+  by less than one level per channel. The original flash did not recur.
 - **Full resolution needs DXVK to honour the larger-swapchain switch** (above).
 - **Occlusion and frustum culling use the left eye's camera.** HZB culling and the per-instance
   culling constants aren't redirected, so objects at the right edge of the right eye could be culled
