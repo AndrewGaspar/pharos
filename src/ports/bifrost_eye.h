@@ -10,5 +10,6 @@ void tag_root(ID3D12RootSignature* root, UINT index);
 UINT root_index(ID3D12RootSignature* root);
 void allocator(ID3D12GraphicsCommandList* list, ID3D12CommandAllocator* allocator);
 D3D12_GPU_VIRTUAL_ADDRESS bind(ID3D12GraphicsCommandList* list, UINT64 original, UINT bytes);
+void refresh();
 void prepare(UINT count, ID3D12CommandList* const* lists, const float* camera, int eye);
 }  // namespace bifrost::eye

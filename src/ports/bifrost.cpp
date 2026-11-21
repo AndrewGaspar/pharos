@@ -12,13 +12,16 @@
 #include "ports/bifrost_resources.h"
 #include "ports/bifrost_replay.h"
 #include "ports/bifrost_eye.h"
+#include "ports/bifrost_dual.h"
+#include "ports/bifrost_lists.h"
 #include "ports/common.h"
 
 using namespace aco;
 using Microsoft::WRL::ComPtr;
 namespace port {
+extern const size_t create_queue;
 extern const size_t create_root, graphics_pso, compute_pso, create_list, set_pso, reset_list;
-}
+}  // namespace port
 namespace {
 HMODULE system_d3d12() {
   static HMODULE mod = port::system_library(L"d3d12.dll");
@@ -31,6 +34,7 @@ Fn real(const char* name) {
 }
 
 void check_features(ID3D12Device* dev) {
+  bifrost::dual::Internal internal;
   HMODULE core = ngx::core_module();
   if (!core) {
     ACO_LOG("Bifrost: NGX driver unavailable");
@@ -189,17 +193,26 @@ void observe(ID3D12PipelineState* pso) {
 void WINAPI bind(ID3D12GraphicsCommandList* list, ID3D12PipelineState* pso) {
   orig<decltype(bind)>(list, port::set_pso)(list, pso);
   bifrost::bind_inputs(list, pso);
+  if (auto* r = bifrost::dual::list(list)) bind(r, pso);
   observe(pso);
 }
 HRESULT WINAPI reset(ID3D12GraphicsCommandList* list, ID3D12CommandAllocator* allocator, ID3D12PipelineState* pso) {
   auto hr = orig<decltype(reset)>(list, port::reset_list)(list, allocator, pso);
   if (SUCCEEDED(hr)) {
+    bifrost::dual::reset_list(list, allocator, pso);
     bifrost::eye::allocator(list, allocator);
     bifrost::replay::reset(list);
     bifrost::clear_frame_size(list);
     bifrost::reset_inputs(list, pso);
     observe(pso);
   }
+  return hr;
+}
+HRESULT WINAPI create_queue(ID3D12Device* dev, const D3D12_COMMAND_QUEUE_DESC* desc, REFIID iid, void** out) {
+  auto hr = orig<decltype(create_queue)>(dev, port::create_queue)(dev, desc, iid, out);
+  ComPtr<ID3D12CommandQueue> q;
+  if (SUCCEEDED(hr) && out && *out && SUCCEEDED(static_cast<IUnknown*>(*out)->QueryInterface(IID_PPV_ARGS(&q))))
+    bifrost::observe_queue(q.Get());
   return hr;
 }
 HRESULT WINAPI command_list(ID3D12Device* dev, UINT node, D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator* a,
@@ -211,6 +224,7 @@ HRESULT WINAPI command_list(ID3D12Device* dev, UINT node, D3D12_COMMAND_LIST_TYP
       hook_vtable(list.Get(), port::set_pso, reinterpret_cast<void*>(bind));
       hook_vtable(list.Get(), port::reset_list, reinterpret_cast<void*>(reset));
       bifrost::observe_commands(list.Get());
+      bifrost::dual::make_list(list.Get(), dev, node, type, a, pso);
       bifrost::eye::allocator(list.Get(), a);
       bifrost::replay::reset(list.Get());
       bifrost::reset_inputs(list.Get(), pso);
@@ -231,6 +245,7 @@ extern "C" HRESULT WINAPI bifrost_create(IUnknown* adapter, D3D_FEATURE_LEVEL le
       log_init(L"bifrost.log");
       bifrost::observe_factory(adapter);
       bifrost::observe_descriptors(dev.Get());
+      if (bifrost::dual::enabled()) hook_vtable(dev.Get(), port::create_queue, reinterpret_cast<void*>(create_queue));
       ACO_LOG("Bifrost: D3D12 device, requested feature level 0x%x", level);
       hook_vtable(dev.Get(), port::create_root, reinterpret_cast<void*>(root_signature));
       hook_vtable(dev.Get(), port::graphics_pso, reinterpret_cast<void*>(graphics));

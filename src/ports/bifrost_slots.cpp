@@ -4,6 +4,46 @@
 
 #include <cstddef>
 namespace port {
+extern const size_t close_list = offsetof(ID3D12GraphicsCommandListVtbl, Close) / sizeof(void*);
+extern const size_t copy_buffer = offsetof(ID3D12GraphicsCommandListVtbl, CopyBufferRegion) / sizeof(void*);
+extern const size_t copy_texture = offsetof(ID3D12GraphicsCommandListVtbl, CopyTextureRegion) / sizeof(void*);
+extern const size_t copy_resource = offsetof(ID3D12GraphicsCommandListVtbl, CopyResource) / sizeof(void*);
+extern const size_t resolve_sub = offsetof(ID3D12GraphicsCommandListVtbl, ResolveSubresource) / sizeof(void*);
+extern const size_t clear_rtv = offsetof(ID3D12GraphicsCommandListVtbl, ClearRenderTargetView) / sizeof(void*);
+extern const size_t clear_dsv = offsetof(ID3D12GraphicsCommandListVtbl, ClearDepthStencilView) / sizeof(void*);
+extern const size_t clear_uav_float =
+    offsetof(ID3D12GraphicsCommandListVtbl, ClearUnorderedAccessViewFloat) / sizeof(void*);
+extern const size_t clear_uav_uint =
+    offsetof(ID3D12GraphicsCommandListVtbl, ClearUnorderedAccessViewUint) / sizeof(void*);
+extern const size_t discard = offsetof(ID3D12GraphicsCommandListVtbl, DiscardResource) / sizeof(void*);
+extern const size_t blend_factor = offsetof(ID3D12GraphicsCommandListVtbl, OMSetBlendFactor) / sizeof(void*);
+extern const size_t stencil_ref = offsetof(ID3D12GraphicsCommandListVtbl, OMSetStencilRef) / sizeof(void*);
+extern const size_t execute_bundle = offsetof(ID3D12GraphicsCommandListVtbl, ExecuteBundle) / sizeof(void*);
+extern const size_t set_index = offsetof(ID3D12GraphicsCommandListVtbl, IASetIndexBuffer) / sizeof(void*);
+extern const size_t set_vertices = offsetof(ID3D12GraphicsCommandListVtbl, IASetVertexBuffers) / sizeof(void*);
+extern const size_t set_stream = offsetof(ID3D12GraphicsCommandListVtbl, SOSetTargets) / sizeof(void*);
+extern const size_t predication = offsetof(ID3D12GraphicsCommandListVtbl, SetPredication) / sizeof(void*);
+extern const size_t compute_const =
+    offsetof(ID3D12GraphicsCommandListVtbl, SetComputeRoot32BitConstant) / sizeof(void*);
+extern const size_t compute_consts =
+    offsetof(ID3D12GraphicsCommandListVtbl, SetComputeRoot32BitConstants) / sizeof(void*);
+extern const size_t compute_cbv =
+    offsetof(ID3D12GraphicsCommandListVtbl, SetComputeRootConstantBufferView) / sizeof(void*);
+extern const size_t compute_srv =
+    offsetof(ID3D12GraphicsCommandListVtbl, SetComputeRootShaderResourceView) / sizeof(void*);
+extern const size_t compute_uav =
+    offsetof(ID3D12GraphicsCommandListVtbl, SetComputeRootUnorderedAccessView) / sizeof(void*);
+extern const size_t graphics_const =
+    offsetof(ID3D12GraphicsCommandListVtbl, SetGraphicsRoot32BitConstant) / sizeof(void*);
+extern const size_t graphics_consts =
+    offsetof(ID3D12GraphicsCommandListVtbl, SetGraphicsRoot32BitConstants) / sizeof(void*);
+extern const size_t graphics_cbv =
+    offsetof(ID3D12GraphicsCommandListVtbl, SetGraphicsRootConstantBufferView) / sizeof(void*);
+extern const size_t graphics_srv =
+    offsetof(ID3D12GraphicsCommandListVtbl, SetGraphicsRootShaderResourceView) / sizeof(void*);
+extern const size_t graphics_uav =
+    offsetof(ID3D12GraphicsCommandListVtbl, SetGraphicsRootUnorderedAccessView) / sizeof(void*);
+extern const size_t create_queue = offsetof(ID3D12DeviceVtbl, CreateCommandQueue) / sizeof(void*);
 extern const size_t reset_allocator = offsetof(ID3D12CommandAllocatorVtbl, Reset) / sizeof(void*);
 extern const size_t barrier = offsetof(ID3D12GraphicsCommandListVtbl, ResourceBarrier) / sizeof(void*);
 extern const size_t dispatch = offsetof(ID3D12GraphicsCommandListVtbl, Dispatch) / sizeof(void*);
@@ -38,6 +78,7 @@ extern const size_t copy_ranges = offsetof(ID3D12DeviceVtbl, CopyDescriptors) / 
 extern const size_t make_rtv = offsetof(ID3D12DeviceVtbl, CreateRenderTargetView) / sizeof(void*);
 extern const size_t make_uav = offsetof(ID3D12DeviceVtbl, CreateUnorderedAccessView) / sizeof(void*);
 extern const size_t make_srv = offsetof(ID3D12DeviceVtbl, CreateShaderResourceView) / sizeof(void*);
+extern const size_t make_dsv = offsetof(ID3D12DeviceVtbl, CreateDepthStencilView) / sizeof(void*);
 extern const size_t make_cbv = offsetof(ID3D12DeviceVtbl, CreateConstantBufferView) / sizeof(void*);
 extern const size_t create_heap = offsetof(ID3D12DeviceVtbl, CreateDescriptorHeap) / sizeof(void*);
 }  // namespace port

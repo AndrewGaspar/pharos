@@ -1,3 +1,4 @@
+#include "ports/bifrost_dual.h"
 #include "ports/bifrost_stereo.h"
 #include <d3dcompiler.h>
 #include "ports/bifrost_scene.h"
@@ -116,7 +117,8 @@ bool StereoOutput::open(ID3D12Device* dev, const D3D12_RESOURCE_DESC& d) {
   ACO_LOG("Bifrost: opened two %ux%u native eye images and half-SBS output", width, height);
   return true;
 }
-bool StereoOutput::present(IDXGISwapChain* chain, ID3D12CommandQueue* queue, int eye) {
+bool StereoOutput::present(IDXGISwapChain* chain, ID3D12CommandQueue* queue, int eye, UINT64 synchronized_target) {
+  dual::Internal internal;
   Ptr<IDXGISwapChain3> sc;
   Ptr<ID3D12Resource> bb;
   if (FAILED(chain->QueryInterface(IID_PPV_ARGS(&sc))) ||
@@ -135,14 +137,21 @@ bool StereoOutput::present(IDXGISwapChain* chain, ID3D12CommandQueue* queue, int
   handle.ptr += slot * stride;
   dev->CreateRenderTargetView(bb.Get(), nullptr, handle);
   transition(cl, bb.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  auto* right = synchronized_target ? dual::other(bb.Get()) : bb.Get();
+  const bool both = right != bb.Get() && reinterpret_cast<UINT64>(right) == synchronized_target;
+  if (both) transition(cl, right, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
   if (eye < 0) valid = 0;
   auto copy = [&](unsigned i) {
     transition(cl, views[i].Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-    cl->CopyResource(views[i].Get(), bb.Get());
+    cl->CopyResource(views[i].Get(), both && i ? right : bb.Get());
     transition(cl, views[i].Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
   };
   for (int i = 0; i < 2; ++i)
     if (i == eye || !(valid & (1u << i))) copy(i);
+  if (both) {
+    transition(cl, right, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT);
+    valid = 3;
+  }
   if (eye >= 0) valid |= 1u << eye;
   transition(cl, bb.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
   cl->SetGraphicsRootSignature(root.Get());
@@ -163,7 +172,7 @@ bool StereoOutput::present(IDXGISwapChain* chain, ID3D12CommandQueue* queue, int
   if (FAILED(queue->Signal(fence.Get(), last + 1))) return false;
   s.done = ++last;
   if (valid == 3 && ++pairs % 300 == 0)
-    ACO_LOG("Bifrost: packed alternating eye #%u (%s updated)", pairs, eye ? "right" : "left");
+    ACO_LOG("Bifrost: packed %s stereo frame #%u", both ? "synchronized" : "alternating", pairs);
   return true;
 }
 }  // namespace bifrost

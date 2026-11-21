@@ -7,6 +7,7 @@
 #include <mutex>
 
 #include "core/hook.h"
+#include "ports/bifrost_dual.h"
 namespace port {
 extern const size_t committed, placed;
 }
@@ -66,12 +67,16 @@ HRESULT WINAPI committed(ID3D12Device* dev, const D3D12_HEAP_PROPERTIES* props, 
                          const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear,
                          REFIID iid, void** out) {
   auto hr = aco::orig<decltype(committed)>(dev, port::committed)(dev, props, flags, desc, state, clear, iid, out);
-  if (SUCCEEDED(hr) && out && props) remember(desc, *props, *out);
+  if (SUCCEEDED(hr) && out && props && desc) {
+    remember(desc, *props, *out);
+    dual::committed(dev, *props, flags, *desc, state, clear, *out);
+  }
   return hr;
 }
 HRESULT WINAPI placed(ID3D12Device* dev, ID3D12Heap* heap, UINT64 offset, const D3D12_RESOURCE_DESC* desc,
                       D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear, REFIID iid, void** out) {
   auto hr = aco::orig<decltype(placed)>(dev, port::placed)(dev, heap, offset, desc, state, clear, iid, out);
+  if (SUCCEEDED(hr) && out && heap && desc) dual::placed(dev, heap, offset, *desc, state, clear, *out);
   if (SUCCEEDED(hr) && out && heap && desc && desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
     remember(desc, heap->GetDesc().Properties, *out);
   return hr;

@@ -1,3 +1,4 @@
+#include "ports/bifrost_dual.h"
 #include "ports/bifrost_sr.h"
 
 #include <nvsdk_ngx_defs.h>
@@ -71,6 +72,7 @@ class Upscaler final : public IUnknown {
     return n;
   }
   bool eval(const Scene& scene) {
+    dual::Internal internal;
     if (!scene.output || !scene.color || !scene.motion || !scene.depth) return false;
     std::lock_guard guard(lock);
     if (!open()) return false;
@@ -140,6 +142,7 @@ class Upscaler final : public IUnknown {
   }
   void finish() {
     std::lock_guard guard(lock);
+    dual::Internal internal;
     if (!active) return;
     auto* slot = begin();
     if (!slot) return;
@@ -288,7 +291,7 @@ void attach_sr(ID3D12CommandQueue* q, UINT width, UINT height) {
   ComPtr<ID3D12Device> dev;
   if (FAILED(q->GetDevice(IID_PPV_ARGS(&dev)))) return;
   display_size(dev.Get(), width, height);
-  for (int i = 0; i < (eye::alternating() ? 2 : 1); ++i) {
+  for (int i = 0; i < ((eye::alternating() || dual::enabled()) ? 2 : 1); ++i) {
     auto* sr = new Upscaler(q);
     q->SetPrivateDataInterface(i ? right_key : queue_key, sr);
     sr->Release();
@@ -329,13 +332,14 @@ ComPtr<ID3D12Resource> display_buffer(ID3D12Resource* output) {
   return associated<ID3D12Resource>(output, display_buffer_key);
 }
 bool upscale(ID3D12CommandQueue* queue, const Scene& scene) {
-  auto sr = associated<IUnknown>(queue, eye::alternating() && scene.info.eye ? right_key : queue_key);
+  auto sr =
+      associated<IUnknown>(queue, (eye::alternating() || dual::enabled()) && scene.info.eye ? right_key : queue_key);
   return sr && static_cast<Upscaler*>(sr.Get())->eval(scene);
 }
 void finish_sr_frame(ID3D12CommandQueue* queue) {
   auto sr = associated<IUnknown>(queue, queue_key);
   if (sr) static_cast<Upscaler*>(sr.Get())->finish();
-  if (eye::alternating()) {
+  if (eye::alternating() || dual::enabled()) {
     auto right = associated<IUnknown>(queue, right_key);
     if (right) static_cast<Upscaler*>(right.Get())->finish();
   }

@@ -18,6 +18,9 @@
 #include "ports/bifrost_scene.h"
 #include "ports/bifrost_replay.h"
 #include "ports/bifrost_eye.h"
+#include "ports/bifrost_dual.h"
+#include "ports/bifrost_lists.h"
+#include <vector>
 #include "ports/bifrost_stereo.h"
 #include "ports/bifrost_sr.h"
 #include "ports/bifrost_verify.h"
@@ -35,6 +38,10 @@ const GUID session_tag{0x4266010b, 0xa117, 0x43a1, {0xb9, 0x41, 0xad, 0x64, 0x23
 const GUID eye_tag{0x276e3ecd, 0x1f80, 0x4042, {0xb4, 0x73, 0xda, 0xf3, 0x0c, 0x40, 0xdf, 0x22}};
 const GUID frame_tag{0x4266010b, 0xa117, 0x43a1, {0xb9, 0x41, 0xad, 0x64, 0x23, 0x04, 0x31, 0xca}};
 const GUID composite_tag{0x4266010b, 0xa117, 0x43a1, {0xb9, 0x41, 0xad, 0x64, 0x23, 0x04, 0x31, 0xcb}};
+const GUID pair_tag{0x4266010b, 0xa117, 0x43a1, {0xb9, 0x41, 0xad, 0x64, 0x23, 0x04, 0x31, 0xcc}};
+struct Pair {
+  UINT64 left_serial{}, right_scene{}, right_target{};
+};
 struct Composite {
   UINT64 scene, target;
 };
@@ -105,6 +112,7 @@ class Session final : public IUnknown {
         display_size(dev.Get(), d.BufferDesc.Width, d.BufferDesc.Height);
       reset_history = true;
       stereo.invalidate();
+      dual::backbuffers(chain, queue.Get());
       refresh_checked = false;
       period = {};
       next_flip = {};
@@ -119,11 +127,22 @@ class Session final : public IUnknown {
     if (flags & (DXGI_PRESENT_TEST | DXGI_PRESENT_DO_NOT_WAIT | DXGI_PRESENT_RESTART)) return flip();
     replay::present();
     finish_sr_frame(queue.Get());
-    if (!fg_enabled && !eye::alternating()) return flip();
+    if (!fg_enabled && !eye::alternating() && !dual::enabled()) return flip();
     Scene scene;
+    Pair pair{};
     {
       std::lock_guard handoff_guard(handoff);
+      if (dual::enabled()) {
+        UINT n = sizeof(pair);
+        queue->GetPrivateData(pair_tag, &n, &pair);
+      }
       scene = recorded_scene(queue.Get());
+    }
+    if (dual::enabled()) {
+      bool fresh = dual::healthy() && pair.left_serial && pair.left_serial == scene.info.serial && scene.info.serial != seen;
+      stereo.present(chain, queue.Get(), -1, fresh ? pair.right_target : 0);
+      seen = scene.info.serial;
+      return flip();
     }
     if (eye::alternating()) {
       bool fresh = scene.info.serial && scene.info.serial != seen;
@@ -456,15 +475,45 @@ void WINAPI execute(ID3D12CommandQueue* q, UINT count, ID3D12CommandList* const*
   replay::submitted(q, count, lists);
   BOOL attached = FALSE;
   UINT bytes = sizeof(attached);
-  if (FAILED(q->GetPrivateData(session_tag, &bytes, &attached)) || !attached) return original(q, count, lists);
+  q->GetPrivateData(session_tag, &bytes, &attached);
+  std::vector<ID3D12CommandList*> combined, right;
+  std::vector<int> which;
+  if (dual::game_call()) {
+    combined.reserve(2 * count);
+    right.reserve(count);
+    which.reserve(2 * count);
+    for (UINT i = 0; i < count; ++i) {
+      combined.push_back(lists[i]);
+      which.push_back(0);
+      if (auto* other = dual::list(lists[i])) {
+        combined.push_back(other);
+        right.push_back(other);
+        which.push_back(1);
+      }
+    }
+  }
+  if (!attached) {
+    if (!right.empty())
+      original(q, UINT(combined.size()), combined.data());
+    else
+      original(q, count, lists);
+    return;
+  }
   std::lock_guard submit_guard(submissions);
   int eye_index = 0;
   if (eye::enabled()) {
     UINT length = sizeof(eye_index);
-    q->GetPrivateData(eye_tag, &length, &eye_index);
+    if (!dual::enabled()) q->GetPrivateData(eye_tag, &length, &eye_index);
     Scene camera;
     for (UINT i = 0; i < count && !camera.info.serial; ++i) camera = recorded_scene(lists[i]);
-    eye::prepare(count, lists, camera.info.camera.valid ? camera.info.camera.view_to_world[0] : nullptr, eye_index);
+    auto* view = camera.info.camera.valid ? camera.info.camera.view_to_world[0] : nullptr;
+    eye::refresh();
+    eye::prepare(count, lists, view, eye_index);
+    if (!right.empty()) eye::prepare(UINT(right.size()), right.data(), view, 1);
+  }
+  if (!right.empty()) {
+    count = UINT(combined.size());
+    lists = combined.data();
   }
   static std::atomic<unsigned> trace_count{};
   if (trace_count.load(std::memory_order_relaxed) < 24) {
@@ -478,20 +527,42 @@ void WINAPI execute(ID3D12CommandQueue* q, UINT count, ID3D12CommandList* const*
                 scene.info.serial, ui.scene, ui.target);
     }
   }
+  Pair pair{};
+  bool paired = !right.empty();
+  UINT pair_bytes = sizeof(pair);
+  if (paired) q->GetPrivateData(pair_tag, &pair_bytes, &pair);
   UINT start = 0;
   for (UINT i = 0; i < count; ++i) {
+    // A complete pair requires both TAA draws and the matching right-eye composite.
+    // These may arrive in separate ExecuteCommandLists calls before the flip.
+    if (paired && which[i] && pair.right_scene) {
+      Composite ui{};
+      UINT n = sizeof(ui);
+      if (SUCCEEDED(lists[i]->GetPrivateData(composite_tag, &n, &ui)) && ui.scene == pair.right_scene)
+        pair.right_target = ui.target;
+    }
     Extent size{};
     UINT bytes = sizeof(size);
     if (FAILED(lists[i]->GetPrivateData(frame_tag, &bytes, &size)) || !size.width) continue;
     auto scene = recorded_scene(lists[i]);
-    scene.info.eye = eye_index;
+    scene.info.eye = paired ? which[i] : eye_index;
+    if (paired) {
+      if (!which[i])
+        pair = {scene.info.serial, 0, 0};
+      else if (i && !which[i-1] && lists[i] == dual::list(lists[i-1]))
+        pair.right_scene = scene.info.native;
+    }
     original(q, i + 1 - start, lists + start);
     start = i + 1;
     if (scene.output && !upscale(q, scene)) scene.output.Reset();
     std::lock_guard guard(handoff);
-    forward_scene(q, scene);
+    if (right.empty() || !which[i]) forward_scene(q, scene);
   }
   if (start < count) original(q, count - start, lists + start);
+  if (paired) {
+    std::lock_guard guard(handoff);
+    q->SetPrivateData(pair_tag, sizeof(pair), &pair);
+  }
 }
 thread_local bool in_resize = false;
 template <class Fn>
@@ -523,6 +594,7 @@ void attach(IUnknown* creator, IDXGISwapChain* chain) {
   DXGI_SWAP_CHAIN_DESC desc{};
   if (option(L"upscaler", L"enabled", 1) && SUCCEEDED(chain->GetDesc(&desc)))
     attach_sr(queue.Get(), desc.BufferDesc.Width, desc.BufferDesc.Height);
+  dual::backbuffers(chain, queue.Get());
   auto* session = new Session(queue.Get());
   const auto hr = chain->SetPrivateDataInterface(session_tag, session);
   session->Release();
@@ -560,6 +632,12 @@ HRESULT WINAPI swap_hwnd(IDXGIFactory2* f, IUnknown* device, HWND hwnd, const DX
 UINT option(const wchar_t* section, const wchar_t* key, UINT fallback) {
   return GetPrivateProfileIntW(section, key, fallback, ini_file().c_str());
 }
+std::wstring option_text(const wchar_t* section, const wchar_t* key, const wchar_t* fallback) {
+  wchar_t text[96]{};
+  GetPrivateProfileStringW(section, key, fallback, text, std::size(text), ini_file().c_str());
+  return text;
+}
+void observe_queue(ID3D12CommandQueue* queue) { hook_vtable(queue, port::execute, reinterpret_cast<void*>(execute)); }
 void observe_factory(IUnknown* object) {
   ComPtr<IDXGIAdapter> adapter;
   ComPtr<IDXGIFactory> factory;

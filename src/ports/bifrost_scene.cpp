@@ -1,3 +1,4 @@
+#include "ports/bifrost_dual.h"
 #include "ports/bifrost_scene.h"
 
 #include <algorithm>
@@ -186,6 +187,7 @@ void clear_scene(ID3D12GraphicsCommandList* list) {
 }
 bool record_scene(ID3D12GraphicsCommandList* list, const DrawState& state, const FrameInfo& info,
                   ID3D12Resource* native) {
+  dual::Internal internal;
   if (!state.topology || !state.signature || !state.pso || !state.viewport_count || !state.scissor_count) return false;
   ComPtr<ID3D12Device> dev;
   if (FAILED(list->GetDevice(IID_PPV_ARGS(&dev)))) return false;
@@ -193,6 +195,7 @@ bool record_scene(ID3D12GraphicsCommandList* list, const DrawState& state, const
   static std::atomic<UINT64> sequence{};
   Scene s{info};
   s.info.serial = ++sequence;
+  s.info.native = reinterpret_cast<UINT64>(native);
   if (!native || !pso || !targets(dev.Get(), native, s)) return false;
   const auto heap = associated<ID3D12DescriptorHeap>(s.color.Get(), heap_tag);
   if (!heap) return false;

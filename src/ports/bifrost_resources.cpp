@@ -18,11 +18,13 @@
 #include "ports/bifrost_composite.h"
 #include "ports/bifrost_replay.h"
 #include "ports/bifrost_eye.h"
+#include "ports/bifrost_dual.h"
+#include "ports/bifrost_lists.h"
 
 using aco::orig;
 using Microsoft::WRL::ComPtr;
 namespace port {
-extern const size_t set_ctable, set_croot, topology, viewports, scissors;
+extern const size_t make_dsv, set_ctable, set_croot, topology, viewports, scissors;
 extern const size_t create_heap, make_srv, make_uav, make_cbv, make_rtv, copy_ranges, copy_simple, set_heaps,
     set_gtable, set_groot, set_targets, draw, draw_indexed, indirect, clear_state;
 }  // namespace port
@@ -124,20 +126,62 @@ void WINAPI srv(ID3D12Device* dev, ID3D12Resource* res, const D3D12_SHADER_RESOU
                 D3D12_CPU_DESCRIPTOR_HANDLE dest) {
   orig<decltype(srv)>(dev, port::make_srv)(dev, res, desc, dest);
   write_descriptor(dest, describe(res, desc ? desc->Format : DXGI_FORMAT_UNKNOWN, 't'));
+  if (dual::game_call()) {
+    auto h = dual::other(dest);
+    if (h.ptr != dest.ptr) {
+      auto* r = dual::other(res);
+      orig<decltype(srv)>(dev, port::make_srv)(dev, r, desc, h);
+      write_descriptor(h, describe(r, desc ? desc->Format : DXGI_FORMAT_UNKNOWN, 't'));
+    }
+  }
 }
 void WINAPI rtv(ID3D12Device* dev, ID3D12Resource* res, const D3D12_RENDER_TARGET_VIEW_DESC* desc,
                 D3D12_CPU_DESCRIPTOR_HANDLE dest) {
   orig<decltype(rtv)>(dev, port::make_rtv)(dev, res, desc, dest);
   write_descriptor(dest, describe(res, desc ? desc->Format : DXGI_FORMAT_UNKNOWN, 'r'));
+  if (dual::game_call()) {
+    auto h = dual::other(dest);
+    if (h.ptr != dest.ptr) {
+      auto* r = dual::other(res);
+      orig<decltype(rtv)>(dev, port::make_rtv)(dev, r, desc, h);
+      write_descriptor(h, describe(r, desc ? desc->Format : DXGI_FORMAT_UNKNOWN, 'r'));
+    }
+  }
 }
 void WINAPI cbv(ID3D12Device* dev, const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE dest) {
   orig<decltype(cbv)>(dev, port::make_cbv)(dev, desc, dest);
   write_descriptor(dest, desc ? View{desc->BufferLocation, desc->SizeInBytes, 1, DXGI_FORMAT_UNKNOWN, 'b'} : View{});
+  if (dual::game_call()) {
+    auto h = dual::other(dest);
+    if (h.ptr != dest.ptr) {
+      auto d = desc ? *desc : D3D12_CONSTANT_BUFFER_VIEW_DESC{};
+      d.BufferLocation = dual::address(d.BufferLocation);
+      orig<decltype(cbv)>(dev, port::make_cbv)(dev, desc ? &d : nullptr, h);
+      write_descriptor(h, desc ? View{d.BufferLocation, d.SizeInBytes, 1, DXGI_FORMAT_UNKNOWN, 'b'} : View{});
+    }
+  }
 }
 void WINAPI uav(ID3D12Device* dev, ID3D12Resource* res, ID3D12Resource* counter,
                 const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE dest) {
   orig<decltype(uav)>(dev, port::make_uav)(dev, res, counter, desc, dest);
   write_descriptor(dest, describe(res, desc ? desc->Format : DXGI_FORMAT_UNKNOWN, 'u'));
+  if (dual::game_call()) {
+    auto h = dual::other(dest);
+    if (h.ptr != dest.ptr) {
+      auto* r = dual::other(res);
+      orig<decltype(uav)>(dev, port::make_uav)(dev, r, dual::other(counter), desc, h);
+      write_descriptor(h, describe(r, desc ? desc->Format : DXGI_FORMAT_UNKNOWN, 'u'));
+    }
+  }
+}
+void WINAPI dsv(ID3D12Device* dev, ID3D12Resource* res, const D3D12_DEPTH_STENCIL_VIEW_DESC* desc,
+                D3D12_CPU_DESCRIPTOR_HANDLE dest) {
+  auto fn = orig<decltype(dsv)>(dev, port::make_dsv);
+  fn(dev, res, desc, dest);
+  if (dual::game_call()) {
+    auto h = dual::other(dest);
+    if (h.ptr != dest.ptr) fn(dev, dual::other(res), desc, h);
+  }
 }
 bool tracked(D3D12_DESCRIPTOR_HEAP_TYPE t) {
   return t == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || t == D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
@@ -145,8 +189,10 @@ bool tracked(D3D12_DESCRIPTOR_HEAP_TYPE t) {
 HRESULT WINAPI create_heap(ID3D12Device* dev, const D3D12_DESCRIPTOR_HEAP_DESC* desc, REFIID iid, void** out) {
   auto hr = orig<decltype(create_heap)>(dev, port::create_heap)(dev, desc, iid, out);
   ComPtr<ID3D12DescriptorHeap> heap;
-  if (SUCCEEDED(hr) && desc && tracked(desc->Type) && out && *out &&
+  if (SUCCEEDED(hr) && desc && (tracked(desc->Type) || dual::game_call()) && out && *out &&
       SUCCEEDED(static_cast<IUnknown*>(*out)->QueryInterface(IID_PPV_ARGS(&heap)))) {
+    dual::descriptors(dev, heap.Get(), *desc);
+    if (!tracked(desc->Type)) return hr;
     auto start = heap->GetCPUDescriptorHandleForHeapStart().ptr;
     auto bytes = UINT64(desc->NumDescriptors) * dev->GetDescriptorHandleIncrementSize(desc->Type);
     std::lock_guard guard(lock);
@@ -183,11 +229,52 @@ void WINAPI copy_ranges(ID3D12Device* dev, UINT nd, const D3D12_CPU_DESCRIPTOR_H
                         const D3D12_CPU_DESCRIPTOR_HANDLE* src, const UINT* sl, D3D12_DESCRIPTOR_HEAP_TYPE type) {
   orig<decltype(copy_ranges)>(dev, port::copy_ranges)(dev, nd, dst, dl, ns, src, sl, type);
   copy(dev, nd, dst, dl, ns, src, sl, type);
+  if (dual::game_call() && nd && type != D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) {
+    std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> dest(nd), source(ns);
+    std::transform(dst, dst + nd, dest.begin(), [](auto h) { return dual::other(h); });
+    std::transform(src, src + ns, source.begin(), [](auto h) { return dual::other(h); });
+    UINT mapped = 0;
+    for (UINT i = 0; i < nd; ++i) mapped += dest[i].ptr != dst[i].ptr;
+    if (!mapped) return;
+    auto fn = orig<decltype(copy_ranges)>(dev, port::copy_ranges);
+    if (mapped == nd) {
+      fn(dev, nd, dest.data(), dl, ns, source.data(), sl, type);
+      copy(dev, nd, dest.data(), dl, ns, source.data(), sl, type);
+      return;
+    }
+    // A mixed batch can include private heaps from another renderer. Advance
+    // through their source ranges too, while writing only our paired heaps.
+    UINT s = 0, used = 0;
+    const auto stride = dev->GetDescriptorHandleIncrementSize(type);
+    for (UINT d = 0; d < nd; ++d) {
+      UINT size = dl ? dl[d] : 1;
+      for (UINT pos = 0; pos < size && s < ns;) {
+        UINT available = (sl ? sl[s] : 1) - used;
+        UINT count = std::min(available, size - pos);
+        if (count && dest[d].ptr != dst[d].ptr) {
+          D3D12_CPU_DESCRIPTOR_HANDLE to{dest[d].ptr + SIZE_T(pos) * stride};
+          D3D12_CPU_DESCRIPTOR_HANDLE from{source[s].ptr + SIZE_T(used) * stride};
+          fn(dev, 1, &to, &count, 1, &from, &count, type);
+          copy(dev, 1, &to, &count, 1, &from, &count, type);
+        }
+        pos += count;
+        used += count;
+        if (count == available) { ++s; used = 0; }
+      }
+    }
+  }
 }
 void WINAPI simple(ID3D12Device* dev, UINT count, D3D12_CPU_DESCRIPTOR_HANDLE dst, D3D12_CPU_DESCRIPTOR_HANDLE src,
                    D3D12_DESCRIPTOR_HEAP_TYPE type) {
   orig<decltype(simple)>(dev, port::copy_simple)(dev, count, dst, src, type);
   copy(dev, 1, &dst, &count, 1, &src, &count, type);
+  if (dual::game_call() && type != D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) {
+    auto dest = dual::other(dst), source = dual::other(src);
+    if (dest.ptr != dst.ptr) {
+      orig<decltype(simple)>(dev, port::copy_simple)(dev, count, dest, source, type);
+      copy(dev, 1, &dest, &count, 1, &source, &count, type);
+    }
+  }
 }
 void WINAPI set_heaps(ID3D12GraphicsCommandList* list, UINT count, ID3D12DescriptorHeap* const* heaps) {
   orig<decltype(set_heaps)>(list, port::set_heaps)(list, count, heaps);
@@ -208,6 +295,11 @@ void WINAPI set_heaps(ID3D12GraphicsCommandList* list, UINT count, ID3D12Descrip
   st.sampler = sampler;
   st.heap = h;
   save(list, st);
+  if (auto* r = dual::list(list)) {
+    std::vector<ID3D12DescriptorHeap*> second(count);
+    for (UINT i = 0; i < count; ++i) second[i] = dual::other(heaps[i]);
+    set_heaps(r, count, second.data());
+  }
 }
 void note_camera(ID3D12GraphicsCommandList* list, Bindings& st, bool compute, UINT root,
                  D3D12_GPU_DESCRIPTOR_HANDLE h) {
@@ -237,6 +329,7 @@ void WINAPI compute_table(ID3D12GraphicsCommandList* list, UINT i, D3D12_GPU_DES
   orig<decltype(compute_table)>(list, port::set_ctable)(list, i, h);
   auto st = get<ID3D12GraphicsCommandList, Bindings>(list, list_tag);
   note_camera(list, st, true, i, h);
+  if (auto* r = dual::list(list)) compute_table(r, i, dual::other(h));
 }
 void WINAPI compute_root(ID3D12GraphicsCommandList* list, ID3D12RootSignature* sig) {
   orig<decltype(compute_root)>(list, port::set_croot)(list, sig);
@@ -244,6 +337,7 @@ void WINAPI compute_root(ID3D12GraphicsCommandList* list, ID3D12RootSignature* s
   st.compute_eye = eye::root_index(sig);
   st.compute_camera = get<ID3D12RootSignature, Layout>(sig, layout_tag).pass.cbv;
   save(list, st);
+  if (auto* r = dual::list(list)) compute_root(r, sig);
 }
 void WINAPI table(ID3D12GraphicsCommandList* list, UINT i, D3D12_GPU_DESCRIPTOR_HANDLE h) {
   orig<decltype(table)>(list, port::set_gtable)(list, i, h);
@@ -252,6 +346,7 @@ void WINAPI table(ID3D12GraphicsCommandList* list, UINT i, D3D12_GPU_DESCRIPTOR_
   if (eye::enabled() || replay::tracking()) note_camera(list, st, false, i, h);
   st.roots[i] = h.ptr;
   save(list, st);
+  if (auto* r = dual::list(list)) table(r, i, dual::other(h));
 }
 void WINAPI root(ID3D12GraphicsCommandList* list, ID3D12RootSignature* sig) {
   orig<decltype(root)>(list, port::set_groot)(list, sig);
@@ -266,6 +361,7 @@ void WINAPI root(ID3D12GraphicsCommandList* list, ID3D12RootSignature* sig) {
     st.draw.signature = sig;
     save(list, st);
   }
+  if (auto* r = dual::list(list)) root(r, sig);
 }
 void WINAPI targets(ID3D12GraphicsCommandList* list, UINT n, const D3D12_CPU_DESCRIPTOR_HANDLE* handles,
                     BOOL contiguous, const D3D12_CPU_DESCRIPTOR_HANDLE* depth) {
@@ -280,6 +376,12 @@ void WINAPI targets(ID3D12GraphicsCommandList* list, UINT n, const D3D12_CPU_DES
   for (UINT i = 0; i < 8; ++i)
     st.draw.targets[i].ptr = i >= n ? 0 : contiguous ? handles[0].ptr + i * stride : handles[i].ptr;
   save(list, st);
+  if (auto* r = dual::list(list)) {
+    D3D12_CPU_DESCRIPTOR_HANDLE targets_eye[8]{};
+    for (UINT i = 0; i < st.draw.num_targets; ++i) targets_eye[i] = dual::other(st.draw.targets[i]);
+    auto depth_eye = dual::other(st.draw.depth);
+    targets(r, st.draw.num_targets, targets_eye, FALSE, depth ? &depth_eye : nullptr);
+  }
 }
 UINT64 address(const Bindings& st, Slot slot, UINT reg) {
   if (reg >= slot.count) return 0;
@@ -293,6 +395,7 @@ void WINAPI topology(ID3D12GraphicsCommandList* list, D3D12_PRIMITIVE_TOPOLOGY t
   auto st = get<ID3D12GraphicsCommandList, Bindings>(list, list_tag);
   st.draw.topology = t;
   save(list, st);
+  if (auto* r = dual::list(list)) topology(r, t);
 }
 void WINAPI viewports(ID3D12GraphicsCommandList* list, UINT n, const D3D12_VIEWPORT* v) {
   orig<decltype(viewports)>(list, port::viewports)(list, n, v);
@@ -300,6 +403,7 @@ void WINAPI viewports(ID3D12GraphicsCommandList* list, UINT n, const D3D12_VIEWP
   st.draw.viewport_count = std::min(n, UINT(std::size(st.draw.viewports)));
   std::copy_n(v, st.draw.viewport_count, st.draw.viewports);
   save(list, st);
+  if (auto* r = dual::list(list)) viewports(r, n, v);
 }
 void WINAPI scissors(ID3D12GraphicsCommandList* list, UINT n, const D3D12_RECT* v) {
   orig<decltype(scissors)>(list, port::scissors)(list, n, v);
@@ -307,6 +411,7 @@ void WINAPI scissors(ID3D12GraphicsCommandList* list, UINT n, const D3D12_RECT* 
   st.draw.scissor_count = std::min(n, UINT(std::size(st.draw.scissors)));
   std::copy_n(v, st.draw.scissor_count, st.draw.scissors);
   save(list, st);
+  if (auto* r = dual::list(list)) scissors(r, n, v);
 }
 bool inspect(ID3D12GraphicsCommandList* list, const std::function<void()>& draw) {
   auto st = get<ID3D12GraphicsCommandList, Bindings>(list, list_tag);
@@ -408,14 +513,21 @@ bool inspect(ID3D12GraphicsCommandList* list, const std::function<void()>& draw)
   }
   return false;
 }
+template <class T>
+T eye_arg(T value) {
+  return value;
+}
+ID3D12Resource* eye_arg(ID3D12Resource* value) { return dual::other(value); }
 template <const size_t& slot, typename... Args>
 void WINAPI submit(ID3D12GraphicsCommandList* list, Args... args) {
   auto draw = [&] { orig<decltype(submit<slot, Args...>)>(list, slot)(list, args...); };
   if (!inspect(list, draw)) draw();
+  if (auto* r = dual::list(list)) submit<slot, Args...>(r, eye_arg(args)...);
 }
 void WINAPI clear(ID3D12GraphicsCommandList* list, ID3D12PipelineState* pso) {
   orig<decltype(clear)>(list, port::clear_state)(list, pso);
   reset_inputs(list, pso);
+  if (auto* r = dual::list(list)) clear(r, pso);
 }
 }  // namespace
 void read_layout(ID3D12RootSignature* root, const D3D12_VERSIONED_ROOT_SIGNATURE_DESC& d) {
@@ -448,6 +560,7 @@ void reset_inputs(ID3D12GraphicsCommandList* list, ID3D12PipelineState* pso) {
 void observe_descriptors(ID3D12Device* dev) {
   observe_uploads(dev);
 #define HOOK(slot, fn) aco::hook_vtable(dev, port::slot, reinterpret_cast<void*>(fn))
+  if (dual::enabled()) HOOK(make_dsv, dsv);
   HOOK(make_cbv, cbv);
   HOOK(make_srv, srv);
   HOOK(make_uav, uav);
@@ -464,6 +577,7 @@ void observe_commands(ID3D12GraphicsCommandList* list) {
     HOOK(set_croot, compute_root);
     replay::observe(list);
   }
+  dual::install(list);
   HOOK(topology, topology);
   HOOK(viewports, viewports);
   HOOK(scissors, scissors);

@@ -14,6 +14,7 @@
 #include "ports/bifrost_present.h"
 #include "ports/bifrost_scene.h"
 #include "ports/bifrost_uploads.h"
+#include "ports/bifrost_lists.h"
 
 namespace port {
 extern const size_t barrier, dispatch, end_query, resolve_queries;
@@ -65,10 +66,12 @@ void WINAPI barriers(ID3D12GraphicsCommandList* list, UINT n, const D3D12_RESOUR
     }
   }
   aco::orig<decltype(barriers)>(list, port::barrier)(list, n, data);
+  dual::resource_barriers(list, n, data);
 }
 void WINAPI dispatch(ID3D12GraphicsCommandList* list, UINT x, UINT y, UINT z) {
   if (auto r = recording(list)) ++r->dispatches;
   aco::orig<decltype(dispatch)>(list, port::dispatch)(list, x, y, z);
+  if (auto* r = dual::list(list)) dispatch(r, x, y, z);
 }
 void WINAPI end_query(ID3D12GraphicsCommandList* list, ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, UINT index) {
   if (auto r = recording(list)) ++r->queries;

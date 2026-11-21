@@ -1,6 +1,8 @@
 #include "ports/bifrost_eye.h"
 
 #include <atomic>
+#include <cmath>
+#include <cwchar>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -11,6 +13,8 @@
 #include "ports/bifrost_present.h"
 #include "ports/bifrost_uploads.h"
 #include "ports/common.h"
+#include "ports/bifrost_dual.h"
+#include "ports/bifrost_lists.h"
 
 namespace port {
 extern const size_t reset_allocator;
@@ -20,6 +24,12 @@ namespace {
 using Microsoft::WRL::ComPtr;
 constexpr GUID key(BYTE n) { return {0xca84218f, 0x1f50, 0x4e11, {0x80, 0xab, 0x50, 0xbb, 0xbb, 0x15, 0xf6, n}}; }
 constexpr GUID root_tag = key(1), arena_tag = key(2), notes_tag = key(3);
+float metres = .0325f, convergence = 4;
+float number(const std::wstring& text, float fallback) {
+  wchar_t* end{};
+  float value = std::wcstof(text.c_str(), &end);
+  return end != text.c_str() && !*end && std::isfinite(value) && value >= 0 ? value : fallback;
+}
 constexpr UINT page_size = 256 * 1024;
 struct Owner : IUnknown {
   std::atomic<ULONG> refs{1};
@@ -91,6 +101,7 @@ struct Notes final : Owner {
 };
 HRESULT WINAPI reset(ID3D12CommandAllocator* a) {
   auto hr = aco::orig<decltype(reset)>(a, port::reset_allocator)(a);
+  if (SUCCEEDED(hr) && dual::enabled()) dual::reset_allocator(a);
   if (SUCCEEDED(hr))
     if (auto pool = associated<Arena>(a, arena_tag)) {
       pool->cursor = 0;
@@ -104,7 +115,7 @@ bool alternating() {
 }
 bool enabled() {
   static const auto eye = option(L"stereo", L"preview_eye", 0);
-  return alternating() || eye == 1 || eye == 2;
+  return dual::enabled() || alternating() || eye == 1 || eye == 2;
 }
 ComPtr<ID3DBlob> camera_root(const D3D12_ROOT_SIGNATURE_DESC& input, UINT& index) {
   if (!enabled() || input.NumParameters > 16) return {};
@@ -176,12 +187,23 @@ UINT64 bind(ID3D12GraphicsCommandList* list, UINT64 address, UINT bytes) {
   notes->ranges[address] = r;
   return r.shadow;
 }
+void refresh() {
+  // Queue submissions are serialized. Read both eye settings together so they
+  // take effect for the same simulation step.
+  static ULONGLONG next{};
+  auto now = GetTickCount64();
+  if (now < next) return;
+  next = now + 1000;
+  auto distance = option_text(L"stereo", L"separation", L"");
+  if (distance.empty()) distance = option_text(L"stereo", L"separation_mm", L"32.5");
+  metres = .001f * number(distance, 32.5f);
+  convergence = number(option_text(L"stereo", L"convergence", L"4"), 4);
+}
 void prepare(UINT count, ID3D12CommandList* const* lists, const float* camera, int eye) {
   if (!enabled()) return;
-  static const float metres = option(L"stereo", L"separation_mm", 33) * .001f;
   static const int single = option(L"stereo", L"preview_eye", 2) == 1 ? 0 : 1;
-  const float separation = (alternating() ? eye : single) == 0 ? -metres : metres;
-  static const float convergence = float(option(L"stereo", L"convergence", 4));
+  int which = alternating() || dual::enabled() ? eye : single;
+  const float separation = dual::healthy() ? (which == 0 ? -metres : metres) : 0;
   unsigned moved = 0;
   std::map<UINT64, Range> ranges;
   for (UINT i = 0; i < count; ++i) {
@@ -198,7 +220,7 @@ void prepare(UINT count, ID3D12CommandList* const* lists, const float* camera, i
     static std::atomic<unsigned> frames{};
     auto seq = ++frames;
     if (seq <= 3 || seq % 300 == 0)
-      ACO_LOG("Bifrost: eye preview #%u moved %u of %zu camera ranges by %.3f m", seq, moved, ranges.size(),
+      ACO_LOG("Bifrost: eye camera #%u moved %u of %zu camera ranges by %.3f m", seq, moved, ranges.size(),
               separation);
   }
 }

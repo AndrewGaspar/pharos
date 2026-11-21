@@ -18,7 +18,7 @@ struct DrawState {
   scissors[D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
 };
 struct FrameInfo {
-  UINT64 serial{};
+  UINT64 serial{}, native{};  // Resource identity, only compared while processing the submission.
   int eye{};
   UINT width{}, height{};
   float jitter[2]{};

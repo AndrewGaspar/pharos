@@ -11,7 +11,7 @@ class StereoOutput {
   bool drain();
   void invalidate() { valid = 0; }
   // eye==-1 duplicates the live flat image and drops the previous perspective pair.
-  bool present(IDXGISwapChain* chain, ID3D12CommandQueue* queue, int eye);
+  bool present(IDXGISwapChain* chain, ID3D12CommandQueue* queue, int eye, UINT64 synchronized_target = 0);
 
  private:
   template <class T>

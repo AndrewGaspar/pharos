@@ -1,3 +1,4 @@
+#include "ports/bifrost_dual.h"
 #include "ports/bifrost_composite.h"
 
 #include <wrl/client.h>
@@ -153,6 +154,7 @@ void prepare_composite(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELINE_STATE_DE
 bool composite(ID3D12GraphicsCommandList* list, ID3D12Resource* native, ID3D12PipelineState* pso,
                ID3D12RootSignature* root, const UINT64* tables, UINT camera_index, UINT64 camera_address,
                const std::function<void()>& draw) {
+  dual::Internal internal;
   if (!native || !pso || !root) return false;
   auto output = output_for(native);
   if (!output) {
