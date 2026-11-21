@@ -13,6 +13,8 @@ struct Kernels {
 
 bool create(ID3D11Device* dev, Kernels& k);
 
+ID3DBlob* compile_code(const char* src, size_t len, const char* name, const char* target);
+
 // Compiles a cs_5_0 compute shader (entry point main) from HLSL source.
 ID3D11ComputeShader* compile(ID3D11Device* dev, const char* src, size_t len, const char* name);
 

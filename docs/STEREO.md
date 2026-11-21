@@ -255,17 +255,28 @@ about half of the 2560x1600 numbers per eye, so 1080p60 at DLSS Performance hold
   culling constants aren't redirected, so objects at the right edge of the right eye could be culled
   early. Not seen yet.
 - **The HUD and menus sit at screen depth in both eyes.** That's the same as torchbearer.
-- **Map cursor depth (in progress, measured live in the lab, runs r9-r15):** the map's white
-  arrow is drawn into the backbuffer (present in framedump PPMs, not a compositor cursor) and
-  follows relative mouse motion 1:1 px. It is drawn by one DrawIndexedInstancedIndirect in the
-  late UI pass into the display-resolution target the UICompositing pass samples as t86:
-  vertex shader `12b61097a3a0b0e7`, pixel shader `068233d2886bf2c8`, indirect-args offset 340
-  in that frame's batch (found by dropping draws with the skipdraw experiment tool, then
-  narrowing by shader, then by offset; dropping it removes only the arrow). Still open: a
-  discriminator stabler than the batch offset, where its position lives (per-draw constants
-  vs instance data), hiding it, and drawing a per-eye substitute at the scene depth under it.
-- **Quiver's HUD isn't told the layout.** Pharos doesn't use the Quiver SDK
-  (`quiver_set_stereo_layout`).
+- **Map/menu cursor at screen depth: fixed by `[stereo] cursor=depth`** (`stereo/cursor.cpp`;
+  measured live in the lab, runs r9-r24). The game's white arrow is drawn into the backbuffer
+  (present in framedump PPMs, not a compositor cursor) by one DrawIndexedInstancedIndirect in
+  the late UI pass into the display-resolution target the UICompositing pass samples as t86:
+  vertex shader `12b61097a3a0b0e7`, pixel shader `068233d2886bf2c8`. It is recognised by that
+  shader pair plus its sprite pages (t70 64x64 fmt 77, t71 512x512 fmt 80; sibling draws with
+  the same shaders, and the single gameplay submission of it, bind other sizes there). While
+  `cursor=depth`, that draw is dropped at record time and a ring is drawn into each eye texture
+  at the OS cursor position (the arrow follows `GetCursorPos` 1:1), offset per eye by the
+  disparity of the scene depth under it: last frame's DLSS depth sampled at the pointer,
+  converted with the main view's ClipXYZToViewPos, smoothed in disparity space. Measured: on
+  the Giza map, scene 833 m, ring disparity 10-12 px at 1280 wide vs 10 px template-matched
+  terrain disparity; main menu 10 m. In gameplay the pair's only draw binds other pages, so
+  nothing is hidden or drawn there; in mono the feature is inert. Still open: the arrow's
+  hotspot vs the ring centre (ring is centred on the pointer position; the arrow's tip measured
+  within ~7 px of it), and checking other menu screens (inventory) bind the same pages.
+  The left-stick cursor uses separate ring and dot batches. In r25, suppressing map draws at
+  offsets 460 and 420 removed the ring and dot respectively. The matching menu draws had
+  different offsets. The runtime identifies their sprite pages from the cursor batch sequence
+  and takes the centre from the dot vertices using D3D11 stream output. In r27, stick moves
+  put the menu cursor at (801,440) and (523,380) at 1280×720. Both eyes drew the substitute
+  at 10 m, with 8.5 pixels of disparity. Switching back to the mouse restored pointer tracking.
 - **Learning hitch:** ~300 ms, once per scene change.
 - **Effect cameras not covered** (§2b): the temporal reprojection matrices, the fog's light-culling
   view matrices, the shadow reprojection (`ReprojectConsts.ScreenToWorldToShadowViewProjection`, VS)

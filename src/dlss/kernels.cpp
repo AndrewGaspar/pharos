@@ -94,7 +94,7 @@ using PFN_D3DCompile = HRESULT(WINAPI*)(const void*, SIZE_T, const char*, const 
 
 }  // namespace
 
-ID3D11ComputeShader* compile(ID3D11Device* dev, const char* src, size_t len, const char* name) {
+ID3DBlob* compile_code(const char* src, size_t len, const char* name, const char* target) {
   static PFN_D3DCompile d3d_compile = [] {
     HMODULE m = LoadLibraryW(L"d3dcompiler_47.dll");
     return m ? reinterpret_cast<PFN_D3DCompile>(GetProcAddress(m, "D3DCompile")) : nullptr;
@@ -105,7 +105,7 @@ ID3D11ComputeShader* compile(ID3D11Device* dev, const char* src, size_t len, con
   }
   ID3DBlob* code = nullptr;
   ID3DBlob* errors = nullptr;
-  HRESULT hr = d3d_compile(src, len, name, nullptr, nullptr, "main", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
+  HRESULT hr = d3d_compile(src, len, name, nullptr, nullptr, "main", target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
                            &code, &errors);
   if (errors) {
     ACO_LOG("kernels: %s: %.*s", name, static_cast<int>(errors->GetBufferSize()),
@@ -113,8 +113,14 @@ ID3D11ComputeShader* compile(ID3D11Device* dev, const char* src, size_t len, con
     errors->Release();
   }
   if (FAILED(hr) || !code) return nullptr;
+  return code;
+}
+
+ID3D11ComputeShader* compile(ID3D11Device* dev, const char* src, size_t len, const char* name) {
+  ID3DBlob* code = compile_code(src, len, name, "cs_5_0");
+  if (!code) return nullptr;
   ID3D11ComputeShader* cs = nullptr;
-  hr = dev->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &cs);
+  HRESULT hr = dev->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &cs);
   code->Release();
   if (FAILED(hr)) ACO_LOG("kernels: CreateComputeShader(%s) failed 0x%08lx", name, hr);
   return cs;

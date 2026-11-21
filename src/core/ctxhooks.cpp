@@ -17,6 +17,7 @@
 #include "core/vtidx.h"
 #include "dlss/upscaler.h"
 #include "stereo/camera.h"
+#include "stereo/cursor.h"
 #include "stereo/record.h"
 #include "stereo/temporal.h"
 #include "stereo/stereo.h"
@@ -207,6 +208,8 @@ void STDMETHODCALLTYPE hk_DrawIndexedInstanced(ID3D11DeviceContext* self, UINT a
 }
 void STDMETHODCALLTYPE hk_DrawIndexedInstancedIndirect(ID3D11DeviceContext* self, ID3D11Buffer* buf, UINT off) {
   if (skip_this_draw(self, off)) return;
+  CursorDraw cursor = cursor_prepare(self, buf, off);
+  if (cursor == CursorDraw::Hide) return;
   if (ACO_REC_WANT(self)) rec_draw_indexed_instanced_indirect(buf, off);
   geo_count(0, true);
   char args[64] = "";
@@ -214,6 +217,7 @@ void STDMETHODCALLTYPE hk_DrawIndexedInstancedIndirect(ID3D11DeviceContext* self
   draw_common(self, "DrawIndexedInstancedIndirect", args, [&] {
     ORIG(decltype(hk_DrawIndexedInstancedIndirect), Context_DrawIndexedInstancedIndirect)(self, buf, off);
   });
+  if (cursor == CursorDraw::Capture) cursor_restore(self);
 }
 void STDMETHODCALLTYPE hk_DrawInstancedIndirect(ID3D11DeviceContext* self, ID3D11Buffer* buf, UINT off) {
   if (skip_this_draw(self, off)) return;

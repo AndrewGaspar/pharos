@@ -56,6 +56,9 @@ void cam_effect_end(ID3D11DeviceContext* ctx, CamFx* fx);
 void cam_finish_command_list(ID3D11DeviceContext* ctx, ID3D11CommandList* cl);
 void cam_before_execute(ID3D11DeviceContext* imm, ID3D11CommandList* cl, int eye);
 
+// Latest main view's projection m00 and ClipXYZToViewPos (mono), for the stereo cursor's depth.
+bool cam_cursor_view(float* m00, float clip_to_view[4][4]);
+
 void cam_init(ID3D11Device* dev, ID3D11DeviceContext* imm);
 void cam_on_present(bool stereo_on);  // per-frame: eye parameters, statistics
 

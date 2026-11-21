@@ -15,6 +15,7 @@
 #include "core/log.h"
 #include "dlss/kernels.h"
 #include "stereo/camera.h"
+#include "stereo/cursor.h"
 #include "stereo/record.h"
 #include "stereo/temporal.h"
 
@@ -94,6 +95,7 @@ struct State {
   DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
   ID3D11Texture2D* eye[2] = {};
   ID3D11ShaderResourceView* eye_srv[2] = {};
+  ID3D11UnorderedAccessView* eye_uav[2] = {};  // cursor drawing
   ID3D11Texture2D* out = nullptr;
   ID3D11UnorderedAccessView* out_uav = nullptr;
 
@@ -165,6 +167,7 @@ bool ensure_targets(ID3D11Texture2D* bb) {
   bb->GetDesc(&d);
   if (S.out && d.Width == S.w && d.Height == S.h && d.Format == S.fmt) return true;
   for (int i = 0; i < 2; ++i) {
+    release(S.eye_uav[i]);
     release(S.eye_srv[i]);
     release(S.eye[i]);
   }
@@ -181,10 +184,11 @@ bool ensure_targets(ID3D11Texture2D* bb) {
   t.Format = d.Format;
   t.SampleDesc = {1, 0};
   t.Usage = D3D11_USAGE_DEFAULT;
-  t.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+  t.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
   for (int i = 0; i < 2; ++i) {
     if (FAILED(S.dev->CreateTexture2D(&t, nullptr, &S.eye[i]))) return false;
     if (FAILED(S.dev->CreateShaderResourceView(S.eye[i], nullptr, &S.eye_srv[i]))) return false;
+    S.dev->CreateUnorderedAccessView(S.eye[i], nullptr, &S.eye_uav[i]);  // cursor only; may stay null
   }
   t.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
   if (FAILED(S.dev->CreateTexture2D(&t, nullptr, &S.out)) ||
@@ -383,6 +387,7 @@ void stereo_on_present(IDXGISwapChain* sc, PFN_GetBuffer real_get_buffer) {
   RecFrame* f = rec_stop();
   cam_on_present(want);
   if (!want) {
+    cursor_set_active(false);
     tmp_frame_end(false, nullptr, 0);
     rec_free(f);
     if (S.active) ACO_LOG("stereo: off");
@@ -412,6 +417,7 @@ void stereo_on_present(IDXGISwapChain* sc, PFN_GetBuffer real_get_buffer) {
     got = SUCCEEDED(sc->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&bb)));
   }
   if (rec_frame_ok(f, &why) && ensure_device_objects() && got && ensure_targets(bb)) {
+    cursor_set_active(cfg.stereo_cursor == "depth" && S.eye_uav[0] && S.eye_uav[1] && cursor_ready(S.dev));
     double t0 = now_ms();
     S.imm->CopyResource(S.eye[0], bb);
     tmp_before_right(S.imm);
@@ -429,6 +435,16 @@ void stereo_on_present(IDXGISwapChain* sc, PFN_GetBuffer real_get_buffer) {
     g_eye.store(0, std::memory_order_relaxed);
     S.imm->CopyResource(S.eye[1], bb);
     tmp_after_right(S.imm);
+    if (cfg.stereo_cursor == "depth") {
+      cursor_begin_frame(S.imm, sc, S.w, S.h);
+      if (cursor_visible()) {
+        ID3DDeviceContextState* prev = nullptr;
+        S.imm1->SwapDeviceContextState(S.own_state, &prev);
+        cursor_draw(S.dev, S.imm, S.eye_uav, S.w, S.h);
+        S.imm1->SwapDeviceContextState(prev, nullptr);
+        if (prev) prev->Release();
+      }
+    }
     double t_replay = now_ms();
     if (wide) {
       bool sw = cfg.stereo_swap;
@@ -444,6 +460,7 @@ void stereo_on_present(IDXGISwapChain* sc, PFN_GetBuffer real_get_buffer) {
     S.cmds_sum += rec_frame_size(f);
     S.bytes_sum += rec_frame_bytes(f);
   } else {
+    cursor_set_active(false);
     if (why && why != S.last_bad) {
       ACO_LOG("stereo: frame not replayed: %s", why);
       S.last_bad = why;

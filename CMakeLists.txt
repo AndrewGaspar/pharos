@@ -40,6 +40,7 @@ add_library(aco_d3d11 SHARED
   src/stereo/record.cpp
   src/stereo/stereo.cpp
   src/stereo/camera.cpp
+  src/stereo/cursor.cpp
   src/stereo/temporal.cpp
   src/core/hyprland.cpp
   src/core/quiver.cpp

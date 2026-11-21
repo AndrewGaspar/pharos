@@ -73,7 +73,7 @@ options = ["cloth.mode", "cloth.scale"]
 [[page]]
 id = "stereo"
 title = "Stereo 3D"
-options = ["stereo.mode", "stereo.output", "stereo.separation", "stereo.convergence", "stereo.swap"]
+options = ["stereo.mode", "stereo.output", "stereo.separation", "stereo.convergence", "stereo.swap", "stereo.cursor"]
 
 [[page.group]]
 title = "Debugging"
@@ -1233,6 +1233,17 @@ apply = "live"
 type = "bool"
 label = "Swap eyes"
 help = "Left eye on the right (cross-eyed viewing)."
+level = "advanced"
+apply = "live"
+
+[option."stereo.cursor"]
+type = "enum"
+label = "Map and menu cursor"
+help = "Depth draws a ring at the surface under the mouse pointer or left-stick cursor in each eye."
+values = [
+  { value = "game", label = "Game's cursor" },
+  { value = "depth", label = "At scene depth" },
+]
 level = "advanced"
 apply = "live"
 

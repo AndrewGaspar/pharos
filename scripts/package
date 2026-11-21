@@ -11,3 +11,11 @@ cp "$root/build/d3d11.dll" "$root/build/mod/"
 cp "$sdk/lib/Windows_x86_64/rel/nvngx_dlss.dll" "$sdk/lib/Windows_x86_64/rel/nvngx_dlssg.dll" "$root/build/mod/"
 cp "$root/dist/pharos.ini" "$root/dist/quiver-options.toml" "$root/build/mod/"
 echo "build/mod: $(ls "$root/build/mod" | tr '\n' ' ')"
+if [[ ${1:-} == --quiver ]]; then
+  # Preserve the Pharos release defaults. Quiver applies the player's overrides on launch.
+  sed -i -e '/^\[cloth\]/,/^\[/s/^mode=.*/mode=render/' \
+         -e '/^\[world\]/,/^\[/s/^lod_distance=.*/lod_distance=2/' \
+         -e '/^\[world\]/,/^\[/s/^npc_density=.*/npc_density=40/' \
+         -e '/^\[world\]/,/^\[/s/^npc_units=.*/npc_units=8/' \
+         -e '/^\[stereo\]/,/^\[/s/^cursor=.*/cursor=depth/' "$root/build/mod/pharos.ini"
+fi

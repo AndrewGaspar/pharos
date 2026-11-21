@@ -144,6 +144,7 @@ void fill_main(MainView& mv, const F4* c) {
 
 std::mutex g_main_mutex;
 F4 g_main_v2w[3];        // latest main view's viewToWorld rows (mono)
+F4 g_main_c2v[4];        // and its ClipXYZToViewPos rows (cursor depth)
 float g_main_m00 = 0;    // and its projection's m00
 bool g_main_valid = false;
 MainView g_last_main;    // and the rest of it (effect cameras, any context)
@@ -151,6 +152,7 @@ MainView g_last_main;    // and the rest of it (effect cameras, any context)
 void note_main(const F4* c, const MainView& mv) {
   std::lock_guard lock(g_main_mutex);
   memcpy(g_main_v2w, c + kViewToWorld, sizeof(g_main_v2w));
+  memcpy(g_main_c2v, c + kClipToView, sizeof(g_main_c2v));
   g_main_m00 = c[kProj].x;
   g_main_valid = true;
   g_last_main = mv;
@@ -1196,6 +1198,14 @@ void cam_before_execute(ID3D11DeviceContext* imm, ID3D11CommandList* cl, int eye
   auto* h = static_cast<ClChunks*>(u);
   for (auto& ch : h->chunks) upload_chunk(imm, *ch, eye);
   u->Release();
+}
+
+bool cam_cursor_view(float* m00, float clip_to_view[4][4]) {
+  std::lock_guard lock(g_main_mutex);
+  if (!g_main_valid) return false;
+  *m00 = g_main_m00;
+  for (int r = 0; r < 4; ++r) memcpy(&clip_to_view[r][0], &g_main_c2v[r].x, 16);
+  return true;
 }
 
 void cam_on_present(bool stereo_on) {
