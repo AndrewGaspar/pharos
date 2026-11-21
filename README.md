@@ -6,6 +6,8 @@ city crowds. Named after the Lighthouse of Alexandria.
 
 Development ports for Odyssey (Aegis) and Valhalla (Bifrost) are documented in [the port notes](docs/PORTS.md).
 
+The Origins lab also supports [face-mounted sensor rigs](docs/SENSOR_RIG.md) for virtual-clock camera and pose capture.
+
 Built with mingw; it loads as a `d3d11.dll` proxy. The exe is Denuvo + VMProtect protected and is
 never modified on disk: rendering changes happen at the D3D11 API level, and the world tweaks
 (crowds, LOD, cloth) adjust engine data and object vtables in memory at runtime.

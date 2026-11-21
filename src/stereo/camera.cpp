@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "core/config.h"
+#include "rig/capture.h"
 #include "core/hook.h"
 #include "core/log.h"
 #include "core/vtidx.h"
@@ -132,11 +133,14 @@ struct MainView {
   float c0p[3], c1p[3];
   float right[3], look[3];    // unit vectors
   float m00 = 0;
+  float depth_a = 0, depth_b = 0;
 };
 
 void fill_main(MainView& mv, const F4* c) {
   float m00 = c[kProj].x, m11 = c[kProj + 1].y;
   mv.m00 = m00;
+  mv.depth_a = c[kProj + 2].z;
+  mv.depth_b = c[kProj + 2].w;
   for (int i = 0; i < 3; ++i) {
     const F4& v = c[kViewToWorld + i];
     const F4& w = c[kViewToWorldPrev + i];
@@ -261,6 +265,12 @@ UINT imm_alloc(UINT bytes) {
 bool g_pool_failed = false;
 
 struct Chunk {
+  struct RigSlot {
+    UINT offset;
+    rig::Slot kind;
+    float depth_a, depth_b;
+  };
+  std::vector<RigSlot> rig_slots;
   UINT base = 0;  // offset in the pool
   UINT used = 0;
   std::vector<uint8_t> eye[2];
@@ -421,7 +431,15 @@ UINT put_slot(CamCtx* cs, const void* l, const void* r, UINT size) {
 void upload_chunk(ID3D11DeviceContext* imm, const Chunk& ch, int eye) {
   if (!ch.used) return;
   D3D11_BOX b{ch.base, 0, 0, ch.base + ch.used, 1, 1};
-  imm->UpdateSubresource(g_pool, 0, &b, ch.eye[eye].data(), 0, 0);
+  const uint8_t* bytes = ch.eye[eye].data();
+  thread_local std::vector<uint8_t> projected;
+  if (const auto* view = rig::replay_view(); view && !ch.rig_slots.empty()) {
+    projected.assign(bytes, bytes + ch.used);
+    for (const auto& slot : ch.rig_slots)
+      rig::project(slot.kind, projected.data() + slot.offset, *view, slot.depth_a, slot.depth_b);
+    bytes = projected.data();
+  }
+  imm->UpdateSubresource(g_pool, 0, &b, bytes, 0, 0);
   st_uploads.fetch_add(1, std::memory_order_relaxed);
   st_upload_bytes.fetch_add(ch.used, std::memory_order_relaxed);
 }
@@ -447,6 +465,7 @@ enum FxKind : uint8_t {
   kFxP2W,        // cloud composite: (cs.x, cs.y, 1) -> view direction (rows, .x .y .w), cs ~ NDC
   kFxRayTL,      // cloud ray march: ray = PlaneTopLeft + u PlaneRight - v PlaneUp
   kFxRayR,
+  kFxRayUp,
 };
 
 enum FxGroup : uint8_t { kGrSSR, kGrFog, kGrClouds, kGrCloudMarch, kGrShadow, kGrFlare, kGrCount };
@@ -465,9 +484,10 @@ const FxCbuffer kFxCbuffers[] = {
     {"NewSSLRShared_cbuffer", kGrSSR, {{"worldToProj", kFxVP}, {"prevWorldToProj", kFxVPPrev}}},
     {"VolumetricFogAllParamsCustomLayout_cbuffer", kGrFog, {{"SSToWS", kFxSS2WS}, {"EyePositionWS", kFxPos}}},
     {"CloudsCompositeViewCache_cbuffer", kGrClouds, {{"Proj2World", kFxP2W}}},
-    {"CloudsRayMarch_cbuffer", kGrCloudMarch, {{"PlaneTopLeft", kFxRayTL}, {"PlaneRight", kFxRayR}}},
-    {"ShadowMaskStabilization_cbuffer", kGrShadow,
-     {{"LastSSToWS", kFxSS2WSPrev}, {"SSToWS", kFxSS2WS}}},
+    {"CloudsRayMarch_cbuffer",
+     kGrCloudMarch,
+     {{"PlaneTopLeft", kFxRayTL}, {"PlaneRight", kFxRayR}, {"PlaneUp", kFxRayUp}}},
+    {"ShadowMaskStabilization_cbuffer", kGrShadow, {{"LastSSToWS", kFxSS2WSPrev}, {"SSToWS", kFxSS2WS}}},
     {"SunFlareOcclusion_cbuffer", kGrFlare, {{"ViewProj", kFxVP}}},
 };
 
@@ -640,6 +660,8 @@ const char* kind_name(FxKind k) {
     case kFxP2W: return "proj2world";
     case kFxRayTL: return "ray";
     case kFxRayR: return "ray-right";
+    case kFxRayUp:
+      return "ray-up";
   }
   return "?";
 }
@@ -659,13 +681,14 @@ void log_field(const char* what, uint64_t hash, UINT slot, const FxField& f, con
 
 // Moves the fields of one constant buffer (l = left eye's copy, r = right's; both start as the
 // game's data, `bytes` long). Returns the number of fields moved.
-int move_fields(const FxShader& fs, const FxSlot& slot, const MainView& mv, uint8_t* l, uint8_t* r, UINT bytes) {
+int move_fields(const FxShader& fs, const FxSlot& slot, const MainView& mv, uint8_t* l, uint8_t* r, UINT bytes,
+                std::vector<Chunk::RigSlot>& rig_fields) {
   int moved = 0;
   uint8_t* out[2] = {l, r};
   // The ray march's plane pair is handled together.
-  int ray_tl = -1, ray_r = -1;
+  int ray_up = -1, ray_r = -1;
   for (const FxField& f : slot.fields) {
-    if (f.kind == kFxRayTL) ray_tl = int(f.offset);
+    if (f.kind == kFxRayUp) ray_up = int(f.offset);
     if (f.kind == kFxRayR) ray_r = int(f.offset);
   }
   for (const FxField& f : slot.fields) {
@@ -673,11 +696,15 @@ int move_fields(const FxShader& fs, const FxSlot& slot, const MainView& mv, uint
     if (f.offset + need > bytes) continue;
     const F4* m = reinterpret_cast<const F4*>(l + f.offset);
     bool ok = false;
+    auto field = [&](rig::Slot kind, UINT off) {
+      if (rig::armed()) rig_fields.push_back({off, kind, mv.depth_a, mv.depth_b});
+    };
     switch (f.kind) {
       case kFxVP:
       case kFxVPPrev: {
         bool cur = match_vp(m, mv.vp), prev = match_vp(m, mv.vpp);
         if (!cur && !prev) break;
+        field(rig::Slot::ViewProjection, f.offset);
         bool use_prev = prev && (f.kind == kFxVPPrev || !cur);
         F4 mm[4];
         memcpy(mm, m, sizeof(mm));
@@ -699,6 +726,7 @@ int move_fields(const FxShader& fs, const FxSlot& slot, const MainView& mv, uint
         F4 mm[4];
         memcpy(mm, m, sizeof(mm));
         bool affine = std::fabs(mm[3].x) + std::fabs(mm[3].y) + std::fabs(mm[3].z) < 1e-6f && std::fabs(mm[3].w - 1.0f) < 1e-6f;
+        if (affine) field(rig::Slot::ScreenToWorld, f.offset);
         for (int e = 0; e < 2; ++e) {
           F4* d = reinterpret_cast<F4*>(out[e] + f.offset);
           memcpy(d, mm, sizeof(mm));
@@ -719,6 +747,7 @@ int move_fields(const FxShader& fs, const FxSlot& slot, const MainView& mv, uint
       case kFxPos: {
         bool cur = near3(&m->x, mv.pos, 0.01f), prev = near3(&m->x, mv.posp, 0.01f);
         if (!cur && !prev) break;
+        field(rig::Slot::EyePosition, f.offset);
         for (int e = 0; e < 2; ++e) {
           float* d = reinterpret_cast<float*>(out[e] + f.offset);
           const float* dd = cur ? mv.eye[e].d : mv.eye[e].dp;
@@ -743,6 +772,7 @@ int move_fields(const FxShader& fs, const FxSlot& slot, const MainView& mv, uint
         float cx[3] = {m[0].x, m[1].x, m[2].x};
         float c = dot3f(cx, mv.right) / (len3(cx) + 1e-12f);
         if (std::fabs(c) < 0.999f || std::fabs(slope) < 1e-3f) break;
+        field(rig::Slot::CloudProjection, f.offset);
         for (int e = 0; e < 2; ++e) {
           F4* d = reinterpret_cast<F4*>(out[e] + f.offset);
           float kcs = mv.eye[e].k / slope;
@@ -774,6 +804,9 @@ int move_fields(const FxShader& fs, const FxSlot& slot, const MainView& mv, uint
         float mid[3];
         for (int i = 0; i < 3; ++i) mid[i] = tl[i] + 0.5f * pr[i];
         if (std::fabs(std::fabs(slope) - 2.0f) > 0.2f || std::fabs(ndc_x(mv, mid)) > 0.2f) break;
+        field(rig::Slot::RayTopLeft, f.offset);
+        field(rig::Slot::RayRight, ray_r);
+        if (ray_up >= 0 && UINT(ray_up) + 16 <= bytes) field(rig::Slot::RayUp, ray_up);
         for (int e = 0; e < 2; ++e) {
           float* d = reinterpret_cast<float*>(out[e] + f.offset);
           float du = mv.eye[e].k / slope;
@@ -784,7 +817,9 @@ int move_fields(const FxShader& fs, const FxSlot& slot, const MainView& mv, uint
         ok = true;
         break;
       }
-      case kFxRayR: continue;  // with kFxRayTL
+      case kFxRayUp:
+      case kFxRayR:
+        continue;  // with kFxRayTL
     }
     if (ok) {
       moved++;
@@ -1088,6 +1123,16 @@ unsigned cam_filter(ID3D11DeviceContext* ctx, CamStage stage, UINT start, UINT n
     } else {
       poff = put_slot(cs, l, r, size);
     }
+    if (rig::armed() && (slot == kInstanceSlot || src[kEyePos].x || src[kEyePos].y || src[kEyePos].z)) {
+      auto& chunk = ctx == g_imm ? imm_up[n_up - 1] : cs->chunks.back();
+      auto kind = slot == kInstanceSlot ? rig::Slot::Instance : cs->main.valid ? rig::Slot::Main : rig::Slot::Screen;
+      float a = cs->main.depth_a, b = cs->main.depth_b;
+      if (kind == rig::Slot::Screen && src[kClipToView + 3].z != 0) {
+        b = 1 / src[kClipToView + 3].z;
+        a = src[kClipToView + 3].w * b;
+      }
+      if (b > 0) chunk->rig_slots.push_back({poff - chunk->base, kind, a, b});
+    }
     out_buf[i] = g_pool;
     out_first[i] = poff / 16;
     out_num[i] = ((size + 255) / 256) * 16;
@@ -1198,6 +1243,7 @@ void cam_effect_begin(ID3D11DeviceContext* ctx, CamStage st, ID3D11DeviceChild* 
   thread_local std::vector<uint8_t> lb[CamFx::kMax], rb[CamFx::kMax];
   UINT poff[CamFx::kMax], pbytes[CamFx::kMax];
   bool use[CamFx::kMax] = {};
+  std::vector<Chunk::RigSlot> fields[CamFx::kMax];
   bool imm = ctx == g_imm;
   {
     std::lock_guard lock(cs->mutex);
@@ -1242,8 +1288,18 @@ void cam_effect_begin(ID3D11DeviceContext* ctx, CamStage st, ID3D11DeviceChild* 
       rb[i].assign(pbytes[i], 0);
       memcpy(lb[i].data(), sh->data.data() + off, bytes);
       memcpy(rb[i].data(), sh->data.data() + off, bytes);
-      if (!move_fields(fs, *bd.sl, mv, lb[i].data(), rb[i].data(), bytes)) continue;
-      if (!imm) poff[i] = put_slot(cs, lb[i].data(), rb[i].data(), pbytes[i]);
+      if (!move_fields(fs, *bd.sl, mv, lb[i].data(), rb[i].data(), bytes, fields[i])) continue;
+      if (!imm) {
+        poff[i] = put_slot(cs, lb[i].data(), rb[i].data(), pbytes[i]);
+        for (auto field : fields[i]) {
+          auto& chunk = *cs->chunks.back();
+          field.offset += poff[i] - chunk.base;
+          chunk.rig_slots.push_back(field);
+        }
+      } else if (const auto* v = rig::replay_view()) {
+        for (auto field : fields[i])
+          rig::project(field.kind, rb[i].data() + field.offset, *v, field.depth_a, field.depth_b);
+      }
       use[i] = true;
     }
   }

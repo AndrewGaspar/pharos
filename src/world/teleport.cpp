@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "core/lab.h"
+#include "rig/capture.h"
 #include "core/log.h"
 
 namespace aco {
@@ -43,23 +44,25 @@ bool readable(uintptr_t p, size_t n) {
 
 uintptr_t read_ptr(uintptr_t p) { return readable(p, 8) ? *reinterpret_cast<uintptr_t*>(p) : 0; }
 
-bool valid_entity(uintptr_t e) {
+bool valid_entity(uintptr_t e, bool upright = true) {
   if (!readable(e, kPos + 16) || read_ptr(e) != image_base() + kEntityVtRva) return false;
   const float* up = reinterpret_cast<const float*>(e + kUp);
   const float* pos = reinterpret_cast<const float*>(e + kPos);
   for (int i = 0; i < 3; ++i)
     if (!std::isfinite(pos[i]) || std::fabs(pos[i]) > 1e5f) return false;
-  return std::fabs(up[2] - 1.0f) < 0.05f && pos[3] == 1.0f;  // upright, homogeneous w = 1
+  if (upright) return std::fabs(up[2] - 1.0f) < 0.05f && pos[3] == 1.0f;
+  const float norm2 = up[0] * up[0] + up[1] * up[1] + up[2] * up[2];
+  return std::fabs(norm2 - 1) < 0.1f && pos[3] == 1.0f;
 }
 
-uintptr_t find_player() {
+uintptr_t find_player(bool upright = true) {
   static uintptr_t last = 1;
   uintptr_t found = 0;
   std::string diag;
   for (const Chain& c : kChains) {
     uintptr_t root = read_ptr(image_base() + c.rva);
     uintptr_t e = root ? read_ptr(root + c.off) : 0;
-    bool ok = valid_entity(e);
+    bool ok = valid_entity(e, upright);
     if (ok && !found) found = e;
     char b[96];
     snprintf(b, sizeof(b), " [%#llx+%#llx]=%p%s", (unsigned long long)c.rva, (unsigned long long)c.off,
@@ -345,6 +348,37 @@ bool camera_at_player_head() {
 }
 
 void teleport_register() {
+  rig::register_anchor("face", [](rig::Pose& out) {
+    uintptr_t entity = find_player(false);
+    if (!entity || !readable(entity + 0xd8, 10)) return false;
+    uintptr_t components = read_ptr(entity + 0xd8);
+    auto count = *reinterpret_cast<const uint16_t*>(entity + 0xe0);
+    if (count > 512 || !readable(components, count * sizeof(uintptr_t))) return false;
+    for (unsigned i = 0; i < count; ++i) {
+      auto component = read_ptr(components + sizeof(uintptr_t) * i);
+      if (read_ptr(component) != image_base() + 0x35f5508 || read_ptr(component + 0x10) != entity) continue;
+      auto look = read_ptr(component + 0xb0);
+      auto runtime = read_ptr(component + 0x4c0);
+      if (read_ptr(look) != image_base() + 0x35f4228 || read_ptr(runtime + 0x1a8) != component ||
+          read_ptr(runtime + 0x1b0) != look || !readable(runtime + 0x1e8, 10) ||
+          *reinterpret_cast<const uint16_t*>(runtime + 0x1f0) != 9)
+        return false;
+      auto chain = read_ptr(runtime + 0x1e8);
+      if (!readable(chain, 9 * 32)) return false;
+      // LookAtData's evaluated world-space chain ends in head and two eyes.
+      // The eye joints can turn independently. Use the head's orientation for the mount.
+      rig::Quat head;
+      rig::Vec a, b;
+      memcpy(&head, reinterpret_cast<void*>(chain + 13 * 16), sizeof(head));
+      memcpy(&a, reinterpret_cast<void*>(chain + 14 * 16), sizeof(a));
+      memcpy(&b, reinterpret_cast<void*>(chain + 16 * 16), sizeof(b));
+      float ipd2 = (a - b).dot(a - b);
+      if (!head.unit() || !(ipd2 > 0.04f * 0.04f && ipd2 < 0.09f * 0.09f)) return false;
+      out = {(a + b) * 0.5f, head * rig::Quat{{0, 0.70710678f, -0.70710678f}, 0}};
+      return true;
+    }
+    return false;
+  });
   if (!lab_active()) return;
   // `quiver lab where <i>`: player position and heading, render camera (Z up, yaw 0 = +X, 90 = +Y).
   lab_verb("where", [](const std::vector<std::string>&, bool& ok) -> std::string {

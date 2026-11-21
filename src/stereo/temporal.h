@@ -37,6 +37,7 @@ struct TemporalPresentScope {
 void tmp_init(ID3D11Device* dev, ID3D11DeviceContext* imm);
 // Learning bookkeeping, every frame; frame_size = immediate-context calls recorded this frame.
 void tmp_frame_end(bool stereo_on, ID3D11Resource* backbuffer, size_t frame_size);
+void tmp_rig_history(ID3D11DeviceContext* imm, bool save);
 void tmp_before_right(ID3D11DeviceContext* imm);  // left eye's state out, right eye's in
 void tmp_after_right(ID3D11DeviceContext* imm);   // right eye's state out, left eye's in
 void tmp_relearn();

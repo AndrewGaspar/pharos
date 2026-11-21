@@ -1,3 +1,4 @@
+#include "rig/capture.h"
 #include "core/d3d11_title.h"
 #include "core/ctxhooks.h"
 
@@ -169,6 +170,7 @@ inline void draw_common(ID3D11DeviceContext* self, const char* op, const char* a
   tmp_on_draw(self);
   trace_draw(self, op, args);
   ShaderClass c = ps_class(self);
+  if (c == ShaderClass::SceneTonemap && rig::armed()) rig::scene_color(self);
   if (c == ShaderClass::UiSprite || c == ShaderClass::UiPlain || c == ShaderClass::UiRichText || c == ShaderClass::UiTourIntro) {
     UINT caption_offset;
     if (c != ShaderClass::UiRichText && panel_begin(self, c, &caption_offset)) {

@@ -63,6 +63,7 @@ ShaderClass classify(ShaderKind kind, const std::vector<uint8_t>& bc) {
       return ShaderClass::TemporalAA;
     return ShaderClass::None;
   }
+  if (title::origins && contains(bc, "HdrLightingPass_scene") && contains(bc, "HdrLightingPass_acesLUT")) return ShaderClass::SceneTonemap;
   if (contains(bc, "ConvertLinearZParams_DepthBufferSampler")) return ShaderClass::LinearZ;
   if (contains(bc, "UICompositingParameters_cbuffer")) return ShaderClass::UIComposite;
   if (cam_effect_bytecode(bc.data(), bc.size())) return ShaderClass::CamEffect;
@@ -140,6 +141,7 @@ const char* shader_class_name(ShaderClass c) {
     case ShaderClass::UiTourIntro: return "UI animated panel";
     case ShaderClass::UiPlain: return "UI sprite";
     case ShaderClass::TemporalAA: return "TemporalAA";
+    case ShaderClass::SceneTonemap: return "SceneTonemap";
     case ShaderClass::LinearZ: return "LinearZ";
     case ShaderClass::UIComposite: return "UIComposite";
     case ShaderClass::Culling: return "Culling";

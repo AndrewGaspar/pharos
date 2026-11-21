@@ -1,4 +1,5 @@
 #include "world/world.h"
+#include "rig/capture.h"
 
 #include <windows.h>
 #include <d3d11_1.h>
@@ -172,7 +173,17 @@ void world_on_culling_dispatch(ID3D11DeviceContext* ctx, const std::function<voi
   } else {
     g_unshadowed.fetch_add(1, std::memory_order_relaxed);
   }
-  if (active && far_mode) {
+  // The display camera's visibility and hierarchical depth buffer cannot cull
+  // the other directions of a sensor rig. Leave square shadow-map jobs alone.
+  bool rig_views = rig::armed() && have && f_at(data, kVPosToUV + 8) != f_at(data, kVPosToUV + 12);
+  if (rig_views) {
+    uint32_t flags;
+    memcpy(&flags, data + kCullingFlags, 4);
+    flags &= ~(0x10u | 4u);
+    memcpy(data + kCullingFlags, &flags, 4);
+    memset(data + 544, 0, 8);  // FrustumPlaneCount and AntiFrustumPlaneCount
+  }
+  if (active && far_mode && !rig_views) {
     cb->Release();
     if (c1) c1->Release();
     ID3D11ComputeShader* v = cs ? far_variant(ctx, cs, cfg.world_lod_distance) : nullptr;
@@ -187,7 +198,7 @@ void world_on_culling_dispatch(ID3D11DeviceContext* ctx, const std::function<voi
     if (cs) cs->Release();
     return;
   }
-  ID3D11Buffer* own = (active && have) ? own_buffer(ctx) : nullptr;
+  ID3D11Buffer* own = ((active || rig_views) && have) ? own_buffer(ctx) : nullptr;
   if (!own) {
     cb->Release();
     if (c1) c1->Release();

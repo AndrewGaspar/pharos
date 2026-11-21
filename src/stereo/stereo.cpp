@@ -1,4 +1,5 @@
 #include "stereo/stereo.h"
+#include "rig/capture.h"
 
 #include <windows.h>
 #include <d3d11_1.h>
@@ -386,16 +387,18 @@ void compose_wide(IDXGISwapChain* sc, ID3D11Texture2D* left, ID3D11Texture2D* ri
 
 void stereo_on_present(IDXGISwapChain* sc, PFN_GetBuffer real_get_buffer) {
   const Config& cfg = config();
+  rig::poll();
   S.real_get_buffer = real_get_buffer;
   if (cfg.stereo_mode != "off") hypr_start();
   bool display_stereo = hypr_display_stereo() == 1;
-  bool want = (cfg.stereo_mode == "sbs" || (cfg.stereo_mode == "auto" && display_stereo)) && S.dev && S.imm1 &&
-              !S.failed && !fg12_proxy_on();
+  bool stereo_display = cfg.stereo_mode == "sbs" || (cfg.stereo_mode == "auto" && display_stereo);
+  bool want = (rig::armed() || stereo_display) && S.dev && S.imm1 && !S.failed && !fg12_proxy_on();
   bool wide = sc == S.wide_sc;
   RecFrame* f = rec_stop();
   TemporalPresentScope compositor;
   cam_on_present(want);
   if (!want) {
+    if (rig::armed()) rig::abort_capture("D3D11 replay backend unavailable");
     marker_history_reset();
     cursor_set_active(false);
     tmp_frame_end(false, nullptr, 0);
@@ -428,7 +431,37 @@ void stereo_on_present(IDXGISwapChain* sc, PFN_GetBuffer real_get_buffer) {
     got = SUCCEEDED(sc->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&bb)));
   }
   bool ready = got && ensure_device_objects() && ensure_targets(bb);
-  if (rec_frame_ok(f, &why) && ready) {
+  bool replayable = rec_frame_ok(f, &why) && ready;
+  if (rig::armed()) {
+    bool saved = false;
+    rig::capture(
+        S.imm,
+        [&] {
+          if (!saved) {
+            S.imm->CopyResource(S.eye[0], bb);
+            tmp_rig_history(S.imm, true);
+            saved = true;
+          } else
+            tmp_rig_history(S.imm, false);
+          g_eye.store(1, std::memory_order_relaxed);
+          rec_replay(f, S.imm);
+          g_eye.store(0, std::memory_order_relaxed);
+        },
+        replayable ? nullptr : (why ? why : "stereo resources unavailable"));
+    if (saved) {
+      tmp_rig_history(S.imm, false);
+      S.imm->CopyResource(bb, S.eye[0]);
+    }
+    if (!stereo_display) {
+      if (wide && bb) compose_wide(sc, bb, bb);
+      tmp_frame_end(true, bb, rec_frame_size(f));
+      if (bb) bb->Release();
+      rec_free(f);
+      rec_start();
+      return;
+    }
+  }
+  if (replayable) {
     S.hold_frames = 3;
     cursor_set_active(cfg.stereo_cursor == "depth" && S.eye_uav[0] && S.eye_uav[1] && cursor_ready(S.dev));
     double t0 = now_ms();

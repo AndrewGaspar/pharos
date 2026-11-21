@@ -29,6 +29,8 @@ set(D3D11_RENDER_SOURCES
   src/fg/fg_d3d12.cpp
   src/fg/vk_device_ext.cpp
   src/core/ctxhooks.cpp
+  src/rig/capture.cpp
+  src/rig/projection.cpp
   src/stereo/record.cpp
   src/stereo/stereo.cpp
   src/stereo/camera.cpp

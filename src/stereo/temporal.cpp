@@ -406,6 +406,13 @@ void tmp_frame_end(bool stereo_on, ID3D11Resource* backbuffer, size_t frame_size
   g_found.clear();
 }
 
+void tmp_rig_history(ID3D11DeviceContext* imm, bool save) {
+  std::lock_guard lock(g_mutex);
+  ++g_internal;
+  for (auto& t : g_twins) imm->CopyResource(save ? t.eye[0] : t.res, save ? t.res : t.eye[0]);
+  --g_internal;
+}
+
 void tmp_before_right(ID3D11DeviceContext* imm) {
   std::vector<Twin> twins;
   bool seeded;
