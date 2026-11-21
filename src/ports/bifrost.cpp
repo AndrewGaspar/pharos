@@ -7,6 +7,7 @@
 
 #include "core/hook.h"
 #include "dlss/ngx.h"
+#include "ports/bifrost_present.h"
 #include "ports/bifrost_resources.h"
 #include "ports/common.h"
 
@@ -64,7 +65,8 @@ void check_features(ID3D12Device* dev) {
 
 const GUID root_layout_tag = {0xaaf1f067, 0xa3c3, 0x4b85, {0x86, 0x1f, 0x59, 0x5e, 0x3f, 0xf0, 0x76, 0x39}};
 
-// Both root signature versions expose the same register/space/table-offset fields.
+// Both root signature versions expose the same register/space/table-offset
+// fields.
 template <typename Desc>
 std::string layout(const Desc& desc) {
   std::ostringstream s;
@@ -158,6 +160,7 @@ void WINAPI bind(ID3D12GraphicsCommandList* list, ID3D12PipelineState* pso) {
 HRESULT WINAPI reset(ID3D12GraphicsCommandList* list, ID3D12CommandAllocator* allocator, ID3D12PipelineState* pso) {
   auto hr = orig<decltype(reset)>(list, port::reset_list)(list, allocator, pso);
   if (SUCCEEDED(hr)) {
+    bifrost::clear_frame_size(list);
     bifrost::reset_inputs(list, pso);
     observe(pso);
   }
@@ -188,6 +191,7 @@ extern "C" HRESULT WINAPI bifrost_create(IUnknown* adapter, D3D_FEATURE_LEVEL le
     ComPtr<ID3D12Device> dev;
     if (SUCCEEDED(static_cast<IUnknown*>(*out)->QueryInterface(IID_PPV_ARGS(&dev)))) {
       log_init(L"bifrost.log");
+      bifrost::observe_factory(adapter);
       bifrost::observe_descriptors(dev.Get());
       ACO_LOG("Bifrost: D3D12 device, requested feature level 0x%x", level);
       hook_vtable(dev.Get(), port::create_root, reinterpret_cast<void*>(root_signature));

@@ -18,5 +18,5 @@ mkdir -p "$out"
 cp "$build/ports/$target/$proxy.dll" "$out/"
 sdk=$root/third_party/DLSS-310.9.16/lib/Windows_x86_64/rel
 cp "$sdk/nvngx_dlss.dll" "$sdk/nvngx_dlssg.dll" "$out/"
-if [[ $target == aegis ]]; then cp "$root/dist/aegis.ini" "$out/"; fi
+if [[ $target == aegis || $target == bifrost ]]; then cp "$root/dist/$target.ini" "$out/"; fi
 echo "$out"

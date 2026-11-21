@@ -3,6 +3,10 @@
 
 #include <cstddef>
 namespace port {
+extern const size_t topology = offsetof(ID3D12GraphicsCommandListVtbl, IASetPrimitiveTopology) / sizeof(void*);
+extern const size_t viewports = offsetof(ID3D12GraphicsCommandListVtbl, RSSetViewports) / sizeof(void*);
+extern const size_t scissors = offsetof(ID3D12GraphicsCommandListVtbl, RSSetScissorRects) / sizeof(void*);
+extern const size_t execute = offsetof(ID3D12CommandQueueVtbl, ExecuteCommandLists) / sizeof(void*);
 extern const size_t committed = offsetof(ID3D12DeviceVtbl, CreateCommittedResource) / sizeof(void*);
 extern const size_t placed = offsetof(ID3D12DeviceVtbl, CreatePlacedResource) / sizeof(void*);
 extern const size_t create_root = offsetof(ID3D12DeviceVtbl, CreateRootSignature) / sizeof(void*);

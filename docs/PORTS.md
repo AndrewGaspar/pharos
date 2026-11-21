@@ -11,7 +11,7 @@ scripts/package-port odyssey "/path/to/Assassin's Creed Odyssey"
 scripts/package-port valhalla "/path/to/Assassin's Creed Valhalla"
 
 quiver lab edit aegis dll.d3d11=n,b env.PROTON_ENABLE_NVAPI=1 env.DXVK_ENABLE_NVAPI=1
-quiver lab edit bifrost dll.d3d12=n,b env.PROTON_ENABLE_NVAPI=1
+quiver lab edit bifrost dll.d3d12=n,b env.PROTON_ENABLE_NVAPI=1 env.VKD3D_CONFIG=descriptor_heap
 quiver lab up aegis
 quiver lab launch aegis --mod build/ports/aegis/mod --wait frame
 quiver lab up bifrost
@@ -38,4 +38,6 @@ In the tiled TAA geometry draw, space 2 holds six inputs at t0–t5 (RGBA8, RGBA
 
 The active camera CBV is b0/space1, and the temporal CBV is b0/space2. Touch `capture-camera` in a Bifrost run directory to write their current contents to `bifrost-camera.tsv`. Run r7 found current/previous eye positions at float4 rows 2/3, current camera-to-world rows 6–9, projection 26–29, view-projection 30–33, previous view-projection 38–41 and inverse projection 69–72. Temporal rows 1/2 held display/render sizes and their reciprocals. Row 3.xy held jitter in pixels. The sampled jitter (−0.125, −0.388889) agreed with the projection's offsets at 1280×720.
 
-NGX reported SR and FG available on Valhalla's D3D12 device. The native command-list work still needs motion reconstruction, feature evaluation, frame presentation and independent per-eye command streams and histories.
+Bifrost's native 2× frame generation uses the presenting D3D12 graphics queue. A fullscreen pass at the geometry TAA draw copies scene color, decodes packed motion to previous-minus-current UV coordinates, reprojects sky motion, and inverts the engine's linear depth conversion. The original draw's state and all three game TAA outputs are preserved. DLSS-G consumes those motion and depth images, the engine camera and the finished backbuffer. The swapchain presents the interpolated image followed by the untouched real image. The display's refresh rate sets the cadence. Use `[fg] enabled=0` to disable generation or `verify=1` for GPU pixel readback in SDR.
+
+On the 60 Hz Valhalla lab display, r12 delivered 300 more rendered and 300 more generated frames over ten seconds on the animated title. One GPU sample measured differences of 1.06/255 and 1.05/255 from the neighboring frames. Of the samples that changed by more than 8/255 between real frames, 88.2% of the generated values lay strictly between them. The TAA and UI lists were consecutive entries 51 and 52 in one 54-list graphics submission. Native SR substitution, multi-frame generation, gameplay validation and independent stereo eye streams remain in development.
