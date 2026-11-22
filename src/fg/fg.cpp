@@ -1,4 +1,6 @@
 #include "fg/fg.h"
+#include "fg/color.h"
+#include "core/ctxhooks.h"
 
 #include <windows.h>
 #include <d3d11.h>
@@ -139,6 +141,10 @@ struct State {
   ID3D11Texture2D* real = nullptr;
   ID3D11Texture2D* interp = nullptr;
   ID3D11Texture2D* outreal = nullptr;  // debug: DLSS-G's OutputReal ([fg] show=outreal)
+  fg_color::Converter converter;
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> input_pq, decoded;
+  Microsoft::WRL::ComPtr<ID3D11CommandList> encode, decode_interp, decode_outreal;
+  DXGI_COLOR_SPACE_TYPE color_space = DXGI_COLOR_SPACE_CUSTOM;
   ID3D11Texture2D* scratch = nullptr;  // output for generated frames we don't present
   ID3D11UnorderedAccessView* interp_uav = nullptr;  // debug: pre-fill with magenta
   uint32_t tex_w = 0, tex_h = 0;
@@ -566,8 +572,27 @@ void prune_views() {
   }
 }
 
-bool ensure_textures(const D3D11_TEXTURE2D_DESC& bb) {
-  if (S.real && S.tex_w == bb.Width && S.tex_h == bb.Height && S.tex_format == bb.Format) return true;
+bool ensure_textures(const D3D11_TEXTURE2D_DESC& bb, DXGI_COLOR_SPACE_TYPE cs) {
+  if (S.real && S.tex_w == bb.Width && S.tex_h == bb.Height && S.tex_format == bb.Format && S.color_space == cs)
+    return true;
+  bool convert = fg_color::needs_pq(cs, bb.Format);
+  static DXGI_COLOR_SPACE_TYPE last_cs = DXGI_COLOR_SPACE_CUSTOM;
+  static DXGI_FORMAT last_fmt = DXGI_FORMAT_UNKNOWN;
+  static int64_t next_try = 0;
+  if (cs != last_cs || bb.Format != last_fmt) {
+    S.converter.retry_shader();
+    last_cs = cs;
+    last_fmt = bb.Format;
+    next_try = 0;
+  }
+  int64_t now = now_us();
+  if ((convert && S.converter.compiler_failed()) || now < next_try) return false;
+  next_try = now + 2000000;
+  S.encode.Reset();
+  S.decode_interp.Reset();
+  S.decode_outreal.Reset();
+  S.input_pq.Reset();
+  S.decoded.Reset();
   safe_release(S.real);
   safe_release(S.interp_uav);
   safe_release(S.interp);
@@ -587,15 +612,29 @@ bool ensure_textures(const D3D11_TEXTURE2D_DESC& bb) {
   std::vector<uint32_t> magenta(size_t(bb.Width) * bb.Height, 0xffff00ffu);
   D3D11_SUBRESOURCE_DATA init{magenta.data(), bb.Width * 4, 0};
   bool fill = config().fg_debug_fill && (bb.Format == DXGI_FORMAT_R8G8B8A8_UNORM || bb.Format == DXGI_FORMAT_B8G8R8A8_UNORM);
-  if (FAILED(S.dev->CreateTexture2D(&d, nullptr, &S.real)) ||
-      FAILED(S.dev->CreateTexture2D(&d, fill ? &init : nullptr, &S.interp)) ||
+  if (FAILED(S.dev->CreateTexture2D(&d, nullptr, &S.real))) return false;
+  if (convert) {
+    if (FAILED(S.dev->CreateTexture2D(&d, nullptr, &S.decoded))) { safe_release(S.real); return false; }
+    d.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
+    if (FAILED(S.dev->CreateTexture2D(&d, nullptr, &S.input_pq))) { safe_release(S.real); return false; }
+  }
+  if (FAILED(S.dev->CreateTexture2D(&d, fill ? &init : nullptr, &S.interp)) ||
       FAILED(S.dev->CreateTexture2D(&d, fill ? &init : nullptr, &S.outreal)) ||
       FAILED(S.dev->CreateTexture2D(&d, nullptr, &S.scratch))) {
     ACO_LOG("fg: failed to create %ux%u format %d textures", d.Width, d.Height, d.Format);
     safe_release(S.real);
     return false;
   }
+  if (S.input_pq && (!S.converter.record(S.dev, S.real, S.input_pq.Get(), true, &S.encode) ||
+                     !S.converter.record(S.dev, S.interp, S.decoded.Get(), false, &S.decode_interp) ||
+                     !S.converter.record(S.dev, S.outreal, S.decoded.Get(), false, &S.decode_outreal))) {
+    safe_release(S.real);
+    return false;
+  }
   S.dev->CreateUnorderedAccessView(S.interp, nullptr, &S.interp_uav);
+  S.color_space = cs;
+  next_try = 0;
+  S.reset = true;
   S.tex_w = bb.Width;
   S.tex_h = bb.Height;
   S.tex_format = bb.Format;
@@ -625,7 +664,7 @@ bool ensure_feature(uint32_t w, uint32_t h, uint32_t rw, uint32_t rh, VkFormat f
   for (const auto& kv : config().fg_create_extra) p.set(kv.first.c_str(), kv.second);
   // Which numbering NGX expects for the backbuffer format on Vulkan is undocumented; [fg]
   // bb_format_dxgi=1 passes the DXGI value of the backbuffer instead of the VkFormat.
-  unsigned int fmt_param = config().fg_bb_format_dxgi ? static_cast<unsigned int>(S.tex_format) : static_cast<unsigned int>(fmt);
+  unsigned int fmt_param = config().fg_bb_format_dxgi ? static_cast<unsigned int>(S.input_pq ? DXGI_FORMAT_R10G10B10A2_UNORM : S.tex_format) : static_cast<unsigned int>(fmt);
   p.set(NVSDK_NGX_DLSSG_Parameter_BackbufferFormat, fmt_param);
   p.set(NVSDK_NGX_DLSSG_Parameter_InternalWidth, rw);
   p.set(NVSDK_NGX_DLSSG_Parameter_InternalHeight, rh);
@@ -752,7 +791,8 @@ bool generate(const FgInputs& in, ID3D11Texture2D* swap_bb) {
   NVSDK_NGX_Resource_VK bb{}, depth{}, mv{}, out{}, outreal{}, hudless{};
   VkTex bb_t;
   // [fg] input=swapchain passes the game's (rotating) swapchain image itself; =copy our copy of it.
-  ID3D11Texture2D* input = config().fg_input == "copy" ? S.real : swap_bb;
+  ID3D11Texture2D* input = S.input_pq ? S.input_pq.Get() : config().fg_input == "copy" ? S.real : swap_bb;
+  if (S.encode) orig_ExecuteCommandList(S.imm, S.encode.Get(), TRUE);
   // [fg] swap_outputs=1 (debug): hand S.outreal to NGX as OutputInterpolated and S.interp as
   // OutputReal, to tell "parameter not honoured" from "texture not writable".
   bool swap = config().fg_swap_outputs;
@@ -768,7 +808,7 @@ bool generate(const FgInputs& in, ID3D11Texture2D* swap_bb) {
   p.set(NVSDK_NGX_DLSSG_Parameter_MVecs, static_cast<void*>(&mv));
   p.set(NVSDK_NGX_DLSSG_Parameter_OutputInterpolated, static_cast<void*>(&out));
   // HUD-less colour: the DLSS output (the scene at display resolution before the UI composite).
-  if (config().fg_hudless && in.hudless && ngx_res(in.hudless, false, &hudless)) {
+  if (!fg_color::is_hdr(S.color_space) && config().fg_hudless && in.hudless && ngx_res(in.hudless, false, &hudless)) {
     p.set(NVSDK_NGX_DLSSG_Parameter_HUDLess, static_cast<void*>(&hudless));
     p.set(NVSDK_NGX_DLSSG_Parameter_HUDLessSubrectWidth, S.tex_w);
     p.set(NVSDK_NGX_DLSSG_Parameter_HUDLessSubrectHeight, S.tex_h);
@@ -821,7 +861,7 @@ bool generate(const FgInputs& in, ID3D11Texture2D* swap_bb) {
   p.set(NVSDK_NGX_DLSSG_Parameter_CameraFar, 100000.0f);
   p.set(NVSDK_NGX_DLSSG_Parameter_CameraFOV, 1.0f);
   p.set(NVSDK_NGX_DLSSG_Parameter_CameraAspectRatio, float(S.tex_w) / float(S.tex_h));
-  p.set(NVSDK_NGX_DLSSG_Parameter_ColorBuffersHDR, 0u);
+  p.set(NVSDK_NGX_DLSSG_Parameter_ColorBuffersHDR, unsigned(fg_color::is_hdr(S.color_space)));
   p.set(NVSDK_NGX_DLSSG_Parameter_DepthInverted, 1u);
   p.set(NVSDK_NGX_DLSSG_Parameter_CameraMotionIncluded, 1u);
   p.set(NVSDK_NGX_DLSSG_Parameter_Reset, S.reset ? 1u : 0u);
@@ -970,7 +1010,7 @@ void fg_on_present(IDXGISwapChain*) { ++S.frames; }
 
 bool fg_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent real, HRESULT* hr) {
   const Config& cfg = config();
-  if (cfg.fg_mode == "d3d12" || fg12_proxy_active()) return fg12_present(sc, sync, flags, real, hr, S.frames);
+  if (cfg.fg_mode == "d3d12" || fg12_proxy_on(sc)) return fg12_present(sc, sync, flags, real, hr, S.frames);
   if (S.frames < 300) return false;
   if (cfg.fg_mode != "on") return false;
   if (S.ok) prune_views();
@@ -999,17 +1039,23 @@ bool fg_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent real,
   if (SUCCEEDED(sc->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&bb)))) {
     D3D11_TEXTURE2D_DESC bd;
     bb->GetDesc(&bd);
-    if (ensure_textures(bd)) {
+    auto cs = fg_color::space(sc, bd.Format);
+    if (fg_color::supported(cs, bd.Format) && ensure_textures(bd, cs)) {
       S.imm->CopyResource(S.real, bb);
       if (generate(in, bb)) {
+        auto display = [](ID3D11Texture2D* src) {
+          if (!S.decoded || src == S.real) return src;
+          orig_ExecuteCommandList(S.imm, src == S.interp ? S.decode_interp.Get() : S.decode_outreal.Get(), TRUE);
+          return S.decoded.Get();
+        };
         // Generated frame first (it lies between the previous real frame and this one) ...
         if (cfg.fg_show == "compare" || cfg.fg_show == "compare_gen") {
           // Debug: left half the input frame, right half OutputReal, both from this evaluation.
           D3D11_BOX left{0, 0, 0, S.tex_w / 2, S.tex_h, 1};
           S.imm->CopySubresourceRegion(bb, 0, 0, 0, 0, S.real, 0, &left);
-          S.imm->CopySubresourceRegion(bb, 0, S.tex_w / 2, 0, 0, cfg.fg_show == "compare_gen" ? S.interp : S.outreal, 0, &left);
+          S.imm->CopySubresourceRegion(bb, 0, S.tex_w / 2, 0, 0, display(cfg.fg_show == "compare_gen" ? S.interp : S.outreal), 0, &left);
         } else {
-          S.imm->CopyResource(bb, cfg.fg_show == "real" ? S.real : cfg.fg_show == "outreal" ? S.outreal : S.interp);
+          S.imm->CopyResource(bb, display(cfg.fg_show == "real" ? S.real : cfg.fg_show == "outreal" ? S.outreal : S.interp));
         }
         *hr = real(sc, sync, flags);
         int64_t t_gen = now_us();
@@ -1022,9 +1068,9 @@ bool fg_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent real,
           if (cfg.fg_show == "compare" || cfg.fg_show == "compare_gen") {
             D3D11_BOX left{0, 0, 0, S.tex_w / 2, S.tex_h, 1};
             S.imm->CopySubresourceRegion(bb2, 0, 0, 0, 0, S.real, 0, &left);
-            S.imm->CopySubresourceRegion(bb2, 0, S.tex_w / 2, 0, 0, cfg.fg_show == "compare_gen" ? S.interp : S.outreal, 0, &left);
+            S.imm->CopySubresourceRegion(bb2, 0, S.tex_w / 2, 0, 0, display(cfg.fg_show == "compare_gen" ? S.interp : S.outreal), 0, &left);
           } else {
-            S.imm->CopyResource(bb2, cfg.fg_show == "generated" ? S.interp : cfg.fg_show == "outreal" ? S.outreal : S.real);
+            S.imm->CopyResource(bb2, display(cfg.fg_show == "generated" ? S.interp : cfg.fg_show == "outreal" ? S.outreal : S.real));
           }
           bb2->Release();
         }

@@ -8,7 +8,7 @@ namespace aco {
 // draw hooks stay cheap for the ~20k uninteresting draws per frame.
 void ctxhooks_install_device(ID3D11Device* dev);
 void ctxhooks_install_context(ID3D11DeviceContext* ctx);
-ID3D11DeviceContext* immediate_context();
+bool ctxhooks_engine_renderer(ID3D11Device* dev);
 
 // Original (unhooked) implementations, for modules that must bypass their own hooks.
 HRESULT orig_FinishCommandList(ID3D11DeviceContext* ctx, BOOL restore, ID3D11CommandList** out);

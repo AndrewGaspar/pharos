@@ -16,10 +16,11 @@ bool fg12_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent rea
 // call) the game renders into a backbuffer of ours instead of the swapchain's.
 using PFN_GetBuffer = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, const _GUID&, void**);
 // Frame Generation's proxy back buffer + present thread is in use (decided at the first GetBuffer).
-bool fg12_proxy_on();
-HRESULT fg12_get_buffer(IDXGISwapChain* sc, UINT index, const _GUID& riid, void** out, PFN_GetBuffer real);
-void fg12_before_resize();
-bool fg12_proxy_active();
+bool fg12_proxy_on(IDXGISwapChain* sc);
+void fg12_copy_proxy(IDXGISwapChain* sc);
+HRESULT fg12_get_buffer(IDXGISwapChain* sc, UINT index, const _GUID& riid, void** out, PFN_GetBuffer real, bool eligible);
+void fg12_before_resize(IDXGISwapChain* sc);
+void fg12_after_resize(IDXGISwapChain* sc);
 // [fg] auto_cap: the real-frame-rate cap Frame Generation currently wants (0 = none); enforced by the
 // [reflex] limiter.
 float fg12_auto_cap();

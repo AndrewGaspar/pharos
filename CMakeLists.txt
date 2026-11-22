@@ -25,6 +25,7 @@ set(D3D11_RENDER_SOURCES
   src/core/mapstats.cpp
   src/reflex/reflex.cpp
   src/fg/camera.cpp
+  src/fg/color.cpp
   src/fg/fg.cpp
   src/fg/fg_d3d12.cpp
   src/fg/vk_device_ext.cpp

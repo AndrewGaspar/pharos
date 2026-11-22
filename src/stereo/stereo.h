@@ -22,7 +22,7 @@ bool stereo_wide(IDXGISwapChain* sc);  // sc is a 2x-wide (output = sbs) swapcha
 int stereo_eye();                     // 0 while the game's own submission runs, 1 during the replay
 
 // Swapchain layout (proxy.cpp's DXGI hooks).
-UINT stereo_swapchain_scale();  // width factor for a swapchain being created: 2 for output = sbs
+UINT stereo_swapchain_scale(HWND hwnd);  // width factor for a swapchain being created: 2 for output = sbs
 void stereo_swapchain_created(IDXGISwapChain* sc, UINT game_w, UINT game_h);  // after a 2x creation
 void stereo_swapchain_resized(IDXGISwapChain* sc, UINT game_w, UINT game_h);
 void stereo_adjust_desc(IDXGISwapChain* sc, UINT* width);  // GetDesc(1): the game sees its width

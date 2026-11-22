@@ -14,12 +14,11 @@ namespace aco {
 // Frame flow (AnvilNext 2.0, Origins): ... tonemap (LDR RGBA8, render res) -> TemporalAA resolve
 // (render res) -> UI composite (display res, samples the TAA output with UVs).
 //
-//  * TemporalAA draw (recorded on a deferred context): skipped. In its place we record our motion
-//    vector kernel (using the TAA's own constant buffers) and a copy of the input colour into the
-//    TAA output, then split the deferred command list at that point.
-//  * When the split list is executed on the immediate context, DLSS runs between the two halves.
-//  * UI composite draw: the TAA output SRV is swapped for the display-resolution DLSS output.
+//  * TemporalAA draw: record motion vectors and preserve the native TAA resolve and history.
+//  * When the split list executes on the immediate context, evaluate the upscaler.
+//  * UI composite: submit the draw with a matching successful output, otherwise use native TAA.
 void upscaler_init(ID3D11Device* dev, ID3D11DeviceContext* immediate);
+void upscaler_on_resize(IDXGISwapChain* sc);  // after a successful resize of the rendering chain
 void upscaler_on_present(IDXGISwapChain* sc);
 uint64_t upscaler_frame();  // identifier used by TAA jobs for the pending Present
 
@@ -58,6 +57,8 @@ struct FgInputs {
   FgCamera cam;
 };
 bool upscaler_fg_inputs(FgInputs* out);
+// Engine depth (AddRef'd) before Present advances the frame, including native TAA.
+ID3D11Texture2D* upscaler_cursor_depth(uint32_t& render_w, uint32_t& render_h);
 
 // Called from DllMain: applies render_scale from pharos.ini to the game's ACO.ini.
 void upscaler_preinit();

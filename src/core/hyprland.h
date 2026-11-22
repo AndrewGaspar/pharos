@@ -1,5 +1,7 @@
 #pragma once
 // Ported from torchbearer (src/core/hyprland.h, same author).
+#include <windef.h>
+
 #include <string>
 
 namespace aco {
@@ -20,14 +22,13 @@ void hypr_set_window_tag(const std::string& tag);
 
 // Start the background poll (window tag, display state) if running under Hyprland. Idempotent.
 void hypr_start();
-// Whether the game's monitor (its window's, else the focused one) is a HypXRland side-by-side
-// stereo output: 1 yes, 0 no, -1 unknown (not Hyprland, no answer yet). Updated each second;
-// hypr_display_stereo_now() asks right away (for start-up decisions, before the window exists).
+// Stereo on the mapped compositor client verified for this process. A missing client
+// is mono (0); unavailable IPC is unknown (-1). The startup probe uses the swapchain
+// HWND when supplied so auto can choose stereo before FG allocates a back buffer.
 int hypr_display_stereo();
-int hypr_display_stereo_now();
+int hypr_display_stereo_now(HWND hwnd = nullptr);
 
-// An environment variable of this process: the Windows environment, else the unix one
-// (/proc/self/environ: Wine doesn't copy every variable into the Windows environment).
+// An environment variable from Windows or, for variables Wine omits, its Unix environment.
 std::string process_env(const char* name);
 
 }  // namespace aco

@@ -63,17 +63,15 @@ See [docs/ENGINE_NOTES.md](docs/ENGINE_NOTES.md) for the reverse-engineered fram
 1. **Pass classification** — shaders are classified at creation by names in their DXBC reflection
    data (`TemporalAA_*`, `ConvertLinearZParams_*`, `UICompositingParameters_*`), so all ~60 TAA
    permutations are recognised without hashes.
-2. **TAA interception** — the TAA resolve draw (recorded on a deferred context) is skipped. In its
-   place we record:
-   - our motion-vector kernel, using the TAA pass's *own* constant buffers: decodes the engine's
-     packed RGBA8 velocity buffer and reprojects sky/far pixels with the camera matrices;
-   - a copy of the input colour into the TAA output (the next frame's lighting reads it);
-   - a **command-list split** (`FinishCommandList(TRUE)` mid-recording).
-3. **DLSS evaluation** — when the split list is executed on the immediate context, DLSS runs
-   between the two halves (on a private `ID3DDeviceContextState`), inputs: tonemapped LDR colour,
-   raw reversed-Z depth, motion vectors, the engine's own sub-pixel jitter.
-4. **Composite** — the UI composite samples the scene with UVs, so swapping in the
-   display-resolution DLSS output is all that's needed.
+2. **Motion vectors and native TAA** — at the TAA pass, Pharos decodes the engine's packed
+   velocity and uses its camera matrices to reproject sky and distant pixels. The game also
+   runs its original TAA draw, keeping its scene and temporal history ready for fallback.
+3. **DLSS evaluation** — Pharos splits the deferred command list and runs DLSS on the
+   presenting NVIDIA device's immediate context. It supplies tonemapped colour, reversed-Z
+   depth, motion vectors and the game's own sub-pixel jitter.
+4. **Composite** — when the UI draw executes, Pharos uses the display-resolution scene only
+   if the upscale succeeded for this frame, eye and scene target. Otherwise the draw samples
+   the game's TAA result. The perf log reports the backend used for the presented scene.
 5. **Texture LOD bias** — material samplers get `log2(render/display)` bias.
 
 NGX is loaded dynamically from the driver (`_nvngx.dll`); NVIDIA's static loader library (MSVC

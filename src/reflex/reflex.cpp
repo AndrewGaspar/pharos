@@ -321,7 +321,6 @@ void marker(nv::LatencyMarker type) {
 
 void reflex_on_device(ID3D11Device* dev) {
   std::lock_guard lock(S.mutex);
-  // The game creates probe devices before the real one; follow the newest.
   dev->AddRef();
   if (S.dev) S.dev->Release();
   S.dev = dev;

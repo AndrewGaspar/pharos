@@ -13,6 +13,7 @@
 #include <winsock2.h>
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -32,9 +33,17 @@ struct SockaddrUn {
   char sun_path[108];
 };
 
-// The unix environment of this process (/proc/self/environ): Wine does not copy every variable
-// into the Windows environment (XDG_RUNTIME_DIR is missing there under GE-Proton 11-12; live).
+// GE-Proton omits some Unix variables, including XDG_RUNTIME_DIR, from the Windows environment.
 std::string unix_env(const char* name) {
+  // GE-Proton exposes the game's own Unix environment, including explicit removals
+  // by the launcher. /proc/self may instead resolve to a shared wineserver.
+  using GetUnixEnv = LONG(WINAPI*)(const char*, char*, unsigned int);
+  static auto get_unix_env = reinterpret_cast<GetUnixEnv>(
+      GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "__wine_get_unix_env"));
+  if (get_unix_env) {
+    char value[1024];
+    return get_unix_env(name, value, sizeof value) == 0 ? value : "";
+  }
   HANDLE f = CreateFileA("Z:\\proc\\self\\environ", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                          OPEN_EXISTING, 0, nullptr);
   if (f == INVALID_HANDLE_VALUE) return {};
@@ -145,7 +154,7 @@ size_t field(const std::string& j, const char* key, size_t from, size_t end) {
 
 struct Client {
   std::string address, title, stereo;
-  int w = 0, h = 0, monitor = -1;
+  int w = 0, h = 0, monitor = -1, pid = 0;
   bool mapped = false;
 };
 
@@ -165,6 +174,8 @@ std::vector<Client> clients(const std::string& j) {
     if (t != std::string::npos && j[t] == '"') c.title = j.substr(t + 1, j.find('"', t + 1) - t - 1);
     size_t s = field(j, "stereo", pos, end);
     if (s != std::string::npos && j[s] == '"') c.stereo = j.substr(s + 1, j.find('"', s + 1) - s - 1);
+    size_t p = field(j, "pid", pos, end);
+    if (p != std::string::npos) c.pid = atoi(j.c_str() + p);
     size_t mo = field(j, "monitor", pos, end);
     if (mo != std::string::npos) c.monitor = atoi(j.c_str() + mo);
     size_t z = field(j, "size", pos, end);
@@ -197,29 +208,57 @@ HWND main_window() {
   return best.h;
 }
 
-// Which compositor window is ours? The pid can't tell: under Wine, files are opened by wineserver,
-// so Z:\proc\self is wineserver's (live: the pid read that way was wineserver's, the window's was
-// the game process's). Instead the window's title briefly carries a random marker; the client
-// whose title shows it is ours. The title is restored as soon as the compositor has seen it.
-std::string identify(HWND hwnd) {
-  wchar_t old[512] = {};
-  GetWindowTextW(hwnd, old, 512);
-  wchar_t marked[600];
-  unsigned nonce = GetTickCount() ^ (GetCurrentProcessId() << 12) ^ unsigned(uintptr_t(hwnd));
-  char tag[32];
-  snprintf(tag, sizeof tag, "[pharos-%08x]", nonce);
-  _snwprintf(marked, 600, L"%ls %hs", old, tag);
-  DWORD_PTR res = 0;
-  if (!SendMessageTimeoutW(hwnd, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(marked), SMTO_ABORTIFHUNG, 3000, &res))
-    return {};
-  std::string found;
-  for (int i = 0; i < 30 && found.empty(); i++) {
-    Sleep(100);
-    for (const auto& c : clients(hypr_request("j/clients")))
-      if (c.title.find(tag) != std::string::npos) found = c.address;
+// Wine's Win32 PID differs from the compositor's Unix PID. Confirm that changing
+// this HWND's caption changes a mapped compositor client, then cache that client's
+// address and Unix PID. A same-title window in another gamescope/desktop is common.
+Client owned_client(HWND hwnd, const std::vector<Client>& all, bool startup) {
+  static std::mutex mu;
+  static HWND known_hwnd{};
+  static Client known;
+  std::lock_guard lk(mu);
+  DWORD pid = 0;
+  if (!hwnd || !GetWindowThreadProcessId(hwnd, &pid) || pid != GetCurrentProcessId()) return {};
+  if (hwnd == known_hwnd) {
+    for (const auto& c : all)
+      if (c.mapped && c.pid == known.pid && c.address == known.address) return c;
   }
-  SendMessageTimeoutW(hwnd, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(old), SMTO_ABORTIFHUNG, 3000, &res);
-  return found;
+  known_hwnd = nullptr;
+  known = {};
+
+  // Call the default caption handler directly. The window thread may be waiting on
+  // the render thread creating this swapchain, so do not send it a synchronous message.
+  const size_t len = DefWindowProcW(hwnd, WM_GETTEXTLENGTH, 0, 0);
+  std::wstring old(len + 1, L'\0');
+  old.resize(DefWindowProcW(hwnd, WM_GETTEXT, old.size(), reinterpret_cast<LPARAM>(old.data())));
+  if (!startup) {
+    // A headless game has no client on the desktop. Avoid perturbing its caption on
+    // every background poll. Special characters need JSON escaping; probe those directly.
+    char title[2048];
+    if (WideCharToMultiByte(CP_UTF8, 0, old.c_str(), -1, title, sizeof title, nullptr, nullptr) &&
+        !strpbrk(title, "\\\"\b\f\n\r\t") &&
+        std::none_of(all.begin(), all.end(), [&](const Client& c) { return c.mapped && c.title == title; }))
+      return {};
+  }
+  char tag[40];
+  snprintf(tag, sizeof tag, "[pharos-%08lx-%08lx]", GetCurrentProcessId(), GetTickCount());
+  const std::wstring marked(tag, tag + strlen(tag));
+  if (!DefWindowProcW(hwnd, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(marked.c_str()))) return {};
+  // Query immediately; Xwayland may need a few refreshes to publish the caption.
+  for (int i = 0; i < 12 && !known_hwnd; i++) {
+    if (i) Sleep(20);
+    for (const auto& c : clients(hypr_request("j/clients"))) {
+      if (c.mapped && c.pid > 0 && c.title == tag) {
+        known = c;
+        known_hwnd = hwnd;
+        break;
+      }
+    }
+  }
+  wchar_t current[48]{};
+  DefWindowProcW(hwnd, WM_GETTEXT, 48, reinterpret_cast<LPARAM>(current));
+  if (current == marked)
+    DefWindowProcW(hwnd, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(old.c_str()));
+  return known;
 }
 
 // Monitors in `j/monitors`: HypXRland reports `"stereo": "sbs"` only on a side-by-side stereo
@@ -227,7 +266,7 @@ std::string identify(HWND hwnd) {
 // "3D on stereo displays: Auto" keys on too (quiver-app stereo_ui.rs).
 struct Monitor {
   int id = -1;
-  bool focused = false, stereo = false;
+  bool stereo = false;
 };
 std::vector<Monitor> monitors(const std::string& j) {
   // Each monitor object has a "description" (its nested workspace objects, which also carry an
@@ -244,8 +283,6 @@ std::vector<Monitor> monitors(const std::string& j) {
     Monitor m;
     size_t v = field(j, "id", pos, end);
     if (v != std::string::npos) m.id = atoi(j.c_str() + v);
-    size_t f = field(j, "focused", pos, end);
-    m.focused = f != std::string::npos && j.compare(f, 4, "true") == 0;
     size_t st = field(j, "stereo", pos, end);
     m.stereo = st != std::string::npos && j.compare(st, 5, "\"sbs\"") == 0;
     out.push_back(m);
@@ -255,16 +292,16 @@ std::vector<Monitor> monitors(const std::string& j) {
 
 // -1 unknown (not Hyprland / no answer), 0 the game's monitor is mono, 1 it is a stereo output.
 std::atomic<int> g_display_stereo{-1};
+std::atomic<HWND> g_swapchain_window{nullptr};
 
-// Our window's monitor (when we know our window), else the focused one.
-int display_stereo(const std::vector<Client>& all, const std::string& address) {
-  auto ms = monitors(hypr_request("j/monitors"));
-  if (ms.empty()) return -1;
-  int mon = -1;
-  for (const auto& c : all)
-    if (!address.empty() && c.address == address) mon = c.monitor;
-  for (const auto& m : ms)
-    if ((mon >= 0 && m.id == mon) || (mon < 0 && m.focused)) return m.stereo ? 1 : 0;
+// The focused desktop output can belong to a different game or the host of a stream.
+int display_stereo(HWND hwnd, Client& me, bool startup) {
+  auto reply = hypr_request("j/clients");
+  if (reply.empty()) return -1;
+  me = owned_client(hwnd, clients(reply), startup);
+  if (!me.mapped || me.monitor < 0) return 0;
+  for (const auto& m : monitors(hypr_request("j/monitors")))
+    if (m.id == me.monitor) return m.stereo ? 1 : 0;
   return -1;
 }
 
@@ -272,6 +309,7 @@ std::mutex g_mu;
 std::string g_want;     // tag to keep on the window ("" = none)
 std::string g_applied;  // tag currently applied
 std::string g_address;  // window it is applied to
+int g_pid = 0;
 std::string g_last;     // last outcome, for status
 std::atomic<bool> g_thread{false};
 
@@ -284,42 +322,27 @@ std::string tag_request(const std::string& sign_tag, const std::string& address)
 }
 
 void step() {
-  std::string want, address;
-  {
-    std::lock_guard lk(g_mu);
-    want = g_want;
-    address = g_address;
-  }
-  // Is the window we know still there?
-  const Client* me = nullptr;
-  auto all = clients(hypr_request("j/clients"));
-  int ds = display_stereo(all, address);
+  Client client;
+  HWND hwnd = g_swapchain_window.load();
+  int ds = display_stereo(IsWindow(hwnd) ? hwnd : main_window(), client, false);
   if (ds != g_display_stereo.exchange(ds))
     ACO_LOG("hyprland: the game's display is %s", ds == 1 ? "a stereo (side-by-side) output" : ds == 0 ? "mono" : "unknown");
-  for (const auto& c : all)
-    if (!address.empty() && c.address == address) me = &c;
-  if (!me) {
-    HWND h = main_window();
-    if (!h) return;
-    address = identify(h);
-    if (address.empty()) return;
-    all = clients(hypr_request("j/clients"));
-    for (const auto& c : all)
-      if (c.address == address) me = &c;
-    if (!me) return;
-    std::lock_guard lk(g_mu);
-    if (address != g_address) g_applied.clear();  // a new window carries no tag of ours yet
-    g_address = address;
-  }
   std::lock_guard lk(g_mu);
+  if (client.address != g_address || client.pid != g_pid) {
+    g_applied.clear();
+    g_address = client.address;
+    g_pid = client.pid;
+  }
+  if (g_address.empty()) return;
+  const auto& want = g_want;
   if (g_applied == want) {
-    g_last = "window " + me->address + " \"" + me->title + "\" " + std::to_string(me->w) + "x" + std::to_string(me->h) +
-             ", tag " + (want.empty() ? "(none)" : want) + ", compositor stereo: " + (me->stereo.empty() ? "?" : me->stereo);
+    g_last = "window " + client.address + " \"" + client.title + "\" " + std::to_string(client.w) + "x" + std::to_string(client.h) +
+             ", tag " + (want.empty() ? "(none)" : want) + ", compositor stereo: " + (client.stereo.empty() ? "?" : client.stereo);
     return;
   }
   if (!g_applied.empty()) tag_request("-" + g_applied, g_address);
   std::string r = want.empty() ? "ok" : tag_request("+" + want, g_address);
-  ACO_LOG("hyprland: window %s (\"%s\", %dx%d): tag %s -> %s", me->address.c_str(), me->title.c_str(), me->w, me->h,
+  ACO_LOG("hyprland: window %s (\"%s\", %dx%d): tag %s -> %s", client.address.c_str(), client.title.c_str(), client.w, client.h,
          want.empty() ? "(cleared)" : want.c_str(), r.substr(0, 120).c_str());
   g_applied = want;
 }
@@ -377,14 +400,11 @@ int hypr_display_stereo() { return g_display_stereo.load(); }
 
 std::string process_env(const char* name) { return env(name); }
 
-int hypr_display_stereo_now() {
+int hypr_display_stereo_now(HWND hwnd) {
   if (!hypr_available()) return -1;
-  std::string address;
-  {
-    std::lock_guard lk(g_mu);
-    address = g_address;
-  }
-  int ds = display_stereo(clients(hypr_request("j/clients")), address);
+  if (hwnd) g_swapchain_window = hwnd;
+  Client me;
+  int ds = display_stereo(hwnd ? hwnd : main_window(), me, true);
   g_display_stereo = ds;
   return ds;
 }

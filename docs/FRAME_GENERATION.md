@@ -6,6 +6,18 @@ for reference.
 
 ## D3D12 route (`src/fg/fg_d3d12.cpp`, `[fg] mode=d3d12`)
 
+For an FP16 scRGB swapchain, Pharos converts the input from linear BT.709 at 80 nits per
+unit to BT.2020 with ST 2084 (PQ) encoding in RGB10A2. DLSS-G receives that format and
+its HDR evaluation flag. Each generated frame is converted back to scRGB for presentation.
+Real frames keep their original FP16 values. A native HDR10 swapchain can supply PQ
+directly. The SDR HUD-less texture is omitted on both HDR paths.
+
+To inspect a static highlight in the lab, set `[fg] show=compare_gen` and take a
+`quiver lab shot INSTANCE --hdr` capture. The left half is the real image and the right
+half contains the same region of the generated image. Compare luminance in the raw
+scRGB data. The SDK describes the required input encoding in its
+[frame generation HDR guide](https://github.com/NVIDIA-RTX/Streamline/blob/main/docs/ProgrammingGuideDLSS_G.md#110-dlss-g-and-hdr).
+
 DLSS-G runs through NGX's **D3D12** API on a vkd3d-proton device of our own, next to the game's
 DXVK D3D11 device:
 

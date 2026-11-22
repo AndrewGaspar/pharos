@@ -10,6 +10,7 @@
 #include <mutex>
 
 #include "core/cbshadow.h"
+#include "core/d3d11_forward.h"
 #include "core/ctxgate.h"
 #include "core/hook.h"
 #include "core/log.h"
@@ -47,8 +48,7 @@ void ctx_gate_wait() {
 namespace {
 
 using namespace vt;
-
-ID3D11DeviceContext* g_immediate = nullptr;
+constexpr GUID kEngineRenderer = {0x7df65a03, 0x5113, 0x49f5, {0x84,0x40,0x31,0xb4,0x25,0x34,0x58,0xd6}};
 
 // Per-context class of the bound pixel shader. Contexts are few (immediate + ~9 deferred), so a
 // small linear table keeps lookups lock-free.
@@ -368,7 +368,14 @@ HRESULT STDMETHODCALLTYPE hk_CreateVertexShader(ID3D11Device* self, const void* 
 HRESULT STDMETHODCALLTYPE hk_CreatePixelShader(ID3D11Device* self, const void* bc, SIZE_T n, ID3D11ClassLinkage* l,
                                                ID3D11PixelShader** out) {
   HRESULT hr = ORIG(decltype(hk_CreatePixelShader), Device_CreatePixelShader)(self, bc, n, l, out);
-  if (SUCCEEDED(hr) && out) shaders_register(*out, ShaderKind::PS, bc, n);
+  if (SUCCEEDED(hr) && out && *out) {
+    shaders_register(*out, ShaderKind::PS, bc, n);
+    auto cls = shader_class_fast(*out);
+    if (cls == ShaderClass::UIComposite || cls == ShaderClass::LinearZ || cls == ShaderClass::TemporalAA) {
+      const BOOL game = TRUE;
+      self->SetPrivateData(kEngineRenderer, sizeof(game), &game);
+    }
+  }
   return hr;
 }
 HRESULT STDMETHODCALLTYPE hk_CreateComputeShader(ID3D11Device* self, const void* bc, SIZE_T n, ID3D11ClassLinkage* l,
@@ -388,7 +395,7 @@ HRESULT STDMETHODCALLTYPE hk_CreateDeferredContext(ID3D11Device* self, UINT flag
 }
 HRESULT STDMETHODCALLTYPE hk_CreateSamplerState(ID3D11Device* self, const D3D11_SAMPLER_DESC* desc,
                                                 ID3D11SamplerState** out) {
-  if (desc) {
+  if (desc && d3d11_upscale_device(self)) {
     D3D11_SAMPLER_DESC d = *desc;
     upscaler_adjust_sampler(&d);
     return ORIG(decltype(hk_CreateSamplerState), Device_CreateSamplerState)(self, &d, out);
@@ -397,6 +404,12 @@ HRESULT STDMETHODCALLTYPE hk_CreateSamplerState(ID3D11Device* self, const D3D11_
 }
 
 } // namespace
+
+bool ctxhooks_engine_renderer(ID3D11Device* dev) {
+  BOOL game = FALSE;
+  UINT size = sizeof(game);
+  return SUCCEEDED(dev->GetPrivateData(kEngineRenderer, &size, &game)) && game;
+}
 
 void ctxhooks_install_context(ID3D11DeviceContext* ctx) {
   cbshadow_install(ctx);
@@ -430,15 +443,9 @@ void ctxhooks_install_device(ID3D11Device* dev) {
   hook_vtable(dev, Device_CreateSamplerState, reinterpret_cast<void*>(hk_CreateSamplerState));
   ID3D11DeviceContext* imm = nullptr;
   dev->GetImmediateContext(&imm);
-  g_immediate = imm;
-  trace_set_immediate(imm);
   ctxhooks_install_context(imm);
-  stereo_init(dev, imm);
-  upscaler_init(dev, imm);
   imm->Release();
 }
-
-ID3D11DeviceContext* immediate_context() { return g_immediate; }
 
 HRESULT orig_FinishCommandList(ID3D11DeviceContext* ctx, BOOL restore, ID3D11CommandList** out) {
   return orig<decltype(hk_FinishCommandList)>(ctx, Context_FinishCommandList)(ctx, restore, out);

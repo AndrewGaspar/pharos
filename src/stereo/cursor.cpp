@@ -189,7 +189,6 @@ struct State {
   float inv_z = 0.0f;        // smoothed 1/Z at the cursor (0 = at infinity / unknown)
   float last_z = 0.0f;
   float dbg_m00 = 0.0f, dbg_d = -1.0f;
-  int dbg_fg = -1;           // last upscaler_fg_inputs result in begin_frame
   bool dbg_logged_draw = false;
   unsigned long long frames = 0;
 } S;
@@ -277,15 +276,9 @@ void read_pending(ID3D11DeviceContext* imm) {
 }
 
 void issue_depth_sample(ID3D11DeviceContext* imm, ID3D11Device* dev, unsigned w, unsigned h) {
-  FgInputs in{};
-  if (!upscaler_fg_inputs(&in) || !in.depth || !in.render_w || !in.render_h) return;
-  ID3D11Texture2D* tex = nullptr;
-  if (FAILED(in.depth->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&tex)))) {
-    in.depth->Release();
-    if (in.mv) in.mv->Release();
-    if (in.hudless) in.hudless->Release();
-    return;
-  }
+  uint32_t render_w = 0, render_h = 0;
+  ID3D11Texture2D* tex = upscaler_cursor_depth(render_w, render_h);
+  if (!tex) return;
   D3D11_TEXTURE2D_DESC d;
   tex->GetDesc(&d);
   int s = S.slot;
@@ -303,28 +296,27 @@ void issue_depth_sample(ID3D11DeviceContext* imm, ID3D11Device* dev, unsigned w,
     S.pending[s] = false;
   }
   if (S.stage[s]) {
-    unsigned x = unsigned(S.mono[0] / float(w) * float(in.render_w));
-    unsigned y = unsigned(S.mono[1] / float(h) * float(in.render_h));
-    if (x >= in.render_w) x = in.render_w - 1;
-    if (y >= in.render_h) y = in.render_h - 1;
+    unsigned x = unsigned(S.mono[0] / float(w) * float(render_w));
+    unsigned y = unsigned(S.mono[1] / float(h) * float(render_h));
+    if (x >= render_w) x = render_w - 1;
+    if (y >= render_h) y = render_h - 1;
     D3D11_BOX box{x, y, 0, x + 1, y + 1, 1};
     imm->CopySubresourceRegion(S.stage[s], 0, 0, 0, 0, tex, 0, &box);
-    S.pend_ndc[s][0] = 2.0f * (float(x) + 0.5f) / float(in.render_w) - 1.0f;
-    S.pend_ndc[s][1] = 1.0f - 2.0f * (float(y) + 0.5f) / float(in.render_h);
+    S.pend_ndc[s][0] = 2.0f * (float(x) + 0.5f) / float(render_w) - 1.0f;
+    S.pend_ndc[s][1] = 1.0f - 2.0f * (float(y) + 0.5f) / float(render_h);
     float m00tmp = 0.0f;
     S.pend_ok[s] = cam_cursor_view(&m00tmp, S.pend_c2v[s]);
     S.pending[s] = true;
     S.slot ^= 1;
   }
   tex->Release();
-  in.depth->Release();
-  if (in.mv) in.mv->Release();
-  if (in.hudless) in.hudless->Release();
 }
 
 } // namespace
 
 void cursor_note_flat_menu() { g_flat_menu.store(true, std::memory_order_relaxed); }
+
+bool cursor_needs_depth() { return g_on.load(std::memory_order_acquire); }
 
 void cursor_set_active(bool on) {
   if (g_on.exchange(on, std::memory_order_acq_rel) != on && on)
@@ -441,7 +433,7 @@ void cursor_begin_frame(ID3D11DeviceContext* imm, IDXGISwapChain* sc, unsigned w
   // (The FG camera copy can't be used in stereo: its PassParams reads hit our redirected
   // pool buffers. The camera system's own last main view is the source instead.)
   float m00 = 0.0f, c2v[4][4];
-  S.dbg_fg = cam_cursor_view(&m00, c2v) ? 1 : 0;
+  bool have_camera = cam_cursor_view(&m00, c2v);
   float sep = cfg.stereo_separation * 0.001f;
   float inv_conv = cfg.stereo_convergence > 0.0f ? 1.0f / cfg.stereo_convergence : 0.0f;
   for (int e = 0; e < 2; ++e) {
@@ -454,7 +446,7 @@ void cursor_begin_frame(ID3D11DeviceContext* imm, IDXGISwapChain* sc, unsigned w
   S.dbg_m00 = m00;
   if (S.frames % 300 == 0)
     ACO_LOG("stereo: cursor at (%.0f, %.0f), scene %.1f m, eye centres (%.1f, %.1f) [fg=%d m00=%.3f d=%.6f]",
-            S.mono[0], S.mono[1], S.last_z, S.centre[0][0], S.centre[1][0], S.dbg_fg, S.dbg_m00, S.dbg_d);
+            S.mono[0], S.mono[1], S.last_z, S.centre[0][0], S.centre[1][0], have_camera, S.dbg_m00, S.dbg_d);
 }
 
 bool cursor_ready(ID3D11Device* dev) { return ensure_objects(dev); }

@@ -19,6 +19,7 @@ namespace aco {
 void cursor_note_flat_menu();
 void cursor_set_active(bool on);  // at Present, like g_cam_on
 bool cursor_ready(ID3D11Device* dev);
+bool cursor_needs_depth();
 // Only the indexed indirect UI batch contains the cursor.
 enum class CursorDraw { Game, Hide, Capture };
 CursorDraw cursor_prepare(ID3D11DeviceContext* ctx, ID3D11Buffer* args, UINT off);

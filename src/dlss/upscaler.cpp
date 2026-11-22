@@ -1,6 +1,7 @@
 #include "core/d3d11_title.h"
 #include "dlss/upscaler.h"
 #include "stereo/stereo.h"
+#include "stereo/cursor.h"
 #include "core/ctxgate.h"
 
 #include <windows.h>
@@ -8,6 +9,7 @@
 #include <d3d10.h>
 #include <dxgi.h>
 #include <shlobj.h>
+#include <wrl/client.h>
 
 #include <atomic>
 #include <cmath>
@@ -33,6 +35,8 @@
 namespace aco {
 
 namespace {
+
+using Microsoft::WRL::ComPtr;
 
 // TemporalAA_cbuffer layout (from the TAA shader's reflection data).
 struct TaaConstants {
@@ -67,26 +71,34 @@ ID3D11Resource* resource_of(ID3D11View* v) {
 struct Job {
   ID3D11Resource* color = nullptr;     // tonemapped LDR, render res
   ID3D11Resource* depth = nullptr;     // raw reversed-Z device depth (R32F copy), render res
-  ID3D11Resource* responsive = nullptr;
+  ComPtr<ID3D11Resource> taa_output;
+  ComPtr<ID3D11Texture2D> mv;
+  ComPtr<ID3D11ShaderResourceView> mv_srv;
   uint32_t render_w = 0, render_h = 0;
   float jitter_x = 0, jitter_y = 0;
   uint64_t frame = 0;
+  uint64_t resize_generation = 0;
   FgCamera cam;
   ~Job() {
     safe_release(color);
     safe_release(depth);
-    safe_release(responsive);
   }
 };
 
-// Attached to the game's command list (SetPrivateDataInterface) when we split it: the parts that
-// precede it, each followed by a DLSS job. Released together with the command list.
+// A split preserves all commands preceding the intercepted pass. For a deferred
+// composite we record both bindings, then submit just one draw on the immediate
+// context, after the result for this frame and this stereo eye is known.
+struct Part {
+  ComPtr<ID3D11CommandList> list;
+  std::shared_ptr<Job> job;
+  ComPtr<ID3D11CommandList> upscale_draw;
+  ComPtr<ID3D11Resource> scene;
+  ComPtr<ID3D11ShaderResourceView> upscaled;
+};
+
 struct Chain final : IUnknown {
   std::atomic<ULONG> refs{1};
-  std::vector<std::pair<ID3D11CommandList*, std::shared_ptr<Job>>> parts;
-  ~Chain() {
-    for (auto& p : parts) p.first->Release();
-  }
+  std::vector<Part> parts;
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
     if (riid == __uuidof(IUnknown)) {
       *out = this;
@@ -163,6 +175,7 @@ struct GpuTimer {
 
 struct State {
   ID3D11Device* dev = nullptr;
+  std::atomic<ID3D11Device*> ready_device{};
   ID3D11Device1* dev1 = nullptr;
   ID3D11DeviceContext* imm = nullptr;
   ID3D11DeviceContext1* imm1 = nullptr;
@@ -180,7 +193,7 @@ struct State {
 
   std::unordered_map<ID3D11Resource*, ID3D11Resource*> lin_to_raw;  // linear Z -> raw depth copy
   std::unordered_set<ID3D11Resource*> taa_outputs;                   // TAA RT0 resources (rotating)
-  std::unordered_map<ID3D11DeviceContext*, std::vector<std::pair<ID3D11CommandList*, std::shared_ptr<Job>>>> pending;
+  std::unordered_map<ID3D11DeviceContext*, std::vector<Part>> pending;
 
   // Immediate-context-only state (render thread).
   ID3D11Texture2D* out = nullptr;
@@ -198,14 +211,22 @@ struct State {
     uint64_t last_job_frame = 0;
     LARGE_INTEGER last_eval_time{};
   } feat[2];
-  bool ngx_tried = false, ngx_ok = false;
+  bool ngx_tried = false;
+  std::atomic<bool> ngx_unavailable{false};
   // Last job executed (for Frame Generation).
   ID3D11Resource* fg_depth = nullptr;
   uint32_t fg_rw = 0, fg_rh = 0;
   float fg_jx = 0, fg_jy = 0;
   uint64_t fg_frame = 0;
   FgCamera fg_cam;
-  int eval_failures = 0;
+  ComPtr<ID3D11Texture2D> fg_mv;
+  ComPtr<ID3D11Resource> valid_scene;
+  bool output_composited = false;
+  int valid_eye = 0;
+  const char* output_backend = nullptr;
+  const char* presented_backend = "game-taa";
+  uint64_t last_swap_frame = UINT64_MAX;
+  std::atomic<bool> logged_fallback{false};
 
   GpuTimer gpu_timer;
   LARGE_INTEGER perf_last{};
@@ -213,9 +234,10 @@ struct State {
   double perf_max_ms = 0;
   LARGE_INTEGER frame_last{};
 
-  std::atomic<uint32_t> display_w{0}, display_h{0};
+  std::atomic<uint64_t> display_size{0};  // a consistent width/height pair across resize threads
+  std::atomic<bool> resized{false};
+  std::atomic<uint64_t> resize_generation{0};
   std::atomic<uint64_t> frame{0};
-  std::atomic<uint64_t> taa_replaced_frame{0};
   // per perf-window counters
   std::atomic<uint32_t> n_taa_calls{0}, n_bail{0}, n_taa{0}, n_jobs{0}, n_dlss{0}, n_comp{0}, n_swap{0};
   std::mutex jit_mutex;
@@ -223,18 +245,24 @@ struct State {
   float render_scale_hint = 1.0f;  // for sampler LOD bias (known before the first frame)
 } S;
 
+void note_fallback(const char* reason) {
+  if (!S.logged_fallback.exchange(true))
+    ACO_LOG("upscaler: no upscale output (%s); using the game's TAA", reason);
+}
+
 bool ensure_kernels() {
   std::lock_guard lock(S.mutex);
   if (!S.kernels_tried) {
     S.kernels_tried = true;
     S.kernels_ok = kernels::create(S.dev, S.k);
+    if (!S.kernels_ok) note_fallback("shader initialization failed");
   }
   return S.kernels_ok;
 }
 
 // Called with S.mutex held.
 bool ensure_mv(uint32_t w, uint32_t h) {
-  if (S.mv && S.mv_w == w && S.mv_h == h) return true;
+  if (S.mv_srv && S.mv_w == w && S.mv_h == h) return true;
   safe_release(S.mv_uav);
   safe_release(S.mv_srv);
   safe_release(S.mv);
@@ -250,7 +278,7 @@ bool ensure_mv(uint32_t w, uint32_t h) {
   if (FAILED(S.dev->CreateTexture2D(&d, nullptr, &S.mv)) ||
       FAILED(S.dev->CreateUnorderedAccessView(S.mv, nullptr, &S.mv_uav)) ||
       FAILED(S.dev->CreateShaderResourceView(S.mv, nullptr, &S.mv_srv))) {
-    ACO_LOG("upscaler: failed to create %ux%u motion vector texture", w, h);
+    note_fallback("motion vector texture allocation failed");
     return false;
   }
   S.mv_w = w;
@@ -261,7 +289,8 @@ bool ensure_mv(uint32_t w, uint32_t h) {
 
 // Render thread.
 bool ensure_output(uint32_t w, uint32_t h) {
-  if (S.out && S.out_w == w && S.out_h == h) return true;
+  std::lock_guard lock(S.mutex);
+  if (S.out_srv && S.out_w == w && S.out_h == h) return true;
   safe_release(S.out_uav);
   safe_release(S.out_srv);
   safe_release(S.out);
@@ -277,7 +306,7 @@ bool ensure_output(uint32_t w, uint32_t h) {
   if (FAILED(S.dev->CreateTexture2D(&d, nullptr, &S.out)) ||
       FAILED(S.dev->CreateUnorderedAccessView(S.out, nullptr, &S.out_uav)) ||
       FAILED(S.dev->CreateShaderResourceView(S.out, nullptr, &S.out_srv))) {
-    ACO_LOG("upscaler: failed to create %ux%u output texture", w, h);
+    note_fallback("output texture allocation failed");
     return false;
   }
   S.out_w = w;
@@ -298,26 +327,25 @@ ID3D11ShaderResourceView* srv_for(ID3D11Resource* r, DXGI_FORMAT fmt = DXGI_FORM
     pd = &d;
   }
   ID3D11ShaderResourceView* v = nullptr;
-  S.dev->CreateShaderResourceView(r, pd, &v);
+  if (!r || FAILED(S.dev->CreateShaderResourceView(r, pd, &v))) return nullptr;
   r->AddRef();  // keep the key alive while cached
   S.srv_cache[r] = v;
   return v;
 }
 
-void blit(ID3D11ShaderResourceView* src, uint32_t src_w, uint32_t src_h, kernels::BlitMode mode, float scale) {
+bool blit(ID3D11ShaderResourceView* src, uint32_t src_w, uint32_t src_h, kernels::BlitMode mode, float scale) {
   ID3D11DeviceContext* c = S.imm;
   D3D11_MAPPED_SUBRESOURCE m;
-  if (SUCCEEDED(c->Map(S.k.blit_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
-    kernels::BlitParams p = {};
-    p.dst_size_inv[0] = 1.0f / S.out_w;
-    p.dst_size_inv[1] = 1.0f / S.out_h;
-    p.src_size[0] = static_cast<float>(src_w);
-    p.src_size[1] = static_cast<float>(src_h);
-    p.mode = mode;
-    p.scale = scale;
-    memcpy(m.pData, &p, sizeof(p));
-    c->Unmap(S.k.blit_cb, 0);
-  }
+  if (!src || FAILED(c->Map(S.k.blit_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return false;
+  kernels::BlitParams p = {};
+  p.dst_size_inv[0] = 1.0f / S.out_w;
+  p.dst_size_inv[1] = 1.0f / S.out_h;
+  p.src_size[0] = static_cast<float>(src_w);
+  p.src_size[1] = static_cast<float>(src_h);
+  p.mode = mode;
+  p.scale = scale;
+  memcpy(m.pData, &p, sizeof(p));
+  c->Unmap(S.k.blit_cb, 0);
   c->CSSetShader(S.k.blit, nullptr, 0);
   c->CSSetConstantBuffers(0, 1, &S.k.blit_cb);
   c->CSSetShaderResources(0, 1, &src);
@@ -328,17 +356,26 @@ void blit(ID3D11ShaderResourceView* src, uint32_t src_w, uint32_t src_h, kernels
   ID3D11UnorderedAccessView* null_uav = nullptr;
   c->CSSetShaderResources(0, 1, &null_srv);
   c->CSSetUnorderedAccessViews(0, 1, &null_uav, nullptr);
+  return true;
 }
 
 bool ensure_feature(int eye, uint32_t rw, uint32_t rh, uint32_t dw, uint32_t dh) {
   const Config& cfg = config();
   auto& F = S.feat[eye];
-  if (F.handle && F.rw == rw && F.rh == rh && F.dw == dw && F.dh == dh && F.preset == cfg.preset)
-    return true;
+  // A feature rejected at these dimensions and preset will also be rejected
+  // on the next frame. Retry when its creation parameters change.
+  if (F.rw == rw && F.rh == rh && F.dw == dw && F.dh == dh && F.preset == cfg.preset)
+    return F.handle != nullptr;
   if (F.handle) {
     ngx::release_feature(F.handle);
     F.handle = nullptr;
   }
+  F.rw = rw;
+  F.rh = rh;
+  F.dw = dw;
+  F.dh = dh;
+  F.preset = cfg.preset;
+  F.reset_next = true;
   ngx::Params& p = S.create_params;
   if (!p) p = ngx::alloc_params();
   if (!p) return false;
@@ -355,21 +392,15 @@ bool ensure_feature(int eye, uint32_t rw, uint32_t rh, uint32_t dw, uint32_t dh)
   F.handle = ngx::create_feature(S.imm, NVSDK_NGX_Feature_SuperSampling, p);
   ACO_LOG("upscaler: DLSS feature (eye %d) %ux%u -> %ux%u preset=%s flags=0x%x: %s", eye, rw, rh, dw, dh,
           cfg.preset.c_str(), flags, F.handle ? "ok" : "FAILED");
-  F.rw = rw;
-  F.rh = rh;
-  F.dw = dw;
-  F.dh = dh;
-  F.preset = cfg.preset;
-  F.reset_next = true;
   return F.handle != nullptr;
 }
 
-bool evaluate_dlss(const Job& job) {
+bool evaluate_dlss(const Job& job, uint64_t frame) {
   if (!S.ngx_tried) {
     S.ngx_tried = true;
-    S.ngx_ok = ngx::init(S.dev, out_dir()) && ngx::dlss_available();
+    S.ngx_unavailable = !ngx::init(S.dev, out_dir()) || !ngx::dlss_available();
   }
-  if (!S.ngx_ok || !job.depth) return false;
+  if (S.ngx_unavailable || !job.depth) return false;
   int eye = stereo_eye();
   auto& F = S.feat[eye];
   if (!ensure_feature(eye, job.render_w, job.render_h, S.out_w, S.out_h)) return false;
@@ -383,14 +414,12 @@ bool evaluate_dlss(const Job& job) {
   QueryPerformanceFrequency(&freq);
   float dt_ms = F.last_eval_time.QuadPart ? 1000.0f * (now.QuadPart - F.last_eval_time.QuadPart) / freq.QuadPart : 16.6f;
   F.last_eval_time = now;
-  bool reset = F.reset_next || job.frame > F.last_job_frame + 2;
-  F.reset_next = false;
-  F.last_job_frame = job.frame;
+  bool reset = F.reset_next || frame > F.last_job_frame + 1;
 
   p.set(NVSDK_NGX_Parameter_Color, job.color);
   p.set(NVSDK_NGX_Parameter_Output, static_cast<ID3D11Resource*>(S.out));
   p.set(NVSDK_NGX_Parameter_Depth, job.depth);
-  p.set(NVSDK_NGX_Parameter_MotionVectors, static_cast<ID3D11Resource*>(S.mv));
+  p.set(NVSDK_NGX_Parameter_MotionVectors, static_cast<ID3D11Resource*>(job.mv.Get()));
   p.set(NVSDK_NGX_Parameter_Jitter_Offset_X, job.jitter_x * cfg.jitter_x);
   p.set(NVSDK_NGX_Parameter_Jitter_Offset_Y, job.jitter_y * cfg.jitter_y);
   p.set(NVSDK_NGX_Parameter_Sharpness, 0.0f);
@@ -416,9 +445,13 @@ bool evaluate_dlss(const Job& job) {
 
   NVSDK_NGX_Result r = ngx::evaluate(S.imm, F.handle, p);
   if (NVSDK_NGX_FAILED(r)) {
-    if (S.eval_failures++ < 10) ACO_LOG("upscaler: DLSS evaluate failed: %s", ngx::result_str(r));
+    F.reset_next = true;
+    static std::once_flag first_eval_failure;
+    std::call_once(first_eval_failure, [&] { ACO_LOG("upscaler: DLSS evaluate failed: %s", ngx::result_str(r)); });
     return false;
   }
+  F.reset_next = false;
+  F.last_job_frame = frame;
   static bool logged = false;
   if (!logged) {
     logged = true;
@@ -429,12 +462,30 @@ bool evaluate_dlss(const Job& job) {
 }
 
 void run_job(const Job& job) {
-  uint32_t dw = S.display_w.load(), dh = S.display_h.load();
+  S.valid_scene = nullptr;
+  S.output_backend = nullptr;
+  S.output_composited = false;
+  if (S.resized.load() || job.resize_generation != S.resize_generation.load()) return;
+  uint64_t frame = S.frame.load();
+  // The cursor uses engine depth even if NGX fails after the TAA was recorded.
+  if (job.depth) job.depth->AddRef();
+  safe_release(S.fg_depth);
+  S.fg_depth = job.depth;
+  S.fg_rw = job.render_w;
+  S.fg_rh = job.render_h;
+  S.fg_frame = frame;
+  const Config& cfg = config();
+  if (!cfg.enabled || !job.mv) return;
+  uint64_t display = S.display_size.load();
+  uint32_t dw = static_cast<uint32_t>(display >> 32), dh = static_cast<uint32_t>(display);
   static int diag = 0;
   if (diag++ < 4)
     ACO_LOG("upscaler: job frame=%llu render=%ux%u display=%ux%u jitter=(%g,%g) depth=%p", (unsigned long long)job.frame,
             job.render_w, job.render_h, dw, dh, job.jitter_x, job.jitter_y, static_cast<void*>(job.depth));
-  if (!dw || !dh) return;
+  if (!dw || !dh) {
+    note_fallback("swapchain size unavailable");
+    return;
+  }
   if (!ensure_output(dw, dh)) return;
   // DXVK's SwapDeviceContextState doesn't take the context's multithread lock (other methods do), and
   // with Frame Generation's present thread ([fg] present_thread=1) another thread uses the immediate
@@ -447,33 +498,36 @@ void run_job(const Job& job) {
   ID3DDeviceContextState* prev = nullptr;
   S.imm1->SwapDeviceContextState(S.own_state, &prev);
 
-  const Config& cfg = config();
-  bool done = false;
   S.n_jobs++;
-  if (job.depth) job.depth->AddRef();
-  if (S.fg_depth) S.fg_depth->Release();
-  S.fg_depth = job.depth;
-  S.fg_rw = job.render_w;
-  S.fg_rh = job.render_h;
-  S.fg_jx = job.jitter_x * cfg.jitter_x;
-  S.fg_jy = job.jitter_y * cfg.jitter_y;
-  S.fg_frame = S.frame.load();
-  S.fg_cam = job.cam;
   int timer = S.gpu_timer.start(S.imm);
   if (cfg.debug == "motion") {
-    blit(S.mv_srv, job.render_w, job.render_h, kernels::kBlitMotion, 0.05f);
-    done = true;
-  } else if (cfg.debug == "depth" && job.depth) {
-    blit(srv_for(job.depth, DXGI_FORMAT_R32_FLOAT), job.render_w, job.render_h, kernels::kBlitDepth, 0.25f);
-    done = true;
-  } else if (cfg.backend == "dlss") {
-    done = evaluate_dlss(job);
-    if (done) S.n_dlss++;
+    if (blit(job.mv_srv.Get(), job.render_w, job.render_h, kernels::kBlitMotion, 0.05f))
+      S.output_backend = "motion";
+  } else if (cfg.debug == "depth") {
+    if (blit(srv_for(job.depth, DXGI_FORMAT_R32_FLOAT), job.render_w, job.render_h, kernels::kBlitDepth, 0.25f))
+      S.output_backend = "depth";
+  } else if (cfg.backend == "bilinear") {
+    if (blit(srv_for(job.color), job.render_w, job.render_h, kernels::kBlitColor, 1.0f))
+      S.output_backend = "bilinear";
+  } else if (cfg.backend == "dlss" && evaluate_dlss(job, frame)) {
+    S.output_backend = "dlss";
+    S.n_dlss++;
+    std::lock_guard lock(S.jit_mutex);
+    S.jitters.emplace(job.jitter_x, job.jitter_y);
   }
-  if (!done) blit(srv_for(job.color), job.render_w, job.render_h, kernels::kBlitColor, 1.0f);
+  if (S.output_backend) {
+    S.valid_scene = job.taa_output;
+    S.valid_eye = stereo_eye();
+    S.fg_mv = job.mv;
+    S.fg_jx = job.jitter_x * cfg.jitter_x;
+    S.fg_jy = job.jitter_y * cfg.jitter_y;
+    S.fg_cam = job.cam;
+    if (bloom_probe_wants(frame))
+      bloom_probe_sample(S.dev, S.imm, frame, S.valid_eye, srv_for(job.color), S.out_srv);
+  } else {
+    note_fallback(S.ngx_unavailable ? "NGX initialization or capability check failed" : "upscaler job failed");
+  }
   S.gpu_timer.stop(S.imm, timer);
-  if (bloom_probe_wants(job.frame))
-    bloom_probe_sample(S.dev, S.imm, job.frame, stereo_eye(), srv_for(job.color), S.out_srv);
 
   S.imm1->SwapDeviceContextState(prev, nullptr);
   if (prev) prev->Release();
@@ -484,15 +538,26 @@ void run_job(const Job& job) {
   }
 }
 
-void split_here(ID3D11DeviceContext* ctx, std::shared_ptr<Job> job) {
-  ID3D11CommandList* part = nullptr;
-  HRESULT hr = orig_FinishCommandList(ctx, TRUE, &part);
-  if (FAILED(hr) || !part) {
-    ACO_LOG("upscaler: FinishCommandList split failed 0x%08lx", hr);
-    return;
-  }
+ComPtr<ID3D11CommandList> finish_part(ID3D11DeviceContext* ctx) {
+  ComPtr<ID3D11CommandList> part;
+  HRESULT hr = orig_FinishCommandList(ctx, TRUE, part.GetAddressOf());
+  if (FAILED(hr)) ACO_LOG("upscaler: FinishCommandList split failed 0x%08lx", hr);
+  return part;
+}
+
+bool split_here(ID3D11DeviceContext* ctx, std::shared_ptr<Job> job = {}) {
+  Part part;
+  part.list = finish_part(ctx);
+  if (!part.list) return false;
+  part.job = std::move(job);
   std::lock_guard lock(S.mutex);
-  S.pending[ctx].emplace_back(part, std::move(job));
+  S.pending[ctx].push_back(std::move(part));
+  return true;
+}
+
+bool wants_upscale() {
+  const Config& cfg = config();
+  return cfg.enabled && (!S.ngx_unavailable.load() || cfg.backend == "bilinear" || cfg.debug != "none");
 }
 
 bool on_linear_z(ID3D11DeviceContext* ctx) {
@@ -524,8 +589,10 @@ bool on_linear_z(ID3D11DeviceContext* ctx) {
 
 bool on_taa(ID3D11DeviceContext* ctx) {
   const Config& cfg = config();
+  uint64_t generation = S.resize_generation.load();
   S.n_taa_calls++;
-  if (!cfg.enabled || !ensure_kernels()) return false;
+  const bool upscale = wants_upscale() && ensure_kernels();
+  if (!upscale && !cursor_needs_depth()) return false;
 
   ID3D11ShaderResourceView* srv[4] = {};
   ctx->PSGetShaderResources(kTaaColor, 4, srv);
@@ -536,7 +603,7 @@ bool on_taa(ID3D11DeviceContext* ctx) {
   UINT first[ncb] = {}, num[ncb] = {};
   ID3D11DeviceContext1* c1 = nullptr;
   ctx->QueryInterface(__uuidof(ID3D11DeviceContext1), reinterpret_cast<void**>(&c1));
-  c1->PSGetConstantBuffers1(0, ncb, cb, first, num);
+  if (c1) c1->PSGetConstantBuffers1(0, ncb, cb, first, num);
 
   auto cleanup = [&] {
     for (auto*& s : srv) safe_release(s);
@@ -595,25 +662,26 @@ bool on_taa(ID3D11DeviceContext* ctx) {
   ID3D11Resource* lin = resource_of(srv[2]);
   ID3D11Resource* taa_out = resource_of(rtv[0]);
   ID3D11Resource* raw = nullptr;
+  auto job = std::make_shared<Job>();
+  ComPtr<ID3D11UnorderedAccessView> mv_uav;
   {
     std::lock_guard lock(S.mutex);
-    if (!ensure_mv(rw, rh)) {
-      color->Release();
-      lin->Release();
-      taa_out->Release();
-      cleanup();
-      return false;
+    if (upscale && ensure_mv(rw, rh)) {
+      mv_uav = S.mv_uav;
+      job->mv = S.mv;
+      job->mv_srv = S.mv_srv;
+      if (S.taa_outputs.insert(taa_out).second) taa_out->AddRef();
     }
     auto it = S.lin_to_raw.find(lin);
     if (it != S.lin_to_raw.end()) {
       raw = it->second;
       raw->AddRef();
     }
-    if (S.taa_outputs.insert(taa_out).second) taa_out->AddRef();
   }
 
-  // 1) Motion vectors, recorded in the game's stream with the TAA pass's own constant buffers.
-  {
+  // Record motion reconstruction only for upscale jobs. A cursor-only job
+  // publishes the actual engine depth at execution time in each eye.
+  if (mv_uav) {
     ID3D11ComputeShader* old_cs = nullptr;
     ctx->CSGetShader(&old_cs, nullptr, nullptr);
     ID3D11ShaderResourceView* old_srv[2] = {};
@@ -628,7 +696,7 @@ bool on_taa(ID3D11DeviceContext* ctx) {
     ctx->CSSetShader(S.k.motion, nullptr, 0);
     ID3D11ShaderResourceView* in[2] = {srv[1], srv[2]};
     ctx->CSSetShaderResources(0, 2, in);
-    ctx->CSSetUnorderedAccessViews(0, 1, &S.mv_uav, nullptr);
+    ctx->CSSetUnorderedAccessViews(0, 1, mv_uav.GetAddressOf(), nullptr);
     for (int i = 0; i < 3; ++i) {
       UINT slot = kernels::kMotionCbSlots[i];
       constexpr UINT source_slots[] = {title::pass_slot, title::instance_slot, title::temporal_slot};
@@ -648,29 +716,20 @@ bool on_taa(ID3D11DeviceContext* ctx) {
     for (auto*& b : old_cb) safe_release(b);
   }
 
-  // 2) Keep engine consumers of the TAA output (screenshots, next-frame effects) fed with the
-  //    un-antialiased colour, since the TAA resolve no longer writes it.
-  if constexpr (title::origins) ctx->CopyResource(taa_out, color);
-
-  // 3) DLSS runs between the two halves of this command list.
-  auto job = std::make_shared<Job>();
-  job->color = color;  // ownership transferred
+  // Preserve the engine resolve and temporal history. The composite can be
+  // recorded on a different worker before this job ever reaches NGX.
+  job->color = color;
   job->depth = raw;
-  job->responsive = resource_of(srv[3]);
+  job->taa_output.Attach(taa_out);
   job->render_w = rw;
   job->render_h = rh;
   job->jitter_x = tc.sub_pixel_jitter[0];
   job->jitter_y = tc.sub_pixel_jitter[1];
   job->frame = S.frame.load();
+  job->resize_generation = generation;
   job->cam = cam;
-  S.taa_replaced_frame.store(job->frame);
-  S.n_taa++;
-  {
-    std::lock_guard jl(S.jit_mutex);
-    S.jitters.emplace(job->jitter_x, job->jitter_y);
-  }
+  if (job->mv) S.n_taa++;
   lin->Release();
-  taa_out->Release();
   cleanup();
 
   if (ctx == S.imm) {
@@ -678,48 +737,62 @@ bool on_taa(ID3D11DeviceContext* ctx) {
   } else {
     split_here(ctx, std::move(job));
   }
-  // Odyssey still renders its three masked draws into the engine-owned history.
-  return title::origins;
+  return false;  // the caller issues the game's original TAA draw
+}
+
+// Execution is ordered on the presenting immediate context. Never consume an
+// earlier frame, the other eye, a different engine target or a resized output.
+bool use_upscaled_draw(ID3D11Resource* scene, ID3D11ShaderResourceView* upscaled) {
+  if (S.resized.load() || !config().enabled || !S.valid_scene || S.valid_scene.Get() != scene || S.fg_frame != S.frame.load() ||
+      S.valid_eye != stereo_eye() || upscaled != S.out_srv) {
+    S.output_composited = false;
+    S.last_swap_frame = UINT64_MAX;
+    return false;
+  }
+  S.output_composited = true;
+  S.last_swap_frame = S.fg_frame;
+  S.presented_backend = S.output_backend;
+  S.n_swap++;
+  return true;
 }
 
 bool on_composite(ID3D11DeviceContext* ctx, const std::function<void()>& draw) {
-  const Config& cfg = config();
-  static std::atomic<int> diag{0};
-  if (diag++ < 8)
-    ACO_LOG("upscaler: composite ctx=%p imm=%d out_srv=%p replaced_frame=%llu frame=%llu", static_cast<void*>(ctx),
-            ctx == S.imm, static_cast<void*>(S.out_srv), (unsigned long long)S.taa_replaced_frame.load(),
-            (unsigned long long)S.frame.load());
   S.n_comp++;
-  // Only swap if the TAA of this frame was actually replaced (else the TAA output is valid).
-  if (!cfg.enabled || !S.out_srv || S.taa_replaced_frame.load() + 1 < S.frame.load()) return false;
-  // The composite is out = ui + (1 - ui.a) * scene with ui = t86 (texture0, premultiplied) and
-  // scene = t87 (texture1). Only the scene slot may be swapped: at 100% render scale the engine's
-  // texture pool hands former TAA outputs to the UI layer too, so identity alone isn't enough.
-  ID3D11ShaderResourceView* srv[2] = {};
-  ctx->PSGetShaderResources(title::texture0, 2, srv);
-  int slot = -1;
-  if (srv[1]) {
+  if (!wants_upscale()) return false;
+  // Only the scene slot (t87 in Origins) is replaceable. The UI can reuse a
+  // resource from the same pool at 100% render scale.
+  constexpr UINT slot = title::texture0 + 1;
+  ComPtr<ID3D11ShaderResourceView> native;
+  ctx->PSGetShaderResources(slot, 1, native.GetAddressOf());
+  if (!native) return false;
+  Part part;
+  native->GetResource(part.scene.GetAddressOf());
+  {
     std::lock_guard lock(S.mutex);
-    ID3D11Resource* r = resource_of(srv[1]);
-    if (S.taa_outputs.count(r)) slot = 1;
-    r->Release();
+    if (!S.out_srv || !S.taa_outputs.count(part.scene.Get())) return false;
+    part.upscaled = S.out_srv;
   }
-  if (diag < 10) {
-    ID3D11Resource* r0 = srv[0] ? resource_of(srv[0]) : nullptr;
-    ID3D11Resource* r1 = srv[1] ? resource_of(srv[1]) : nullptr;
-    ACO_LOG("upscaler: composite t86=%p t87=%p -> slot %d (%zu known TAA outputs)", static_cast<void*>(r0),
-            static_cast<void*>(r1), slot, S.taa_outputs.size());
-    if (r0) r0->Release();
-    if (r1) r1->Release();
-  }
-  if (slot >= 0) {
-    S.n_swap++;
-    ctx->PSSetShaderResources(title::texture0 + slot, 1, &S.out_srv);
+  if (ctx == S.imm) {
+    if (!use_upscaled_draw(part.scene.Get(), part.upscaled.Get())) return false;
+    ctx->PSSetShaderResources(slot, 1, part.upscaled.GetAddressOf());
     draw();
-    ctx->PSSetShaderResources(title::texture0 + slot, 1, &srv[slot]);
+    ctx->PSSetShaderResources(slot, 1, native.GetAddressOf());
+    return true;
   }
-  for (auto*& s : srv) safe_release(s);
-  return slot >= 0;
+
+  if (!split_here(ctx)) return false;  // unconditional commands before the draw
+  ctx->PSSetShaderResources(slot, 1, part.upscaled.GetAddressOf());
+  draw();
+  ctx->PSSetShaderResources(slot, 1, native.GetAddressOf());
+  part.upscale_draw = finish_part(ctx);
+  if (!part.upscale_draw) return false;
+  draw();
+  part.list = finish_part(ctx);
+  if (part.list) {
+    std::lock_guard lock(S.mutex);
+    S.pending[ctx].push_back(std::move(part));
+  }
+  return true;
 }
 
 // Documents\Assassin's Creed Origins\ACO.ini
@@ -752,15 +825,6 @@ void upscaler_preinit() {
 }
 
 void upscaler_init(ID3D11Device* dev, ID3D11DeviceContext* immediate) {
-  // The game creates probe devices before the real one; always bind to the newest. Lazily created
-  // resources belong to whichever device was current when first needed (the real one).
-  if (S.dev == dev) return;
-  if (S.own_state) S.own_state->Release();
-  S.own_state = nullptr;
-  if (S.dev1) S.dev1->Release();
-  if (S.imm1) S.imm1->Release();
-  S.dev1 = nullptr;
-  S.imm1 = nullptr;
   bloom_probe_init();
   S.dev = dev;
   S.imm = immediate;
@@ -770,15 +834,59 @@ void upscaler_init(ID3D11Device* dev, ID3D11DeviceContext* immediate) {
   HRESULT hr = S.dev1 ? S.dev1->CreateDeviceContextState(0, &fl, 1, D3D11_SDK_VERSION, __uuidof(ID3D11Device1), nullptr,
                                                          &S.own_state)
                       : E_NOINTERFACE;
-  S.gpu_timer = GpuTimer();
   S.gpu_timer.init(dev);
-  ACO_LOG("upscaler: init (device context state 0x%08lx)", hr);
+  if (S.own_state && S.imm1) S.ready_device.store(dev, std::memory_order_release);
+  else note_fallback("private D3D11 context state unavailable");
+  ACO_LOG("upscaler: init presenting device %p (device context state 0x%08lx)", static_cast<void*>(dev), hr);
 }
 
 uint64_t upscaler_frame() { return S.frame.load(std::memory_order_relaxed); }
 
+static void read_display_size(IDXGISwapChain* sc) {
+  DXGI_SWAP_CHAIN_DESC d{};
+  if (SUCCEEDED(sc->GetDesc(&d))) {
+    // In full-width SBS, the hooked description already reports a single eye.
+    S.display_size.store((uint64_t(d.BufferDesc.Width) << 32) | d.BufferDesc.Height);
+  }
+}
+
+void upscaler_on_resize(IDXGISwapChain* sc) {
+  S.resized.store(true);
+  S.resize_generation.fetch_add(1);
+  read_display_size(sc);
+}
+
 void upscaler_on_present(IDXGISwapChain* sc) {
   uint64_t f = S.frame.fetch_add(1) + 1;
+  static IDXGISwapChain* previous = nullptr;  // identity only; DXGI owns the chain
+  if (!previous) read_display_size(sc);
+  else if (sc != previous) upscaler_on_resize(sc);
+  previous = sc;
+  if (S.resized.exchange(false)) {
+    // Retire the previous resolution's cached engine textures on the immediate
+    // thread. Command lists and jobs hold their own references until execution.
+    S.valid_scene = nullptr;
+    S.last_swap_frame = UINT64_MAX;
+    safe_release(S.fg_depth);
+    S.fg_mv.Reset();
+    for (auto& feature : S.feat) {
+      feature.reset_next = true;
+      if (!feature.handle) feature.rw = 0;  // a fresh swapchain may permit feature creation
+    }
+    for (auto& [resource, view] : S.srv_cache) {
+      resource->Release();
+      safe_release(view);
+    }
+    S.srv_cache.clear();
+    std::lock_guard lock(S.mutex);
+    for (auto& [lin, raw] : S.lin_to_raw) {
+      lin->Release();
+      raw->Release();
+    }
+    S.lin_to_raw.clear();
+    for (auto* target : S.taa_outputs) target->Release();
+    S.taa_outputs.clear();
+  }
   // Hotkey: DLSS <-> the game's own TAA, for A/B comparisons in play (edge-triggered).
   static bool key_was_down = false;
   if (int vk = config_toggle_vk()) {
@@ -799,15 +907,14 @@ void upscaler_on_present(IDXGISwapChain* sc) {
   if (!S.perf_last.QuadPart) S.perf_last = now;
   double elapsed = double(now.QuadPart - S.perf_last.QuadPart) / double(freq.QuadPart);
   if (elapsed >= 2.0) {
-    const Config& cfg = config();
     double gpu = S.gpu_timer.samples ? S.gpu_timer.total_ms / S.gpu_timer.samples : 0.0;
-    ACO_LOG("perf: %.1f fps (%.2f ms avg, %.2f ms worst) | upscale gpu %.3f ms [%s%s] render %ux%u -> %ux%u",
+    ACO_LOG("perf: %.1f fps (%.2f ms avg, %.2f ms worst) | upscale gpu %.3f ms [%s] render %ux%u -> %ux%u",
             S.perf_frames / elapsed, 1000.0 * elapsed / S.perf_frames, S.perf_max_ms, gpu,
-            cfg.enabled ? cfg.backend.c_str() : "game-taa", cfg.debug == "none" ? "" : (" debug=" + cfg.debug).c_str(),
+            S.last_swap_frame == f - 1 ? S.presented_backend : "game-taa",
             S.mv_w, S.mv_h, S.out_w, S.out_h);
     {
       std::lock_guard jl(S.jit_mutex);
-      ACO_LOG("perf: taa_calls=%u bails=%u taa=%u jobs=%u dlss=%u composite=%u swapped=%u distinct_jitters=%zu", S.n_taa_calls.exchange(0), S.n_bail.load(), S.n_taa.exchange(0),
+      ACO_LOG("perf: taa_calls=%u bails=%u taa=%u jobs=%u dlss=%u game_composite=%u swapped=%u distinct_jitters=%zu", S.n_taa_calls.exchange(0), S.n_bail.load(), S.n_taa.exchange(0),
               S.n_jobs.exchange(0), S.n_dlss.exchange(0), S.n_comp.exchange(0), S.n_swap.exchange(0),
               S.jitters.size());
       S.jitters.clear();
@@ -819,17 +926,20 @@ void upscaler_on_present(IDXGISwapChain* sc) {
     S.gpu_timer.samples = 0;
   }
   if (f == 1 || f % 64 == 0) {
-    DXGI_SWAP_CHAIN_DESC d;
-    if (SUCCEEDED(sc->GetDesc(&d))) {
-      S.display_w.store(d.BufferDesc.Width);
-      S.display_h.store(d.BufferDesc.Height);
-    }
+    read_display_size(sc);
     config_reload();
   }
 }
 
 bool upscaler_on_draw(ID3D11DeviceContext* ctx, ShaderClass cls, const std::function<void()>& draw) {
-  if (!S.dev || !S.own_state) return false;
+  if (cls != ShaderClass::LinearZ && cls != ShaderClass::TemporalAA && cls != ShaderClass::UIComposite) return false;
+  auto* active = S.ready_device.load(std::memory_order_acquire);
+  if (!active || S.resized.load()) return false;
+  if (ctx != S.imm) {
+    ComPtr<ID3D11Device> owner;
+    ctx->GetDevice(&owner);
+    if (owner.Get() != active) return false;
+  }
   switch (cls) {
     case ShaderClass::LinearZ: return on_linear_z(ctx);
     case ShaderClass::TemporalAA: latency_on_taa(ctx); return on_taa(ctx);
@@ -839,7 +949,7 @@ bool upscaler_on_draw(ID3D11DeviceContext* ctx, ShaderClass cls, const std::func
 }
 
 void upscaler_on_finish_command_list(ID3D11DeviceContext* ctx, ID3D11CommandList* cl) {
-  std::vector<std::pair<ID3D11CommandList*, std::shared_ptr<Job>>> parts;
+  std::vector<Part> parts;
   {
     std::lock_guard lock(S.mutex);
     auto it = S.pending.find(ctx);
@@ -847,10 +957,7 @@ void upscaler_on_finish_command_list(ID3D11DeviceContext* ctx, ID3D11CommandList
     parts = std::move(it->second);
     S.pending.erase(it);
   }
-  if (!cl) {
-    for (auto& p : parts) p.first->Release();
-    return;
-  }
+  if (!cl) return;
   auto* chain = new Chain;
   chain->parts = std::move(parts);
   cl->SetPrivateDataInterface(kChainGuid, chain);
@@ -863,20 +970,34 @@ bool upscaler_on_execute_command_list(ID3D11DeviceContext* ctx, ID3D11CommandLis
   UINT size = sizeof(u);
   if (FAILED(cl->GetPrivateData(kChainGuid, &size, &u)) || !u) return false;
   auto* chain = static_cast<Chain*>(u);
-  for (auto& [part, job] : chain->parts) {
-    orig_ExecuteCommandList(ctx, part, restore);
-    trace_note(ctx, "\"what\":\"dlss\"");
-    run_job(*job);
+  for (const Part& part : chain->parts) {
+    bool use_upscaled = part.upscale_draw && use_upscaled_draw(part.scene.Get(), part.upscaled.Get());
+    orig_ExecuteCommandList(ctx, use_upscaled ? part.upscale_draw.Get() : part.list.Get(), restore);
+    if (part.job) {
+      trace_note(ctx, "\"what\":\"dlss\"");
+      run_job(*part.job);
+    }
   }
   orig_ExecuteCommandList(ctx, cl, restore);
   u->Release();
   return true;
 }
 
+ID3D11Texture2D* upscaler_cursor_depth(uint32_t& render_w, uint32_t& render_h) {
+  if (S.resized.load() || !S.fg_depth || S.fg_frame != S.frame.load()) return nullptr;
+  render_w = S.fg_rw;
+  render_h = S.fg_rh;
+  ID3D11Texture2D* depth = nullptr;
+  S.fg_depth->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&depth));
+  return depth;
+}
+
 bool upscaler_fg_inputs(FgInputs* o) {
-  // Only valid when DLSS ran for the frame being presented.
-  if (!S.mv || !S.fg_depth || !S.out || S.fg_frame + 1 < S.frame.load()) return false;
-  o->mv = S.mv;
+  // Present advanced the frame counter. The *latest* contents of S.out must
+  // have reached the composite, even if several jobs ran in this game frame.
+  if (S.resized.load() || !S.output_composited || !S.valid_scene || !S.fg_depth || S.fg_frame + 1 != S.frame.load())
+    return false;
+  o->mv = S.fg_mv.Get();
   o->mv->AddRef();
   o->depth = S.fg_depth;
   o->depth->AddRef();

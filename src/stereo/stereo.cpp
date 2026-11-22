@@ -277,7 +277,6 @@ double now_ms() {
 
 void stereo_init(ID3D11Device* dev, ID3D11DeviceContext* imm) {
   if (S.dev == dev) return;
-  // The game creates probe devices first; bind to the newest (as the upscaler does).
   release(S.own_state);
   release(S.dev1);
   release(S.imm1);
@@ -299,13 +298,13 @@ int stereo_eye() { return g_eye.load(std::memory_order_relaxed); }
 
 // ---- swapchain layout --------------------------------------------------------------------------
 
-UINT stereo_swapchain_scale() {
+UINT stereo_swapchain_scale(HWND hwnd) {
   const Config& cfg = config();
   if (cfg.stereo_mode == "off") return 1;
   // mode=auto: decide now (before Frame Generation sets up its back buffer at the first GetBuffer)
   // whether this session may show stereo.
   if (cfg.stereo_mode == "auto") {
-    int ds = hypr_display_stereo_now();
+    int ds = hypr_display_stereo_now(hwnd);
     ACO_LOG("stereo: mode=auto, display at swapchain creation: %s", ds == 1 ? "stereo" : ds == 0 ? "mono" : "unknown");
     if (ds != 1) return 1;
     config_block_fg();
@@ -392,7 +391,7 @@ void stereo_on_present(IDXGISwapChain* sc, PFN_GetBuffer real_get_buffer) {
   if (cfg.stereo_mode != "off") hypr_start();
   bool display_stereo = hypr_display_stereo() == 1;
   bool stereo_display = cfg.stereo_mode == "sbs" || (cfg.stereo_mode == "auto" && display_stereo);
-  bool want = (rig::armed() || stereo_display) && S.dev && S.imm1 && !S.failed && !fg12_proxy_on();
+  bool want = (rig::armed() || stereo_display) && S.dev && S.imm1 && !S.failed && !fg12_proxy_on(sc);
   bool wide = sc == S.wide_sc;
   RecFrame* f = rec_stop(rig::armed());
   TemporalPresentScope compositor;

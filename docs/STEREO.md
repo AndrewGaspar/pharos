@@ -231,7 +231,9 @@ Under DXVK, `sbs` can't reach full resolution in a 1920 window yet:
 **The window is tagged for HypXRland.** The tag is `stereo-hsbs` or `stereo-sbs` (the user's
 `hyprland-xr.lua` maps `stereo-<layout>`). It's set over Hyprland's IPC socket from inside Wine,
 ported from torchbearer. `mode = auto` turns stereo on while HypXRland reports the game's monitor as
-`"stereo": "sbs"`.
+`"stereo": "sbs"`. At swapchain creation Pharos briefly marks its window title and checks which
+mapped client reports that marker. It uses that client's monitor, including when another output
+has focus. A headless game with no matching desktop window selects mono and can use frame generation.
 
 If Quiver stays open across a compositor restart, a new game can inherit the retired
 `HYPRLAND_INSTANCE_SIGNATURE`. Pharos first tries that instance. If the connection fails,
@@ -240,8 +242,8 @@ and connects there before choosing a swapchain. A successful fallback writes
 `hyprland: recovered compositor` in `pharos.log`. If a previous launch already selected the
 frame-generation back buffer, a fresh game launch is required to switch to stereo.
 
-**Frame Generation is off for the session once `[stereo] mode` isn't `off`.** It presents generated
-frames from its own back buffer.
+Frame generation uses its own back buffer. An explicit `[stereo] mode=sbs`, or auto mode that
+detects a stereo output at swapchain creation, disables frame generation for the session.
 
 ## Performance (measured, t1, Discovery Tour courtyard, GPU to itself)
 

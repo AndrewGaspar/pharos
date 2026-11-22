@@ -7,6 +7,10 @@
 // steady state. See docs/FRAME_GENERATION.md (D3D12 route) and tools/interop-test/.
 #include "fg/fg_d3d12.h"
 #include "fg/camera.h"
+#include "fg/color.h"
+#include "core/ctxhooks.h"
+#include "core/hook.h"
+#include "core/vtidx.h"
 
 #include <windows.h>
 #include <d3d11_4.h>
@@ -82,6 +86,7 @@ struct Shared {
   ID3D12Resource* t12 = nullptr;
   UINT w = 0, h = 0;
   DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
+  bool has_uav = false;
   void release() {
     safe_release(t12);
     safe_release(t11);
@@ -93,6 +98,10 @@ struct Shared {
 // One frame's DLSS-G inputs and outputs. Frames alternate between sets ([fg] sets=2, or 3), so the
 // game can copy the next frame's inputs while the present thread still shows this one.
 struct Set {
+  // When the game presents scRGB, NGX interpolates RGB10/PQ. All decoded
+  // outputs of a set share one FP16 scratch, consumed in present order.
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> decoded;
+  Microsoft::WRL::ComPtr<ID3D11CommandList> encode, decode[kMaxGen], decode_outreal;
   Shared color, depth, mv, hudless;
   Shared out[kMaxGen];  // OutputInterpolated of generated index 1..n_gen
   ID3D11Texture2D* real = nullptr;  // D3D11-only copy of the real frame, presented after the generated ones
@@ -158,6 +167,9 @@ struct State {
   Set* prev = &sets[1];
   Set* oldest = &sets[2];
   Shared outreal;
+  fg_color::Converter converter;
+  DXGI_COLOR_SPACE_TYPE color_space = DXGI_COLOR_SPACE_CUSTOM;
+  DXGI_FORMAT swap_fmt = DXGI_FORMAT_UNKNOWN;
   HANDLE game_event = nullptr;  // for CPU waits on the game thread (wait_d3d12 uses fence_event)
   uint32_t tex_w = 0, tex_h = 0;
   DXGI_FORMAT tex_fmt = DXGI_FORMAT_UNKNOWN;
@@ -208,7 +220,7 @@ DXGI_FORMAT storage_format(DXGI_FORMAT f) {
 }
 
 bool make_shared(Shared& s, UINT w, UINT h, DXGI_FORMAT fmt, bool uav) {
-  if (s.t11 && s.w == w && s.h == h && s.fmt == fmt) return true;
+  if (s.t11 && s.w == w && s.h == h && s.fmt == fmt && s.has_uav == uav) return true;
   s.release();
   D3D11_TEXTURE2D_DESC d{};
   d.Width = w;
@@ -246,6 +258,7 @@ bool make_shared(Shared& s, UINT w, UINT h, DXGI_FORMAT fmt, bool uav) {
   s.w = w;
   s.h = h;
   s.fmt = fmt;
+  s.has_uav = uav;
   return true;
 }
 
@@ -533,13 +546,22 @@ bool ensure_feature(uint32_t w, uint32_t h, uint32_t rw, uint32_t rh, DXGI_FORMA
 // outputs (more are created when the multiplier grows, the surplus released when it shrinks). The
 // game thread waits for the sets' evaluations (join + set fences) before calling this with a new
 // n_out, and outputs above the new count are no longer read by any queued job.
-bool ensure_textures(const D3D11_TEXTURE2D_DESC& bb, unsigned n_out) {
-  DXGI_FORMAT f = storage_format(bb.Format);
+bool ensure_textures(const D3D11_TEXTURE2D_DESC& bb, unsigned n_out, bool convert) {
+  DXGI_FORMAT f = convert ? DXGI_FORMAT_R10G10B10A2_UNORM : storage_format(bb.Format);
   static unsigned have_out = 0;
-  bool same = S.tex_w == bb.Width && S.tex_h == bb.Height && S.tex_fmt == f;
+  bool same = S.tex_w == bb.Width && S.tex_h == bb.Height && S.tex_fmt == f && S.swap_fmt == bb.Format;
   if (same && have_out == n_out) return true;
   if (!same) {
-    for (Set& s : S.sets) safe_release(s.real);
+    for (Set& s : S.sets) {
+      safe_release(s.real);
+      s.decoded.Reset();
+      s.encode.Reset();
+      s.decode_outreal.Reset();
+      for (auto& pass : s.decode) pass.Reset();
+    }
+    for (auto*& stage : S.stage) safe_release(stage);
+    safe_release(S.verify_prev);
+    S.verify_pending = -1;
     S.tex_w = S.tex_h = 0;
     have_out = 0;
   }
@@ -552,15 +574,28 @@ bool ensure_textures(const D3D11_TEXTURE2D_DESC& bb, unsigned n_out) {
   d.SampleDesc.Count = 1;
   d.Usage = D3D11_USAGE_DEFAULT;
   d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+  if (!make_shared(S.outreal, bb.Width, bb.Height, f, true)) return false;
   for (Set& s : S.sets) {
     if (!s.real && FAILED(S.dev->CreateTexture2D(&d, nullptr, &s.real))) return false;
-    if (!make_shared(s.color, bb.Width, bb.Height, f, false)) return false;
+    if (!make_shared(s.color, bb.Width, bb.Height, f, convert)) return false;
+    if (convert) {
+      auto decoded = d;
+      decoded.BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
+      if ((!s.decoded && FAILED(S.dev->CreateTexture2D(&decoded, nullptr, &s.decoded))) ||
+          (!s.encode && !S.converter.record(S.dev, s.real, s.color.t11, true, &s.encode)) ||
+          (!s.decode_outreal && !S.converter.record(S.dev, S.outreal.t11, s.decoded.Get(), false, &s.decode_outreal)))
+        return false;
+    }
     for (unsigned k = 0; k < unsigned(kMaxGen); ++k) {
-      if (k >= n_out) s.out[k].release();
-      else if (!make_shared(s.out[k], bb.Width, bb.Height, f, true)) return false;
+      if (k >= n_out) {
+        s.decode[k].Reset();
+        s.out[k].release();
+      } else if (!make_shared(s.out[k], bb.Width, bb.Height, f, true) ||
+                 (convert && !s.decode[k] && !S.converter.record(S.dev, s.out[k].t11, s.decoded.Get(), false,
+                                                                &s.decode[k]))) return false;
     }
   }
-  if (!make_shared(S.outreal, bb.Width, bb.Height, f, true)) return false;
+  S.swap_fmt = bb.Format;
   S.tex_w = bb.Width;
   S.tex_h = bb.Height;
   S.tex_fmt = f;
@@ -606,9 +641,12 @@ bool generate(const FgInputs& in, ID3D11Texture2D* bb, unsigned n_gen, unsigned 
   const Config& cfg = config();
   Set& st = *S.cur;
   st.n_gen = 0;
-  S.imm->CopyResource(st.color.t11, bb);
+  if (st.encode) orig_ExecuteCommandList(S.imm, st.encode.Get(), TRUE); // st.real already holds bb
+  else S.imm->CopyResource(st.color.t11, bb);
   if (!copy_in(st.depth, in.depth) || !copy_in(st.mv, in.mv)) { gen_fail("inputs"); return false; }
-  bool hudless = cfg.fg_hudless && in.hudless;
+  // The upscaler's HUD-less output is SDR, before the game's HDR output transform.
+  bool hdr = fg_color::is_hdr(S.color_space);
+  bool hudless = !hdr && cfg.fg_hudless && in.hudless;
   if (hudless) {
     D3D11_TEXTURE2D_DESC hd;
     in.hudless->GetDesc(&hd);
@@ -680,7 +718,7 @@ bool generate(const FgInputs& in, ID3D11Texture2D* bb, unsigned n_gen, unsigned 
   p.set(NVSDK_NGX_DLSSG_Parameter_AutomodeOverrideReset, 0u);
   p.set(NVSDK_NGX_DLSSG_Parameter_BackbufferFrameID, ++S.backbuffer_id);
   if (float hz = display_hz(); hz > 0) p.set("DLSSG.RefreshRate", hz);
-  p.set(NVSDK_NGX_DLSSG_Parameter_ColorBuffersHDR, 0u);
+  p.set(NVSDK_NGX_DLSSG_Parameter_ColorBuffersHDR, unsigned(hdr));
   p.set(NVSDK_NGX_DLSSG_Parameter_DepthInverted, 1u);
   p.set(NVSDK_NGX_DLSSG_Parameter_CameraMotionIncluded, 1u);
   p.set(NVSDK_NGX_DLSSG_Parameter_Reset, S.reset ? 1u : 0u);
@@ -798,7 +836,6 @@ bool verify_textures() {
   S.cur->real->GetDesc(&d);
   d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
   if (!S.verify_prev && FAILED(S.dev->CreateTexture2D(&d, nullptr, &S.verify_prev))) return false;
-  d.Format = S.tex_fmt;
   d.Usage = D3D11_USAGE_STAGING;
   d.BindFlags = 0;
   d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
@@ -808,6 +845,36 @@ bool verify_textures() {
 }
 
 void verify_read() {
+  if (fg_color::needs_pq(S.color_space, S.swap_fmt)) {
+    // Compare linear light after decoding exactly the generated image sent to the swapchain.
+    // These are paired samples, unlike snapshots of the compositor at arbitrary times.
+    double peak[3]{}, average[3]{};
+    for (int i = 0; i < 3; ++i) {
+      D3D11_MAPPED_SUBRESOURCE m{};
+      if (FAILED(S.imm->Map(S.stage[i], 0, D3D11_MAP_READ, 0, &m))) return;
+      for (UINT y = 0; y < S.tex_h; ++y) {
+        const auto* row = reinterpret_cast<const uint16_t*>(static_cast<const BYTE*>(m.pData) + size_t(y) * m.RowPitch);
+        for (UINT x = 0; x < S.tex_w; ++x) {
+          const auto* pixel = row + x * 4;
+          auto half = [](uint16_t value) {
+            int exp = (value >> 10) & 31, fraction = value & 1023;
+            double v = exp == 31 ? 0.0 : std::ldexp(exp ? 1024 + fraction : fraction, (exp ? exp : 1) - 25);
+            return value & 0x8000 ? -v : v;
+          };
+          double nits = 80.0 * (.2126*half(pixel[0]) + .7152*half(pixel[1]) + .0722*half(pixel[2]));
+          peak[i] = std::max(peak[i], nits);
+          average[i] += nits;
+        }
+      }
+      S.imm->Unmap(S.stage[i], 0);
+      average[i] /= double(S.tex_w) * S.tex_h;
+    }
+    ACO_LOG("fg12 verify scRGB nits (previous/generated/current): peak %.1f/%.1f/%.1f average %.2f/%.2f/%.2f",
+            peak[0], peak[1], peak[2], average[0], average[1], average[2]);
+    return;
+  }
+  // The legacy PPM and MAD diagnostic reads only byte-packed SDR.
+  if (S.tex_fmt != DXGI_FORMAT_B8G8R8A8_UNORM && S.tex_fmt != DXGI_FORMAT_R8G8B8A8_UNORM) return;
   std::vector<std::vector<uint8_t>> img(3);
   for (int i = 0; i < 3; ++i) {
     D3D11_MAPPED_SUBRESOURCE m{};
@@ -858,19 +925,24 @@ void verify_read() {
   ++S.verify_n;
 }
 
-// What goes into the backbuffer for the generated (first) or real (second) present.
-void fill(ID3D11Texture2D* dst, bool generated_slot, const std::string& show, ID3D11Texture2D* gen,
-          ID3D11Texture2D* real) {
+// Select the NGX output only when it is about to be consumed, after its fence.
+ID3D11Texture2D* display_output(const Set& st, unsigned k, bool outreal) {
+  auto* pass = outreal ? st.decode_outreal.Get() : st.decode[k].Get();
+  if (!pass) return outreal ? S.outreal.t11 : st.out[k].t11;
+  orig_ExecuteCommandList(S.imm, pass, TRUE);
+  return st.decoded.Get();
+}
+
+void fill(ID3D11Texture2D* dst, bool generated_slot, const std::string& show, const Set& st, unsigned k) {
   if (show == "compare" || show == "compare_gen") {
-    // Debug: left half the real frame, right half OutputReal / the generated frame.
     D3D11_BOX left{0, 0, 0, S.tex_w / 2, S.tex_h, 1};
-    S.imm->CopySubresourceRegion(dst, 0, 0, 0, 0, real, 0, &left);
-    S.imm->CopySubresourceRegion(dst, 0, S.tex_w / 2, 0, 0, show == "compare_gen" ? gen : S.outreal.t11, 0, &left);
+    S.imm->CopySubresourceRegion(dst, 0, 0, 0, 0, st.real, 0, &left);
+    auto* right = display_output(st, k, show == "compare");
+    S.imm->CopySubresourceRegion(dst, 0, S.tex_w / 2, 0, 0, right, 0, &left);
     return;
   }
-  ID3D11Texture2D* src = generated_slot ? (show == "real" ? real : show == "outreal" ? S.outreal.t11 : gen)
-                                        : (show == "generated" ? gen : show == "outreal" ? S.outreal.t11 : real);
-  S.imm->CopyResource(dst, src);
+  bool use_output = show == "outreal" || (generated_slot ? show != "real" : show == "generated");
+  S.imm->CopyResource(dst, use_output ? display_output(st, k, show == "outreal") : st.real);
 }
 
 // ---- Present trace (`touch <out>/fgtrace-start`) -------------------------------------------------------
@@ -935,9 +1007,6 @@ HANDLE g_exc_file = INVALID_HANDLE_VALUE;  // see exception_logger
 DWORD g_present_tid = 0;
 
 struct Presenter {
-  int proxy = -1;  // decided at the first GetBuffer: 0 off, 1 on
-  PFN_GetBuffer real_get_buffer = nullptr;
-  ID3D11Texture2D* proxy_bb = nullptr;
   ID3D11DeviceContext* ctx = nullptr;  // immediate context, for plain presents before FG is ready
   std::mutex m;
   std::condition_variable cv;
@@ -981,10 +1050,22 @@ struct Presenter {
   uint32_t cap_join_n = 0;
 } P;
 
+// A probe may ask for its own identically sized back buffer before the first
+// Present. DXGI owns each proxy through private interface data on that chain.
+constexpr GUID kProxyTexture = {0x8416721a, 0x803e, 0x4787, {0x82,0x58,0xa5,0x02,0xc6,0xae,0x0f,0x58}};
+constexpr GUID kProxyMode = {0x104b1d67, 0xf3a0, 0x4812, {0xb5,0xc6,0x0b,0x15,0x59,0x91,0x3e,0xd6}};
+using Microsoft::WRL::ComPtr;
+ComPtr<ID3D11Texture2D> proxy_backbuffer(IDXGISwapChain* sc) {
+  ComPtr<ID3D11Texture2D> bb;
+  UINT size = sizeof(ID3D11Texture2D*);
+  sc->GetPrivateData(kProxyTexture, &size, bb.GetAddressOf());
+  return bb;
+}
+
 ID3D11Texture2D* real_backbuffer(IDXGISwapChain* sc) {
   ID3D11Texture2D* bb = nullptr;
-  HRESULT hr = P.real_get_buffer ? P.real_get_buffer(sc, 0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&bb))
-                                 : sc->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&bb));
+  auto real = reinterpret_cast<PFN_GetBuffer>(original(sc, vt::SwapChain_GetBuffer));
+  HRESULT hr = real(sc, 0, IID_PPV_ARGS(&bb));
   return SUCCEEDED(hr) ? bb : nullptr;
 }
 
@@ -1001,10 +1082,9 @@ struct Job {
   // Per generated index: the frame is ready when the D3D12 fence reaches wait_value; its texture;
   // ring slot of its evaluation (timestamp check, -1 = none) and that slot's end timestamp before it.
   UINT64 wait_value[kMaxGen] = {};
-  ID3D11Texture2D* gen[kMaxGen] = {};
+  const Set* set = nullptr;
   int ts_slot[kMaxGen] = {};
   UINT64 ts_old[kMaxGen] = {};
-  ID3D11Texture2D* real = nullptr;
   std::string show;
   bool gate = true;
   bool skip_gen = false;    // superseded before it started: present only the real frame
@@ -1118,7 +1198,7 @@ void present_loop() {
       if (!bb) break;
       int64_t c0 = now_us();
       if (j.gate) g_ctx_gate.fetch_add(1);
-      fill(bb, true, j.show, j.gen[k], j.real);
+      fill(bb, true, j.show, *j.set, k);
       int ti = trace_begin('G', j.frame, j.arrive_us, step, bb, S.imm, int(k) + 1, int(mult));
       bb->Release();
       int64_t c1 = now_us();
@@ -1148,7 +1228,7 @@ void present_loop() {
       // bisecting: no real present
     } else if (ID3D11Texture2D* bb = real_backbuffer(j.sc)) {
       if (j.gate) g_ctx_gate.fetch_add(1);
-      fill(bb, false, j.show, j.gen[0], j.real);
+      fill(bb, false, j.show, *j.set, 0);
       int ti = trace_begin('R', j.frame, j.arrive_us, step, bb, S.imm, 0, int(mult));
       bb->Release();
       t4 = now_us();
@@ -1184,17 +1264,18 @@ void present_loop() {
 // are summed in g_join_us (taken out of the real-frame interval: they are our back-pressure, not the
 // game's cadence).
 int64_t g_join_us = 0;  // game thread
-void join(size_t outstanding = 0) {
+bool join(size_t outstanding = 0) {
   std::unique_lock<std::mutex> lk(P.m);
   auto ok = [outstanding] { return g_jobs.size() + size_t(g_active) <= outstanding; };
-  if (ok()) return;
+  if (ok()) return true;
   int64_t t0 = now_us();
-  P.cv.wait_for(lk, std::chrono::milliseconds(500), ok);
+  bool joined = P.cv.wait_for(lk, std::chrono::milliseconds(500), ok);
   int64_t waited = now_us() - t0;
   if (GetCurrentThreadId() != g_present_tid) g_join_us += waited;
   P.perf_join_ms += waited / 1000.0;
   ++P.perf_join_n;
   ++P.cap_join_n;
+  return joined;
 }
 
 // ---- Frame-rate cap and multiplier ([fg] auto_cap, count, target_hz) ------------------------------
@@ -1395,11 +1476,10 @@ void enqueue(IDXGISwapChain* sc, PFN_RealPresent present, UINT sync, UINT flags,
   j.n_gen = st.n_gen;
   for (unsigned k = 0; k < st.n_gen; ++k) {
     j.wait_value[k] = config().fg_sync == "gpu" ? 0 : st.gen_v[k];
-    j.gen[k] = st.out[k].t11;
     j.ts_slot[k] = st.gen_slot[k];
     j.ts_old[k] = st.gen_ts_old[k];
   }
-  j.real = st.real;
+  j.set = &st;
   j.show = config().fg_skip == "present2" ? std::string("skip_present2") : show;
   j.gate = config().fg_present_gate;
   j.frame = S.backbuffer_id;
@@ -1581,81 +1661,62 @@ void trace_poll(ID3D11Texture2D* bb) {
 
 } // namespace
 
-bool fg12_proxy_on() { return P.proxy > 0; }
+bool fg12_proxy_on(IDXGISwapChain* sc) { return proxy_backbuffer(sc).Get() != nullptr; }
 
-HRESULT fg12_get_buffer(IDXGISwapChain* sc, UINT index, const _GUID& riid, void** out, PFN_GetBuffer real) {
-  P.real_get_buffer = real;
-  if (P.proxy < 0) {
-    P.proxy = config().fg_mode == "d3d12" && config().fg_present_thread ? 1 : 0;
-    if (P.proxy) {
-      ID3D11Device* dev = nullptr;
-      if (SUCCEEDED(sc->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void**>(&dev)))) {
-        enable_multithread(dev);
-        dev->Release();
-      }
-      ACO_LOG("fg12: proxy backbuffer + present thread enabled");
-    }
+// Also preserve a splash/auxiliary chain that requested a proxy before the
+// game renderer was identified, and Present1, which has no FG presenter.
+void fg12_copy_proxy(IDXGISwapChain* sc) {
+  auto proxy = proxy_backbuffer(sc);
+  if (!proxy) return;
+  ComPtr<ID3D11Texture2D> bb;
+  bb.Attach(real_backbuffer(sc));
+  if (!bb) return;
+  ComPtr<ID3D11Device> dev;
+  ComPtr<ID3D11DeviceContext> ctx;
+  proxy->GetDevice(&dev);
+  dev->GetImmediateContext(&ctx);
+  ctx->CopyResource(bb.Get(), proxy.Get());
+}
+
+HRESULT fg12_get_buffer(IDXGISwapChain* sc, UINT index, const _GUID& riid, void** out, PFN_GetBuffer real,
+                       bool eligible) {
+  if (index != 0 || !out) return real(sc, index, riid, out);
+  static std::mutex buffers;
+  std::lock_guard lock(buffers);
+  auto proxy = proxy_backbuffer(sc);
+  if (proxy) return proxy->QueryInterface(riid, out);
+  if (!eligible) return real(sc, index, riid, out);
+  BOOL enabled = FALSE;
+  UINT size = sizeof(enabled);
+  if (FAILED(sc->GetPrivateData(kProxyMode, &size, &enabled))) {
+    enabled = config().fg_mode == "d3d12" && config().fg_present_thread;
+    sc->SetPrivateData(kProxyMode, sizeof(enabled), &enabled);
   }
-  {
-    // Diagnostics: DXVK makes each Present wait until the present this many presents back is done.
-    static int64_t last = 0;
-    if (now_us() - last > 10000000) {
-      last = now_us();
-      IDXGIDevice1* d1 = nullptr;
-      UINT lat = 0;
-      if (SUCCEEDED(sc->GetDevice(__uuidof(IDXGIDevice1), reinterpret_cast<void**>(&d1)))) {
-        d1->GetMaximumFrameLatency(&lat);
-        d1->Release();
-      }
-      int want = config().fg_frame_latency;
-      if (want > 0 && config().fg_mode == "d3d12" && lat != UINT(want) &&
-          SUCCEEDED(sc->GetDevice(__uuidof(IDXGIDevice1), reinterpret_cast<void**>(&d1)))) {
-        d1->SetMaximumFrameLatency(want);
-        d1->Release();
-        ACO_LOG("fg12: maximum frame latency %u -> %d", lat, want);
-      }
-      ACO_LOG("fg12: game's maximum frame latency %u", lat);
-    }
-  }
-  if (!P.proxy) return real(sc, index, riid, out);
-  ID3D11Texture2D* swap_bb = nullptr;
-  HRESULT hr = real(sc, 0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&swap_bb));
+  if (!enabled) return real(sc, index, riid, out);
+  ComPtr<ID3D11Texture2D> swap_bb;
+  HRESULT hr = real(sc, index, IID_PPV_ARGS(&swap_bb));
   if (FAILED(hr)) return hr;
   D3D11_TEXTURE2D_DESC d;
   swap_bb->GetDesc(&d);
-  bool same = false;
-  if (P.proxy_bb) {
-    D3D11_TEXTURE2D_DESC pd;
-    P.proxy_bb->GetDesc(&pd);
-    same = pd.Width == d.Width && pd.Height == d.Height && pd.Format == d.Format;
-  }
-  if (!same) {
-    safe_release(P.proxy_bb);
-    ID3D11Device* dev = nullptr;
-    swap_bb->GetDevice(&dev);
-    d.MiscFlags = 0;
-    d.CPUAccessFlags = 0;
-    d.Usage = D3D11_USAGE_DEFAULT;
-    hr = dev->CreateTexture2D(&d, nullptr, &P.proxy_bb);
-    dev->Release();
-    ACO_LOG("fg12: proxy backbuffer %ux%u format %d bind 0x%x -> 0x%08lx", d.Width, d.Height, d.Format, d.BindFlags, hr);
-    if (FAILED(hr)) {
-      P.proxy_bb = nullptr;
-      swap_bb->Release();
-      return E_FAIL;
-    }
-  }
-  swap_bb->Release();
-  return P.proxy_bb->QueryInterface(riid, out);
+  ComPtr<ID3D11Device> dev;
+  swap_bb->GetDevice(&dev);
+  d.MiscFlags = 0;
+  d.CPUAccessFlags = 0;
+  d.Usage = D3D11_USAGE_DEFAULT;
+  hr = dev->CreateTexture2D(&d, nullptr, &proxy);
+  ACO_LOG("fg12: proxy backbuffer %ux%u format %d bind 0x%x -> 0x%08lx", d.Width, d.Height, d.Format, d.BindFlags, hr);
+  if (FAILED(hr) || FAILED(sc->SetPrivateDataInterface(kProxyTexture, proxy.Get())))
+    return real(sc, index, riid, out);
+  return proxy->QueryInterface(riid, out);
 }
 
-void fg12_before_resize() {
-  if (P.proxy != 1) return;
-  join();
-  safe_release(P.proxy_bb);  // the game has released its references (DXGI requires it for the real ones)
+void fg12_before_resize(IDXGISwapChain* sc) {
+  if (fg12_proxy_on(sc) && P.ctx) join();
 }
 
-bool fg12_proxy_active() { return P.proxy == 1; }
+void fg12_after_resize(IDXGISwapChain* sc) {
+  sc->SetPrivateDataInterface(kProxyTexture, nullptr);
+}
 
 float fg12_auto_cap() { return g_auto_cap.load(); }
 bool fg12_generating() { return g_fg_generating.load(); }
@@ -1727,9 +1788,83 @@ void update_toggle() {
   }
 }
 
+// Configure each color/size/count combination once. A temporary allocation failure
+// can recover without relaunching. A shader compile failure waits for a mode change.
+static bool prepare_output(IDXGISwapChain* sc, const D3D11_TEXTURE2D_DESC& bd, UINT count, bool proxy, int64_t now) {
+  struct Output {
+    UINT w, h, count;
+    DXGI_FORMAT format;
+    DXGI_COLOR_SPACE_TYPE cs;
+    bool operator==(const Output&) const = default;
+  };
+  static Output last{};
+  static bool ready = false;
+  static int64_t next_try = 0;
+  Output current{bd.Width, bd.Height, count, bd.Format, fg_color::space(sc, bd.Format)};
+  if (last != current) {
+    if (last.cs != current.cs || last.format != current.format) {
+      ACO_LOG("fg12: DXGI color space %u format %u, DLSS-G %s", unsigned(current.cs), unsigned(bd.Format),
+              fg_color::needs_pq(current.cs, bd.Format) ? "HDR10 (scRGB conversion)" :
+              !fg_color::supported(current.cs, bd.Format) ? "unavailable for this color encoding" :
+              fg_color::is_hdr(current.cs) ? "native HDR10" : "SDR");
+      S.converter.retry_shader();
+    }
+    last = current;
+    S.color_space = current.cs;
+    S.reset = true;
+    ready = false;
+    next_try = 0;
+  }
+  if (ready) return true;
+  bool convert = fg_color::needs_pq(current.cs, bd.Format);
+  if (!fg_color::supported(current.cs, bd.Format) || (convert && S.converter.compiler_failed()) || now < next_try)
+    return false;
+  // Old command lists and texture sets may still be in use by a queued present or GPU evaluation.
+  if (proxy && !join(0)) return false;
+  if (S.done12) {
+    wait_d3d12(S.done_value);
+    if (wait_fence()->GetCompletedValue() < S.done_value) return false;
+  }
+  ready = ensure_textures(bd, count, convert);
+  if (!ready) {
+    if (!next_try) ACO_LOG("fg12: texture or color-conversion setup failed; presenting real frames");
+    next_try = now + 2000000;
+  }
+  return ready;
+}
+
+static void update_frame_latency(IDXGISwapChain* sc) {
+  // Diagnostics: DXVK makes each Present wait until the present this many presents back is done.
+  static int64_t last = 0;
+  if (now_us() - last > 10000000) {
+    last = now_us();
+    IDXGIDevice1* d1 = nullptr;
+    UINT lat = 0;
+    if (SUCCEEDED(sc->GetDevice(__uuidof(IDXGIDevice1), reinterpret_cast<void**>(&d1)))) {
+      d1->GetMaximumFrameLatency(&lat);
+      d1->Release();
+    }
+    int want = config().fg_frame_latency;
+    if (want > 0 && config().fg_mode == "d3d12" && lat != UINT(want) &&
+        SUCCEEDED(sc->GetDevice(__uuidof(IDXGIDevice1), reinterpret_cast<void**>(&d1)))) {
+      d1->SetMaximumFrameLatency(want);
+      d1->Release();
+      ACO_LOG("fg12: maximum frame latency %u -> %d", lat, want);
+    }
+    ACO_LOG("fg12: game's maximum frame latency %u", lat);
+  }
+}
+
 bool fg12_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent real, HRESULT* hr, uint64_t frames) {
   const Config& cfg = config();
-  const bool proxy = P.proxy == 1;
+  update_frame_latency(sc);
+  auto proxy_bb = proxy_backbuffer(sc);
+  const bool proxy = proxy_bb.Get() != nullptr;
+  if (proxy && !P.ctx) {
+    ComPtr<ID3D11Device> dev;
+    proxy_bb->GetDevice(&dev);
+    enable_multithread(dev.Get());
+  }
   int64_t arrive = now_us();
   const int64_t join_at_arrive = g_join_us;
   // The previous frame's presents may still be running (they use the other texture set); the one
@@ -1756,6 +1891,7 @@ bool fg12_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent rea
     }
   }
   bool done = false;
+  bool generated = false;
   FgInputs in{};
   bool have_in = false;
   if (want && P.init_state == 2) {
@@ -1769,8 +1905,7 @@ bool fg12_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent rea
       }
     }
   }
-  ID3D11Texture2D* bb = proxy ? P.proxy_bb : real_backbuffer(sc);
-  if (proxy && bb) bb->AddRef();
+  ID3D11Texture2D* bb = proxy ? proxy_bb.Detach() : real_backbuffer(sc);
   if (proxy && bb) trace_poll(bb);
   if (have_in && bb) {
     detect_refresh(sc);
@@ -1785,17 +1920,7 @@ bool fg12_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent rea
     mult_range(lo, hi);
     const unsigned n_gen = unsigned(std::max(lo, std::min(hi, g_mult.load())) - 1);
     const unsigned feat_gen = unsigned(hi - 1);
-    {
-      // Textures about to be re-created or released (new size / format / count): nothing queued or
-      // on the GPU may still use them.
-      static unsigned last_feat_gen = 0;
-      if (last_feat_gen != feat_gen || S.tex_w != bd.Width || S.tex_h != bd.Height) {
-        if (proxy) join(0);
-        if (S.done12) wait_d3d12(S.done_value);
-        last_feat_gen = feat_gen;
-      }
-    }
-    if (ensure_textures(bd, feat_gen)) {
+    if (prepare_output(sc, bd, feat_gen, proxy, arrive)) {
       bool verify = cfg.fg_verify && verify_textures();
       if (verify && S.verify_pending > 0 && --S.verify_pending == 0) verify_read();
       if (cfg.fg_sync != "gpu") {
@@ -1813,11 +1938,10 @@ bool fg12_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent rea
       if (generate(in, bb, n_gen, feat_gen)) {
         if (verify && S.verify_pending <= 0 && now_us() - S.verify_last > 2000000 && st.n_gen) {
           // The generated frame closest to the midpoint.
-          const Shared& g = st.out[st.n_gen / 2];
           S.verify_last = now_us();
           S.imm->CopyResource(S.stage[0], prev_real ? prev_real : st.real);
           wait_eval(st.eval_v, S.game_event, 200);
-          S.imm->CopyResource(S.stage[1], g.t11);
+          S.imm->CopyResource(S.stage[1], display_output(st, st.n_gen / 2, false));
           S.imm->CopyResource(S.stage[2], st.real);
           S.verify_pending = 4;
         }
@@ -1838,15 +1962,16 @@ bool fg12_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent rea
             for (unsigned k = 0; k < st.n_gen; ++k) {
               if (cfg.fg_sync != "gpu") wait_eval(st.gen_v[k], S.game_event, 200);
               if (k && step > 0) wait_until(now_us() + step);
-              fill(dst, true, cfg.fg_show, st.out[k].t11, st.real);
+              fill(dst, true, cfg.fg_show, st, k);
               *hr = real(sc, sync, flags);
             }
             if (step > 0) wait_until(now_us() + step);
-            fill(dst, false, cfg.fg_show, st.n_gen ? st.out[0].t11 : st.real, st.real);
+            fill(dst, false, cfg.fg_show, st, 0);
             *hr = real(sc, sync, flags);
             if (proxy) dst->Release();
           }
         }
+        generated = st.n_gen != 0;
         S.perf_generated += st.n_gen;
         done = true;
       } else {
@@ -1873,15 +1998,14 @@ bool fg12_present(IDXGISwapChain* sc, UINT sync, UINT flags, PFN_RealPresent rea
     done = true;
   }
   safe_release(bb);
-  if (!done) return false;
-  if (!have_in) {
+  if (!generated) {
     // No Frame Generation for this frame (toggled off, menus, loading): the next FG frame's interval
     // must not span the gap. (It did: after e.g. 30 s with FG off the EMA jumped to ~3 s, the real
     // present then waited half of that and the game, blocked in join, ran at 2 fps for half a minute
     // while the EMA decayed - also after every menu or loading screen.)
     S.last_real_present = 0;
     pacing_update(false);
-    return true;
+    return done;
   }
 
   // Real-frame interval from the game's arrivals here (with the present thread, not inflated by our
