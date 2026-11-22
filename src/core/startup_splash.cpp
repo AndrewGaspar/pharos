@@ -2,10 +2,11 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <thread>
+#include <vector>
 
-#include "core/config.h"
 #include "core/hyprland.h"
 #include "core/log.h"
 #include "core/startup_splash_resource.h"
@@ -29,7 +30,7 @@ StartupWindows visible_game_windows() {
     RECT rect{};
     if (!GetWindowRect(hwnd, &rect)) return TRUE;
     const SIZE size{rect.right - rect.left, rect.bottom - rect.top};
-    // Origins also creates a visible 0x0 HWND with the splash class and the game's title.
+    // Anvil can also create a visible 0x0 HWND with the splash class and the game's title.
     if (size.cx < 2 || size.cy < 1) return TRUE;
     wchar_t name[64]{};
     if (!GetClassNameW(hwnd, name, 64)) return TRUE;
@@ -42,6 +43,45 @@ StartupWindows visible_game_windows() {
     return TRUE;
   }, reinterpret_cast<LPARAM>(&result));
   return result;
+}
+
+// Resample each eye independently. Windows layered surfaces use premultiplied BGRA,
+// while the artwork stores straight BGRA, including a soft, translucent window border.
+void pack_translucent_sbs(const BYTE* pixels, int eye_width, int height, SIZE size, bool swapped, BYTE* dst) {
+  auto coordinate = [](int index, int source_size, int dest_size) {
+    const auto value = (std::int64_t(index) * 2 + 1) * source_size * 128 / dest_size - 128;
+    return static_cast<int>(std::clamp<std::int64_t>(value, 0, std::int64_t(source_size - 1) * 256));
+  };
+  const size_t pitch = size_t(eye_width) * 2 * 4;
+  for (int y = 0; y < size.cy; ++y) {
+    const int sy = coordinate(y, height, size.cy);
+    const BYTE* top = pixels + size_t(height - 1 - sy / 256) * pitch; // bottom-up resource
+    const BYTE* bottom = sy / 256 + 1 < height ? top - pitch : top;
+    const int fy = sy % 256;
+    for (int eye = 0; eye < 2; ++eye) {
+      const int out_width = eye == 0 ? size.cx / 2 : size.cx - size.cx / 2;
+      const int origin = (swapped ? 1 - eye : eye) * eye_width;
+      for (int x = 0; x < out_width; ++x, dst += 4) {
+        const int sx = coordinate(x, eye_width, out_width);
+        const int left = (origin + sx / 256) * 4;
+        const int right = sx / 256 + 1 < eye_width ? left + 4 : left;
+        const int fx = sx % 256;
+        const BYTE* samples[] = {top + left, top + right, bottom + left, bottom + right};
+        const int weights[] = {(256 - fx) * (256 - fy), fx * (256 - fy), (256 - fx) * fy, fx * fy};
+        // Multiply by alpha before filtering. Invisible RGB never bleeds into a visible edge.
+        int alpha = 0;
+        std::int64_t rgb[3]{};
+        for (int i = 0; i < 4; ++i) {
+          const int coverage = weights[i] * samples[i][3];
+          alpha += coverage;
+          for (int c = 0; c < 3; ++c) rgb[c] += std::int64_t(coverage) * samples[i][c];
+        }
+        constexpr int rgb_scale = 256 * 256 * 255;
+        for (int c = 0; c < 3; ++c) dst[c] = static_cast<BYTE>((rgb[c] + rgb_scale / 2) / rgb_scale);
+        dst[3] = static_cast<BYTE>((alpha + 32768) / 65536);
+      }
+    }
+  }
 }
 
 // The stock window is one eye wide. Half-SBS then uses two source texels per displayed
@@ -64,10 +104,13 @@ void pack_half_sbs(const BYTE* pixels, int image_width, SIZE size, bool swapped,
 // Keep one surface at the native window size. Xwayland can take several polls to publish the
 // HWND and confirm the stereo rule. Resample once, *before* asking it to split the window.
 struct SplashSurface {
+  struct ClearRun { size_t first, count; };
   HDC dc = nullptr;
   HBITMAP bitmap = nullptr;
   HGDIOBJ previous = nullptr;
   SIZE extent{};
+  std::uint32_t* argb = nullptr;
+  std::vector<ClearRun> clear_runs;
 
   void reset() {
     if (previous && previous != HGDI_ERROR) SelectObject(dc, previous);
@@ -77,6 +120,8 @@ struct SplashSurface {
     bitmap = nullptr;
     previous = nullptr;
     extent = {};
+    argb = nullptr;
+    clear_runs.clear();
   }
   ~SplashSurface() { reset(); }
 
@@ -98,6 +143,21 @@ struct SplashSurface {
     if (!previous || previous == HGDI_ERROR) return false;
     const auto& header = artwork->bmiHeader;
     const auto* pixels = reinterpret_cast<const BYTE*>(artwork) + header.biSize;
+    if (header.biBitCount == 32) {
+      pack_translucent_sbs(pixels, header.biWidth / 2, header.biHeight, size, swapped, static_cast<BYTE*>(bits));
+      if (GetModuleHandleW(L"winex11.drv")) {
+        argb = static_cast<std::uint32_t*>(bits);
+        const size_t count = size_t(size.cx) * size.cy;
+        for (size_t i = 0; i < count;) {
+          if (argb[i]) { ++i; continue; }
+          const size_t first = i;
+          while (i < count && argb[i] == 0) ++i;
+          clear_runs.push_back({first, i - first});
+        }
+      }
+      extent = size;
+      return true;
+    }
     if (size.cx == header.biWidth / 2 && size.cx % 2 == 0 && size.cy == header.biHeight) {
       pack_half_sbs(pixels, header.biWidth, size, swapped, static_cast<BYTE*>(bits));
       extent = size;
@@ -122,17 +182,38 @@ struct SplashSurface {
     extent = size;
     return true;
   }
+
+  bool publish(HWND window, bool translucent) {
+    if (!translucent)
+      return UpdateLayeredWindow(window, nullptr, nullptr, nullptr, dc, nullptr, 0, nullptr, ULW_OPAQUE);
+    BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    auto update = [&] { return UpdateLayeredWindow(window, nullptr, nullptr, nullptr, dc, nullptr, 0, &blend, ULW_ALPHA); };
+    bool primed = false;
+    if (!clear_runs.empty()) {
+      // Wine's X11 driver shapes the window before uploading its new pixels. Previously
+      // opaque artwork would survive in the compositor's backing pixmap under our new
+      // transparent margins. Include them in one upload before publishing exact alpha.
+      for (const auto& run : clear_runs) std::fill_n(argb + run.first, run.count, 0x01000000u);
+      primed = update();
+      for (const auto& run : clear_runs) std::fill_n(argb + run.first, run.count, 0u);
+      if (!primed) return false;
+    }
+    // Once the first upload succeeds, the HWND contains the stereo pair, even if it
+    // closes during the second upload. Keep the matching compositor tag in that case.
+    return update() || primed;
+  }
 };
 
 void show_stereo(HINSTANCE module, bool forced, bool swapped) {
   if (!forced && !hypr_available()) return;
-  auto resource = FindResourceW(module, MAKEINTRESOURCEW(IDB_ORIGINS_SPLASH_STEREO), RT_BITMAP);
+  auto resource = FindResourceW(module, MAKEINTRESOURCEW(IDB_STARTUP_SPLASH_STEREO), RT_BITMAP);
   if (!resource) {
     ACO_LOG("startup splash: stereo artwork resource unavailable (%lu)", GetLastError());
     return;
   }
   auto* image = static_cast<const BITMAPINFO*>(LockResource(LoadResource(module, resource)));
-  if (!image || image->bmiHeader.biSize != sizeof(BITMAPINFOHEADER) || image->bmiHeader.biBitCount != 24 ||
+  if (!image || image->bmiHeader.biSize != sizeof(BITMAPINFOHEADER) ||
+      (image->bmiHeader.biBitCount != 24 && image->bmiHeader.biBitCount != 32) ||
       image->bmiHeader.biCompression != BI_RGB || image->bmiHeader.biClrUsed || image->bmiHeader.biHeight < 1 ||
       image->bmiHeader.biWidth < 2 || image->bmiHeader.biWidth % 2) {
     ACO_LOG("startup splash: invalid bitmap resource");
@@ -185,8 +266,8 @@ void show_stereo(HINSTANCE module, bool forced, bool swapped) {
       continue;
     }
     // Publish immediately after the compositor acknowledges the tag. Null position and
-    // size preserve the geometry of Origins' own layered window.
-    if (!UpdateLayeredWindow(window, nullptr, nullptr, nullptr, surface.dc, nullptr, 0, nullptr, ULW_OPAQUE)) {
+    // size preserve the geometry of the game's own layered window.
+    if (!surface.publish(window, image->bmiHeader.biBitCount == 32)) {
       if (added_tag) hypr_clear_splash_stereo(window);
       if (GetTickCount64() - first_visible > 1500) {
         ACO_LOG("startup splash: layered window update failed");
@@ -201,10 +282,8 @@ void show_stereo(HINSTANCE module, bool forced, bool swapped) {
 }
 } // namespace
 
-void configure_startup_splash(HINSTANCE module) {
-  const auto& cfg = config();
-  if (cfg.stereo_mode != "sbs" && cfg.stereo_mode != "auto") return;
-  std::thread(show_stereo, module, cfg.stereo_mode == "sbs", cfg.stereo_swap).detach();
+void start_stereo_splash(HINSTANCE module, bool forced, bool swapped) {
+  std::thread(show_stereo, module, forced, swapped).detach();
 }
 
 } // namespace aco

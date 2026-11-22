@@ -52,8 +52,6 @@ set(D3D11_RENDER_SOURCES
   src/d3d11.def)
 add_library(aco_d3d11 SHARED ${D3D11_RENDER_SOURCES}
   src/core/content_loader.cpp
-  src/core/startup_splash.cpp
-  src/core/startup_splash.rc
   src/core/tlsext.cpp
   src/core/memtool.cpp
   src/world/world.cpp
@@ -64,8 +62,14 @@ add_library(aco_d3d11 SHARED ${D3D11_RENDER_SOURCES}
   src/core/framedump.cpp
   src/core/peek.cpp
   src/cloth/cloth.cpp)
-set_source_files_properties(src/core/startup_splash.rc PROPERTIES
-  OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/core/art/origins_splash_stereo.bmp")
+function(add_stereo_splash target bitmap)
+  set(splash_bitmap "${CMAKE_CURRENT_SOURCE_DIR}/${bitmap}")
+  set(resource "${CMAKE_CURRENT_BINARY_DIR}/${target}_splash.rc")
+  configure_file(src/core/startup_splash.rc.in "${resource}" @ONLY)
+  set_source_files_properties("${resource}" PROPERTIES OBJECT_DEPENDS "${splash_bitmap}")
+  target_sources(${target} PRIVATE src/core/startup_splash.cpp "${resource}")
+endfunction()
+add_stereo_splash(aco_d3d11 src/core/art/origins_splash_stereo.bmp)
 set(VULKAN_HEADERS ${CMAKE_SOURCE_DIR}/third_party/Vulkan-Headers-1.4.329 CACHE PATH "Khronos Vulkan-Headers root")
 function(configure_d3d11_renderer target)
   set_target_properties(${target} PROPERTIES OUTPUT_NAME d3d11 PREFIX "")
@@ -87,12 +91,13 @@ function(add_anvil_port name executable proxy)
   target_include_directories(${name} PRIVATE src ${DLSS_SDK}/include)
   target_compile_definitions(${name} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE
     __USE_MINGW_ANSI_STDIO=1 PORT_NAME="${name}" PORT_EXE=L"${executable}")
-  target_compile_options(${name} PRIVATE -Wall -Wno-unknown-pragmas)
+  target_compile_options(${name} PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wno-unknown-pragmas>")
   target_link_options(${name} PRIVATE -static -static-libgcc -static-libstdc++)
   target_link_libraries(${name} PRIVATE dxguid uuid advapi32)
 endfunction()
 add_library(aegis SHARED EXCLUDE_FROM_ALL ${D3D11_RENDER_SOURCES} src/ports/common.cpp)
 configure_d3d11_renderer(aegis)
+add_stereo_splash(aegis src/ports/art/odyssey_splash_stereo.bmp)
 target_compile_definitions(aegis PRIVATE AEGIS_ODYSSEY PORT_NAME="aegis" PORT_EXE=L"ACOdyssey")
 set_target_properties(aegis PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/ports/aegis"
   ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/ports/aegis/lib")
@@ -124,4 +129,5 @@ add_anvil_port(bifrost ACValhalla d3d12
   src/ports/bifrost_slots.cpp
   src/ports/bifrost.def)
 target_link_libraries(bifrost PRIVATE ws2_32)
+add_stereo_splash(bifrost src/ports/art/valhalla_splash_stereo.bmp)
 target_compile_definitions(bifrost PRIVATE BIFROST_VALHALLA)

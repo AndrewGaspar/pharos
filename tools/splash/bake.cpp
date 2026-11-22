@@ -1,4 +1,4 @@
-// Bake the Origins splash using its original colour and registered artwork layers.
+// Bake stereo views from the game's original colour and its registered artwork layers.
 // Build and usage instructions are in README.md.
 #include <png.h>
 
@@ -7,6 +7,8 @@
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -21,10 +23,20 @@ Image read_png(const std::filesystem::path& path, png_uint_32 format) {
   info.version = PNG_IMAGE_VERSION;
   if (!png_image_begin_read_from_file(&info, path.c_str()))
     throw std::runtime_error(path.string() + ": " + info.message);
-  info.format = format;
+  // Preserve straight RGB at the translucent border of Valhalla's splash.
+  // libpng otherwise composites it when asked to remove the alpha channel.
+  const bool strip_alpha = format == PNG_FORMAT_RGB && (info.format & PNG_FORMAT_FLAG_ALPHA);
+  info.format = strip_alpha ? PNG_FORMAT_RGBA : format;
   Image out{int(info.width), int(info.height), std::vector<unsigned char>(PNG_IMAGE_SIZE(info))};
   if (!png_image_finish_read(&info, nullptr, out.data.data(), 0, nullptr))
     throw std::runtime_error(path.string() + ": " + info.message);
+  if (strip_alpha) {
+    const size_t count = size_t(out.w) * out.h;
+    for (size_t i = 0; i < count; ++i)
+      for (size_t channel = 0; channel < 3; ++channel)
+        out.data[3 * i + channel] = out.data[4 * i + channel];
+    out.data.resize(3 * count);
+  }
   return out;
 }
 
@@ -86,6 +98,43 @@ void separate_plane(Scene& scene, const Image& clean, Image matte, float depth, 
     }
   }
   scene.planes.push_back(std::move(plane));
+}
+
+void load_planes(Scene& scene, const std::filesystem::path& art) {
+  auto add = [&](const std::string& mask, int depth, int radius, const std::string& plate) {
+    auto matte = read_png(art / mask, PNG_FORMAT_GRAY);
+    auto clean = read_png(art / plate, PNG_FORMAT_RGB);
+    for (const auto* input : {&matte, &clean})
+      if (input->w != scene.base.w || input->h != scene.base.h)
+        throw std::runtime_error(mask + " and " + plate + " must match the original dimensions");
+    separate_plane(scene, clean, std::move(matte), float(depth), radius);
+  };
+
+  const auto path = art / "planes.txt";
+  if (!std::filesystem::exists(path)) {
+    // The original Pharos authoring directory predates planes.txt.
+    add("bayek-matte.png", 237, 8, "clean-plates.png");
+    add("title-matte.png", 128, 1, "clean-plates.png");
+    return;
+  }
+
+  std::ifstream file(path);
+  if (!file) throw std::runtime_error("cannot open " + path.string());
+  std::string line;
+  for (int number = 1; std::getline(file, line); ++number) {
+    std::istringstream row(line);
+    std::string mask, plate, extra;
+    int depth, radius;
+    if (!(row >> mask) || mask.front() == '#') continue;
+    if (!(row >> depth >> radius >> plate) || (row >> extra) || depth < 0 || depth > 255 ||
+        radius < 1 || radius > std::max(scene.base.w, scene.base.h))
+      throw std::runtime_error(path.string() + ":" + std::to_string(number) +
+                               ": expected matte, depth (0-255), feather radius (pixels), and clean plate");
+    add(mask, depth, radius, plate);
+  }
+  if (!file.eof()) throw std::runtime_error("error reading " + path.string());
+  // Peel the nearest object first, then draw the exposed layers from back to front.
+  std::reverse(scene.planes.begin(), scene.planes.end());
 }
 
 struct Sample {
@@ -186,19 +235,15 @@ int main(int argc, char** argv) {
   try {
     const std::filesystem::path art = argv[2];
     auto source = read_png(argv[1], PNG_FORMAT_RGB);
-    auto clean = read_png(art / "clean-plates.png", PNG_FORMAT_RGB);
-    auto hero = read_png(art / "bayek-matte.png", PNG_FORMAT_GRAY);
-    auto title = read_png(art / "title-matte.png", PNG_FORMAT_GRAY);
     auto depth = read_png(art / "background-depth.png", PNG_FORMAT_GRAY);
-    for (const auto* input : {&clean, &hero, &title, &depth})
-      if (input->w != source.w || input->h != source.h) throw std::runtime_error("input dimensions differ");
-    Scene scene{source, std::move(depth), {}};
-    separate_plane(scene, clean, std::move(hero), 237, 8);
-    separate_plane(scene, clean, std::move(title), 128, 1);
+    if (depth.w != source.w || depth.h != source.h)
+      throw std::runtime_error("background-depth.png must match the original dimensions");
+    Scene scene{std::move(source), std::move(depth), {}};
+    load_planes(scene, art);
     auto left = view(scene, 1), right = view(scene, -1);
-    Image pair{source.w * 2, source.h, std::vector<unsigned char>(source.data.size() * 2)};
-    const int stride = source.w * 3;
-    for (int y = 0; y < source.h; ++y) {
+    Image pair{left.w * 2, left.h, std::vector<unsigned char>(left.data.size() * 2)};
+    const int stride = left.w * 3;
+    for (int y = 0; y < left.h; ++y) {
       std::copy_n(left.data.data() + y * stride, stride, pair.data.data() + 2 * y * stride);
       std::copy_n(right.data.data() + y * stride, stride, pair.data.data() + (2 * y + 1) * stride);
     }

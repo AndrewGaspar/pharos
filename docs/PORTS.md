@@ -24,6 +24,26 @@ These commands assume Odyssey and Valhalla instances named `aegis` and `bifrost`
 
 Installed profiles use the port name for SR and frame generation and append `Stereo` for SR and stereo. For example, launch with `quiver play 5059 --profile "Aegis Stereo"` or `quiver play 13504 --profile "Bifrost Stereo"`.
 
+### Startup artwork
+
+Aegis 0.1.0-dev.5 and Bifrost 0.1.0-dev.4 use the **Stereo rendering** setting
+for the startup artwork as well as the game. **Off** shows the game's original
+image. **Detect stereo display** checks the artwork window's own display.
+**On** packs the two views into the original window, with **Swap left and right
+eyes** applied. The splash uses half-width side by side with either gameplay
+packing. Quiver's **Skip intro videos** fix controls the movies independently.
+
+Odyssey places the warrior and carried weapons in front of the ships and the
+distant landscape. Valhalla places the double axe in front of the carved medallion
+and preserves the soft transparency around the original artwork.
+
+On a private HypXRland stereo output, both eye orders matched the expected
+Odyssey pixels in the native window. Valhalla's partially transparent edge
+pixels also matched in the native window, and the stereo image remained
+correct after the compositor resized it.
+In the retail Valhalla launch, both the packed and original splash matched the
+expected artwork, including translucent edges. The title accepted input in both modes.
+
 ### Skip intro videos
 
 Each game has a separate Quiver fix for its startup logos and localized notices. Install it from the repository root with `quiver mods 5059 install dist/ports/odyssey-skip-intros` or `quiver mods 13504 install dist/ports/valhalla-skip-intros`. Add **Skip intro videos** to the profiles where you want it. Quiver hides the listed movies for that launch. Remove the fix from a profile to play the intros again.

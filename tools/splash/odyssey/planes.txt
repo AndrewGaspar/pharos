@@ -1,0 +1,2 @@
+hero-matte.png 224 3 clean.png
+title-matte.png 128 1 clean.png

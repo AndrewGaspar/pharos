@@ -1,0 +1,3 @@
+# matte, inverse depth, feather (pixels), exposed background
+sparks-matte.png 222 1 behind-sparks.png
+axes-matte.png 205 2 emblem-stone.png

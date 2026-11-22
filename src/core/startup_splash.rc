@@ -1,2 +1,0 @@
-#include "startup_splash_resource.h"
-IDB_ORIGINS_SPLASH_STEREO BITMAP "core/art/origins_splash_stereo.bmp"

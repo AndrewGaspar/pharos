@@ -1,0 +1,2 @@
+#include "core/startup_splash_resource.h"
+IDB_STARTUP_SPLASH_STEREO BITMAP "@splash_bitmap@"

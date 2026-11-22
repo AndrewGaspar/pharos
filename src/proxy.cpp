@@ -422,7 +422,9 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
     exe[MAX_PATH - 1] = L'\0';
     ACO_LOG("%s loaded into %ls", title::name, exe);
     config_reload();
-    if constexpr (title::origins) configure_startup_splash(inst);
+    const auto& cfg = config();
+    if (cfg.stereo_mode == "auto" || cfg.stereo_mode == "sbs")
+      start_stereo_splash(inst, cfg.stereo_mode == "sbs", cfg.stereo_swap);
     lab_init();
     config_register_lab();
     if constexpr (title::origins) teleport_register();

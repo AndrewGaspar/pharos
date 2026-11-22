@@ -20,6 +20,14 @@ Bayek and the title in the game's original window. The splash uses half side by
 side even when the game uses full side by side. The **Swap eyes** setting applies
 to both the artwork and the game.
 
+Pharos v27 corrects the depth map in the startup artwork. The water recedes toward
+the far shore, the galley sails share the depth of the hull, and the statue’s beard
+follows the jaw. In the full-width source eye pair, the near galley’s sails and
+hull have about 2 pixels of horizontal disparity. The far shore and adjoining
+water have about 0.9 and 1.3 pixels respectively.
+Native-window and compositor captures matched the expected pixels in both mono
+and stereo. The title prompt accepted input in each release test.
+
 With **Stereo 3D** set to **On stereo displays**, Pharos uses the stereo artwork
 on a HypXRland stereo output when the compositor confirms that it will split the
 window. A headless stream or mono desktop shows the game's original artwork.

@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "core/hook.h"
+#include "core/startup_splash.h"
 #include "dlss/ngx.h"
 #include "ports/bifrost_present.h"
 #include "ports/bifrost_composite.h"
@@ -235,6 +236,18 @@ HRESULT WINAPI command_list(ID3D12Device* dev, UINT node, D3D12_COMMAND_LIST_TYP
   return hr;
 }
 }  // namespace
+
+extern "C" BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID) {
+  if (reason == DLL_PROCESS_ATTACH && port::active()) {
+    // Device creation comes after the splash has already been shown on some launches.
+    auto mode = bifrost::option_text(L"stereo", L"mode", L"off");
+    if (mode == L"auto" || mode == L"sbs") {
+      log_init(L"bifrost.log");
+      start_stereo_splash(module, mode == L"sbs", bifrost::option(L"stereo", L"swap", 0) != 0);
+    }
+  }
+  return TRUE;
+}
 
 extern "C" HRESULT WINAPI bifrost_create(IUnknown* adapter, D3D_FEATURE_LEVEL level, REFIID iid, void** out) {
   static auto fn = real<decltype(&D3D12CreateDevice)>("D3D12CreateDevice");

@@ -1,4 +1,21 @@
-# Origins stereo startup artwork
+# Stereo startup artwork
+
+The baker takes the original image and an inverse-depth map at the same resolution.
+A value of 128 is screen depth. Higher values move toward the viewer. Each game can
+also define objects with their own alpha mattes so their silhouettes reveal the
+background as they move. Only the finished side-by-side bitmap is needed at launch.
+
+In a game's authoring directory, `planes.txt` lists the layers from front to back.
+Each line gives the matte filename, depth (0–255), feather radius in pixels, and the
+filename of the clean image behind that object. A radius of 1 uses the clean image
+inside the matte. A larger radius blends it into the surrounding artwork. Blank
+lines and lines starting with `#` are ignored. An empty list uses the background
+depth map alone. The original Origins directory retains its built-in layer order.
+
+- **Odyssey** uses the installed `splashscreen.png`. See the [Odyssey artwork and bake instructions](odyssey/README.md).
+- **Valhalla** preserves its native transparent frame in both eyes. See the [Valhalla artwork and bake instructions](valhalla/README.md).
+
+## Origins
 
 Pharos embeds the finished 1920×540 side-by-side bitmap. To regenerate it, capture
 the game's original 960×540 splash window at native size as `splash.png`.
