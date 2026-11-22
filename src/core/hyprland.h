@@ -28,6 +28,13 @@ void hypr_start();
 int hypr_display_stereo();
 int hypr_display_stereo_now(HWND hwnd = nullptr);
 
+// The Origins artwork is a separate short-lived GDI window. Negotiate half SBS
+// for that HWND without selecting it as the game swapchain or tagging later windows.
+// An explicit stereo mode also permits raw half SBS outside a stereo compositor.
+// added_tag is true only when a new tag must be undone if painting fails.
+bool hypr_prepare_splash_stereo(HWND hwnd, bool forced, bool* added_tag = nullptr);
+void hypr_clear_splash_stereo(HWND hwnd);
+
 // An environment variable from Windows or, for variables Wine omits, its Unix environment.
 std::string process_env(const char* name);
 

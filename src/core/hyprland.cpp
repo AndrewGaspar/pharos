@@ -155,7 +155,7 @@ size_t field(const std::string& j, const char* key, size_t from, size_t end) {
 struct Client {
   std::string address, title, stereo;
   int w = 0, h = 0, monitor = -1, pid = 0;
-  bool mapped = false;
+  bool mapped = false, has_hsbs_tag = false;
 };
 
 // All clients in `j/clients` (a JSON array of flat-ish objects; each starts with "address").
@@ -174,6 +174,11 @@ std::vector<Client> clients(const std::string& j) {
     if (t != std::string::npos && j[t] == '"') c.title = j.substr(t + 1, j.find('"', t + 1) - t - 1);
     size_t s = field(j, "stereo", pos, end);
     if (s != std::string::npos && j[s] == '"') c.stereo = j.substr(s + 1, j.find('"', s + 1) - s - 1);
+    size_t tags = field(j, "tags", pos, end);
+    if (tags != std::string::npos && j[tags] == '[') {
+      size_t close = std::min(j.find(']', tags), end);
+      c.has_hsbs_tag = j.find("\"stereo-hsbs\"", tags) < close;
+    }
     size_t p = field(j, "pid", pos, end);
     if (p != std::string::npos) c.pid = atoi(j.c_str() + p);
     size_t mo = field(j, "monitor", pos, end);
@@ -407,6 +412,41 @@ int hypr_display_stereo_now(HWND hwnd) {
   int ds = display_stereo(hwnd ? hwnd : main_window(), me, true);
   g_display_stereo = ds;
   return ds;
+}
+
+bool hypr_prepare_splash_stereo(HWND hwnd, bool forced, bool* added_tag) {
+  if (added_tag) *added_tag = false;
+  if (!IsWindowVisible(hwnd)) return false;
+  if (!hypr_available()) return forced;
+  Client me;
+  int ds = display_stereo(hwnd, me, true);
+  if (!me.mapped) return forced && ds == -1;
+  if (ds != 1) return forced;
+  if (me.stereo == "hsbs") return true;
+  if (me.has_hsbs_tag) return false;  // An existing rule overrode the tag.
+
+  // The splash worker draws into the original HWND at its original size. A
+  // windowed splash needs the same hsbs-always rule as the game's native-size
+  // stereo surface. Wait for the compositor to confirm that it will split the
+  // two eyes before replacing the intact mono artwork.
+  tag_request("+stereo-hsbs", me.address);
+  for (const auto& c : clients(hypr_request("j/clients"))) {
+    if (c.address == me.address && c.pid == me.pid && c.mapped) {
+      if (c.stereo == "hsbs") {
+        if (added_tag) *added_tag = true;
+        return true;
+      }
+      tag_request("-stereo-hsbs", me.address);
+      break;
+    }
+  }
+  return false;
+}
+
+void hypr_clear_splash_stereo(HWND hwnd) {
+  if (!IsWindow(hwnd) || !hypr_available()) return;
+  Client me = owned_client(hwnd, clients(hypr_request("j/clients")), true);
+  if (me.mapped && me.stereo == "hsbs") tag_request("-stereo-hsbs", me.address);
 }
 
 }  // namespace aco

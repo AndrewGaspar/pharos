@@ -1,8 +1,10 @@
 #pragma once
 
+#include <windef.h>
+
 namespace aco {
 
-// Match the Origins hero-art window to the active launch's intro-video selection.
-void configure_startup_splash(const wchar_t* executable);
+// Paint the stereo pair into Origins' own startup window while the game loads.
+void configure_startup_splash(HINSTANCE module);
 
 } // namespace aco

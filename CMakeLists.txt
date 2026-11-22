@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(pharos LANGUAGES C CXX)
+project(pharos LANGUAGES C CXX RC)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -53,6 +53,7 @@ set(D3D11_RENDER_SOURCES
 add_library(aco_d3d11 SHARED ${D3D11_RENDER_SOURCES}
   src/core/content_loader.cpp
   src/core/startup_splash.cpp
+  src/core/startup_splash.rc
   src/core/tlsext.cpp
   src/core/memtool.cpp
   src/world/world.cpp
@@ -63,12 +64,14 @@ add_library(aco_d3d11 SHARED ${D3D11_RENDER_SOURCES}
   src/core/framedump.cpp
   src/core/peek.cpp
   src/cloth/cloth.cpp)
+set_source_files_properties(src/core/startup_splash.rc PROPERTIES
+  OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/core/art/origins_splash_stereo.bmp")
 set(VULKAN_HEADERS ${CMAKE_SOURCE_DIR}/third_party/Vulkan-Headers-1.4.329 CACHE PATH "Khronos Vulkan-Headers root")
 function(configure_d3d11_renderer target)
   set_target_properties(${target} PROPERTIES OUTPUT_NAME d3d11 PREFIX "")
   target_include_directories(${target} PRIVATE src ${DLSS_SDK}/include ${VULKAN_HEADERS}/include)
   target_compile_definitions(${target} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE __USE_MINGW_ANSI_STDIO=1)
-  target_compile_options(${target} PRIVATE -Wall -Wno-unknown-pragmas -fno-strict-aliasing)
+  target_compile_options(${target} PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wno-unknown-pragmas;-fno-strict-aliasing>")
   target_link_options(${target} PRIVATE -static -static-libgcc -static-libstdc++ -Wl,--enable-stdcall-fixup)
   target_link_libraries(${target} PRIVATE dxguid uuid ole32 shell32 advapi32 ws2_32)
 endfunction()

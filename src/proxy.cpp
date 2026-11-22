@@ -418,13 +418,11 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
 #endif
     log_init(title::log);
     wchar_t exe[MAX_PATH]{};
-    const auto length = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
     exe[MAX_PATH - 1] = L'\0';
     ACO_LOG("%s loaded into %ls", title::name, exe);
-    if constexpr (title::origins) {
-      if (length && length < MAX_PATH) configure_startup_splash(exe);
-    }
     config_reload();
+    if constexpr (title::origins) configure_startup_splash(inst);
     lab_init();
     config_register_lab();
     if constexpr (title::origins) teleport_register();

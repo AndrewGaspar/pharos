@@ -13,18 +13,28 @@ HLSL names from that reflection data.
 
 ## Startup artwork
 
-Pharos v25 follows Quiver's **Skip intro videos** fix for the separate Bayek artwork window.
-On Origins 1.62, the game opens `ScimitarSplashScreenWindow` while its main window is still
-hidden. When the profile hides `videos/UbisoftLogo.bk2`, Pharos takes the splash loader's
-existing missing-image branch before it decodes the artwork. Restoring the logo also restores
-the splash on the next launch. This works with upscaling and frame generation turned off.
+Pharos v26 restores the Bayek artwork window at startup. **Skip intro videos** in
+Quiver still controls the opening movies independently. In mono, Origins draws its
+original image. In stereo, Pharos gives each eye a distinct view of the scene,
+Bayek and the title in the game's original window. The splash uses half side by
+side even when the game uses full side by side. The **Swap eyes** setting applies
+to both the artwork and the game.
 
-Six fresh, warm-cache launches in the Quiver lab compared the v24 and v25 release DLLs
-with intro videos hidden in both. At 960×540 SDR and 30 FPS on an idle RTX 5070 Laptop GPU,
-the median from process start to “Press any key” was 14.62 s in both versions (three runs
-each, in v24/v25/v25/v24/v24/v25 order). The logo window was visible for roughly five seconds
-in v24. The prompt accepted Return in all six runs. Screenshot sampling bounded each prompt
-time to a window of about 0.7 s, so these measurements establish no startup speedup.
+With **Stereo 3D** set to **On stereo displays**, Pharos uses the stereo artwork
+on a HypXRland stereo output when the compositor confirms that it will split the
+window. A headless stream or mono desktop shows the game's original artwork.
+
+Four fresh v26 game processes covered headless automatic mono, two half-side-by-side
+starts and full-side-by-side packing with the eyes swapped. Captured splash pixels
+matched the expected stock or packed artwork. The title prompt accepted input in
+all three launches tested for input. Separately, HypXRland displayed both eye orders
+at the native window size and after a compositor resize, with opaque artwork in
+both eyes.
+
+For comparison, with intro videos hidden, v24 (artwork visible) and v25 (artwork
+skipped) both reached “Press any key” in a median 14.62 s. Each release ran three
+times in the Quiver lab at 960×540 SDR and 30 FPS on an idle RTX 5070 Laptop GPU.
+The artwork was visible for roughly five seconds in v24.
 
 ## Launch-screen content check
 
