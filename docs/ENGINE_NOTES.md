@@ -11,6 +11,21 @@ HLSL names from that reflection data.
 - Creates 3 D3D11 devices (two probes, then the real one) and 9 deferred contexts. Almost all
   rendering is recorded on deferred contexts and executed on the immediate context.
 
+## Startup artwork
+
+Pharos v25 follows Quiver's **Skip intro videos** fix for the separate Bayek artwork window.
+On Origins 1.62, the game opens `ScimitarSplashScreenWindow` while its main window is still
+hidden. When the profile hides `videos/UbisoftLogo.bk2`, Pharos takes the splash loader's
+existing missing-image branch before it decodes the artwork. Restoring the logo also restores
+the splash on the next launch. This works with upscaling and frame generation turned off.
+
+Six fresh, warm-cache launches in the Quiver lab compared the v24 and v25 release DLLs
+with intro videos hidden in both. At 960×540 SDR and 30 FPS on an idle RTX 5070 Laptop GPU,
+the median from process start to “Press any key” was 14.62 s in both versions (three runs
+each, in v24/v25/v25/v24/v24/v25 order). The logo window was visible for roughly five seconds
+in v24. The prompt accepted Return in all six runs. Screenshot sampling bounded each prompt
+time to a window of about 0.7 s, so these measurements establish no startup speedup.
+
 ## Launch-screen content check
 
 On Origins 1.62, the content-loading worker waits three engine frames at each of three
