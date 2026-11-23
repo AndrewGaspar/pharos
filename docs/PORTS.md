@@ -52,6 +52,8 @@ In English-language lab launches, Odyssey reached the first visible “Press any
 
 ## Aegis • Odyssey
 
+Aegis 0.1.0-dev.6 supplies HDR10 input to DLSS Frame Generation when Odyssey outputs HDR. When Odyssey switches to a linear FP16 scRGB backbuffer, Aegis converts the scene to PQ before interpolation and converts each generated frame back to scRGB for presentation. The game’s real frames retain their original color. In an RTX 5090 lab capture of Odyssey’s main menu at 1280×720, the same highlights peaked at 399 nits in the real frame on both builds. The generated peak was 80 nits on dev.5 and 398 nits on dev.6. Among pixels above 100 nits in the real image, median generated brightness rose from 47% to 99.7% of the corresponding real pixel.
+
 The main Aegis build runs the Pharos D3D11 rendering path with Odyssey's texture slots, constant-buffer ranges, projection layout, config file and game settings path. Its default `aegis.ini` enables DLSS SR and 2× FG. To run stereo, set `[stereo] mode=sbs` before launch. The compositor and per-eye temporal histories use the same scene twice per simulation step. Aegis uses Odyssey’s icon controllers to read the world positions of tracked targets.
 
 Odyssey's temporal pass binds color at t85, packed motion at t86, linear depth at t87, the responsive mask at t88, and history at t89–90. The depth converter's second R32F target carries device depth. The CPU upload mirror reads the original b6 jitter during command recording. The motion shader uses the current camera in b2 and previous object projection in b4. The full-frame DLSS evaluation runs once at the geometry draw and the game still writes its own geometry, sky and dither histories. The UI compositor then samples the DLSS reconstruction underneath the HUD.
