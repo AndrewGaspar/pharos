@@ -66,6 +66,29 @@ With `[stereo] cursor=depth`, the mouse follows Odyssey’s Windows client point
 
 Ikaros’s scanning ring samples the centre ray from the game depth buffer. With marker correction disabled its centre was x=319.75 in both 640-pixel half images. With the correction enabled over a distant ridge, the centres were x=314.5 and x=325.5. The compass and button hints use their original projections. The green tracked-location icon is a separate draw. Run r19 measured an unobstructed target at 182.5 m with terrain at 187.2 m. The icon chose the target. A different target was at 200.0 m behind geometry 2.19 m away and the icon chose 2.18 m. Their native billboard depths were 5.8–5.9 m.
 
+#### Discovery Tour icons, the aimed marker and its label
+
+Odyssey draws tracked icons with two cameras. Frame traces in the rayblaster lab (instance `aegis-markers`, runs r1, r4 and r7) identified the draws by the camera bound to each one. Hiding draws in the right eye only (r3 and r4) identified what each draw shows.
+
+- **The scene camera** draws the tour-station banners (128×128 BC7 atlas), the tracked location icons (64×64 BC7 atlas with a 128×128 BC1 mask), the set marker and the brackets around the aimed icon (64×64 BC3). Their distance labels use a separate font shader pair (VS `ec4421bb`, PS `397fb1a1`). Each label is drawn directly after its icon batch. Odyssey places these billboards about 2.2–2.4 m from the camera (the marker shader's readback of native depth in r6 and r7). Before this change only the location-icon atlas was corrected. The banners, brackets, set marker and labels kept their native depth.
+- **The flat HUD camera** draws icons of some nearby tracked things, such as the Discovery Tour horse (sprite VS `c2d0ef4d`), off-screen pointers, their distance labels (font VS `09703824` and `d0a1f529`, PS `6c582fcd`), the compass, the tour panel and the control hints. All of these were at zero disparity.
+
+All scene-camera icons now use the shared target matching (`MarkerRole::Ordinary`, `Bracket` or `Logo`). Labels take the depth chosen for the icon batch before them (`Label`). On the HUD camera, an icon or label moves only when it lines up with a visible tracked target (marker shader modes 4 and 5). It takes that target's depth, or the depth of the first surface in front of the target. The compass band, the top-left tour panel and the bottom control hints are excluded. Odyssey's icons float about 2.2 m above a tour station's position. Its allowance for the height of an icon above its target is therefore 3 m, compared with 2 m for Origins. In busy areas, the icon controllers report more than the shader's 192 positions (r6). The marker pass keeps the nearest 192.
+
+Measurements used side-by-side output at 1280×720 (640-pixel eye images), 32.5 mm per eye and 4 m convergence. Disparities are right-eye minus left-eye positions in half-image pixels, from block matching of the same patch. The before runs used the previous marker code.
+
+| Discovery Tour (rayblaster, RTX 5090) | Before (r8) | After (r9) | Scene at the target |
+| --- | --- | --- | --- |
+| Tour-station banner, 10 m away on foot | −4.80 | +4.07 | +4.19 (r8), +4.07 (r9) |
+| Horse icon on screen | — | +3.96 and +3.80 | +4.09 and +3.73 |
+| Ikaros: brackets around the aimed marker | +6 | +11 | +10.8 |
+| Ikaros: aimed marker's distance label | +6 | +11 | +10.8 |
+| Compass, tour panel text, compass distance | 0 | 0 | — |
+
+In r4, before the change, the label of an aimed location icon 373 m away measured +6 pixels. Its icon measured +10.85 and the terrain +10.84. Setting separation to zero reduced every difference to zero. In r9 the station's golden ground ring measured +3.82, between the adjacent ground at +3.55 and +4.12. It is scene geometry and the marker shader does not draw it.
+
+Off-screen pointers stay on the HUD plane. In r6 and r7, matching pointers by their bearing from the screen centre paired the horse's pointer with an unrelated target 1.4 km away. The horse was 6–8 m from the camera. Where Odyssey places pointers for targets behind the camera is unknown. A pointer needs its own target before it can be placed in depth.
+
 Odyssey’s story bow renders its two spread bars and centre dot separately. In r21, hiding the three draws individually removed the right bar, left bar and dot. In r22 Kassandra aimed at the coastal rocks with the Atlantis shortcut loadout. The centre moved from x=320 in both eyes to x=317.5 and x=322.5, and both bars acquired the same five-pixel disparity. The sight keeps the spread authored by the game as the bow is drawn.
 
 Run r24 rendered the Akropolis Discovery Tour with 1280×720 eyes in a 2560×720 swapchain. Three successive 300-frame samples during gameplay contained 300 fresh eye pairs apiece. The first station’s *Learn More* screen uses an immutable 1920×1080 BC7 photograph followed by the caption and button legend on the same UI camera. In r24 all were at screen depth. In r25 the heading, body and controls measured four pixels of crossed disparity between half-images. The photograph measured zero, including its upper-right edge. The viewer preserves the photograph’s full frame and the native vertical bounds of the scrolling text.

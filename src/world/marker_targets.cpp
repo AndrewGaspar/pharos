@@ -43,7 +43,7 @@ std::unordered_map<void*, Sample> samples;
 std::mutex lock;
 std::atomic<bool> enabled{false};
 unsigned frame;
-MarkerTarget latest[kMaxMarkerTargets];
+MarkerTarget latest[kMaxMarkerSamples];
 size_t count;
 
 template <int I>
@@ -102,14 +102,19 @@ void marker_targets_frame(bool active) {
       it = samples.erase(it);
       continue;
     }
-    if (count < kMaxMarkerTargets) latest[count++] = it->second.pos;
+    if (count < kMaxMarkerSamples) latest[count++] = it->second.pos;
     ++it;
   }
 }
 
-size_t marker_targets_read(MarkerTarget (&out)[kMaxMarkerTargets]) {
+size_t marker_targets_read(MarkerTarget* out, size_t max) {
   std::lock_guard guard(lock);
-  memcpy(out, latest, count * sizeof(*out));
-  return count;
+  const size_t n = count < max ? count : max;
+  memcpy(out, latest, n * sizeof(*out));
+  return n;
+}
+
+size_t marker_targets_read(MarkerTarget (&out)[kMaxMarkerTargets]) {
+  return marker_targets_read(out, kMaxMarkerTargets);
 }
 }  // namespace aco

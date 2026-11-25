@@ -13,7 +13,7 @@ apply = "live"
 [option."stereo.markers"]
 type = "bool"
 label = "World marker and reticle depth"
-help = "Places tracked Ikaros icons at the target or the first obstruction. The bird’s scanning ring and the story bow’s dot and spread bars follow the surface under the sight."
+help = "Places tracked icons, tour stations, set markers and their distance labels at the target or the first obstruction. The scanning ring and the bow sight follow the surface under the sight."
 apply = "live"
 
 [option."upscaler.render_scale"]
