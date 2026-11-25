@@ -1,7 +1,8 @@
 /* quiver_mod.h - Quiver mod SDK: live options and metrics for mods running inside a game.
  *
  * Protocol 3 (design: Quiver's design/MOD-CONFIG.md section 5, design/SIGHT-HUD.md
- * sections 3.6 and 3.14, and design/SIGHT.md section 15 for the stereo layout). Single header, C89/C99/C++, Windows only (MinGW and MSVC),
+ * sections 3.6 and 3.14, design/SIGHT.md section 15 for the stereo layout, design/TOUCH-SDK.md
+ * for touch controls on a phone, 3.2). Single header, C89/C99/C++, Windows only (MinGW and MSVC),
  * kernel32 only: no CRT calls, no allocation on the hot path, no locks on the hot path.
  *
  * Use it in exactly one .c/.cpp file of your DLL:
@@ -24,7 +25,8 @@
  *  - Never returns NULL; every function accepts NULL and the no-op handle.
  *  - All strings are UTF-8. Invalid UTF-8 is replaced, text values are cut at 48 bytes.
  *
- * Threads: quiver_gauge/count/state/text/mark may be called from any thread at any rate.
+ * Threads: quiver_gauge/count/state/text/mark/frame_submit/sample may be called from any
+ * thread at any rate; quiver_touch_layout/quiver_touch_context from any thread.
  * Callbacks run on the SDK thread, or, with QUIVER_POLL, inside quiver_poll() on your
  * thread. quiver_open() is safe in DllMain(DLL_PROCESS_ATTACH); quiver_close() is not
  * meant for DllMain (at process exit, just don't call it).
@@ -44,7 +46,7 @@ extern "C" {
 #endif
 
 #define QUIVER_MOD_PROTOCOL 3
-#define QUIVER_MOD_SDK "quiver_mod.h 3.0"
+#define QUIVER_MOD_SDK "quiver_mod.h 3.2"
 
 typedef struct quiver_mod quiver_mod; /* opaque */
 
@@ -124,6 +126,45 @@ void quiver_close(quiver_mod *m);
  * changes). Under a Quiver older than protocol 3 it is kept but never sent. */
 int quiver_set_stereo_layout(quiver_mod *m, const char *layout);
 
+/* ---- Touch controls (3.2; Quiver's design/TOUCH-SDK.md) ---------------------------- */
+
+/* When the game streams to a phone, the phone draws your touch layout (JSON data, never
+ * code) around the picture, and sends the actions it binds back here. All sizes are points.
+ * Under a Quiver older than 3.2 nothing is sent and the callbacks never run. */
+
+typedef struct quiver_rect { float x, y, w, h; } quiver_rect;
+typedef struct quiver_viewport {
+    const char *orientation;   /* "portrait", "landscape_left", "landscape_right", "" = no touch client */
+    const char *hand;          /* "both", "left", "right" */
+    float screen_w, screen_h, scale;
+    quiver_rect safe, video;
+    int free_count; const char *const *free_names; const quiver_rect *free; /* "leading", "trailing", "top", "bottom" */
+    const char *json;          /* the whole viewport, for fields this header doesn't know ("null" when none) */
+    int reserved_count; const quiver_rect *reserved; /* spots the phone keeps (its menu button) */
+} quiver_viewport;
+/* The phone's viewport: on connect if a touch client is streaming, on every rotation or
+ * hand change, and with orientation "" when it leaves. Valid during the call only. */
+typedef void (*quiver_on_viewport)(void *user, const quiver_viewport *v);
+void quiver_on_viewport_cb(quiver_mod *m, quiver_on_viewport cb, void *user);
+
+/* Replace the whole layout (TOUCH-SDK section 3: a JSON object, at most 64 KB less 64 bytes).
+ * Copied; the SDK thread sends the latest one, and again after a reconnect. Quiver checks
+ * it and logs why it refuses one (`quiver touch status` shows it too). Returns 1 when kept
+ * for sending, 0 if it isn't one JSON object or is too big (nothing changes). */
+int quiver_touch_layout(quiver_mod *m, const char *json);
+/* Which named contexts are active now ("map", "explore", "artifact", "menu"),
+ * comma-separated; "" or NULL = "default". Small and frequent: call it whenever the game's
+ * state changes (latest wins). Returns 1, or 0 for a bad name ([a-z0-9_.-], at most 48
+ * bytes) or more than 16 of them. */
+int quiver_touch_context(quiver_mod *m, const char *names);
+
+typedef enum quiver_touch_phase { QUIVER_TOUCH_PRESS = 1, QUIVER_TOUCH_RELEASE = 2, QUIVER_TOUCH_VALUE = 3 } quiver_touch_phase;
+/* A widget or gesture bound to { "action": id } (TOUCH-SDK section 5). `value` in -1..1 (a
+ * stick or scroll strip), x, y in 0..1 of the video, < 0 = no point. */
+typedef void (*quiver_on_touch_action)(void *user, const char *action_id, quiver_touch_phase phase,
+                                       float value, float x, float y);
+void quiver_on_touch_action_cb(quiver_mod *m, quiver_on_touch_action cb, void *user);
+
 /* ---- Metrics (SIGHT-HUD) ----------------------------------------------------------- */
 
 typedef int32_t quiver_metric; /* small index; < 0 = invalid */
@@ -132,8 +173,8 @@ typedef int32_t quiver_metric; /* small index; < 0 = invalid */
 typedef enum quiver_kind {
     QUIVER_GAUGE = 1, /* a number, latest wins (fps, ms, %) */
     QUIVER_COUNTER,   /* monotonic count; Quiver shows a rate */
-    QUIVER_SERIES,    /* per-event samples: needs a ring (not in this Quiver yet) */
-    QUIVER_FRAME,     /* per-frame records: needs a ring (not in this Quiver yet) */
+    QUIVER_SERIES,    /* per-event samples (quiver_sample): through the shared-memory ring */
+    QUIVER_FRAME,     /* per-frame records (quiver_frame_submit): through the ring */
     QUIVER_STATE,     /* one of the descriptor's declared values ("on", "off") */
     QUIVER_TEXT,      /* short text ("DLSS K", "1280x800") */
     QUIVER_EVENT      /* marks on a timeline (quiver_mark) */
@@ -161,10 +202,21 @@ void quiver_text(quiver_mod *m, quiver_metric h, const char *utf8);   /* <= 48 b
 void quiver_mark(quiver_mod *m, quiver_metric h, int64_t t_qpc, int64_t dur_qpc, const char *label);
 int64_t quiver_now(void); /* QueryPerformanceCounter */
 
-/* Per-frame data (SIGHT-HUD phase 2: shared-memory rings, whose layout is quiver-perf's
- * include/quiver_perf.h; this header will include it then). Declared so mods can be written
- * against them now; until Quiver offers rings they drop everything (counted), and
- * quiver_perf_wanted() returns 0. */
+/* Per-frame data (3.1; Quiver's design/SIGHT-HUD.md sections 3.8 and 3.18). Under a Quiver
+ * that offers rings (the `rings` capability), the SDK thread asks for one once a frame or
+ * series metric is accepted, and maps it (CreateFileW + MapViewOfFile on the file Quiver
+ * made in the session's shared-memory dir; layout: quiver-perf's include/quiver_perf.h).
+ * From then on quiver_frame_submit and quiver_sample write one 128-byte record each, lock-
+ * and syscall-free; before that (or under an older Quiver, which refuses frame and series
+ * metrics) they drop the record and count it in quiver_stats.dropped.
+ *
+ * Frame generation: give every present you make a record with its flags, and Quiver counts
+ * rendered (REAL, or REAL|NOFG) and generated (GENERATED) frames per second from them. They
+ * drive the HUD's base FPS ("79 -> 158") and FG multiplier while Quiver's own counting (the
+ * Sight layer's, from Reflex) has nothing, marked as your mod's. A frame metric that claims
+ * no roles is read by these flags; one claiming "frame.base"/"frame.generated" (with flag
+ * filters) by its claims. Without a ring, gauges claiming the roles "fps.base",
+ * "fps.generated" and "fg.ratio" do the same at 10 Hz. */
 enum {
     QUIVER_FRAME_REAL = 1u << 0,      /* rendered by the game */
     QUIVER_FRAME_GENERATED = 1u << 1, /* generated (interpolated/extrapolated) */
@@ -180,6 +232,8 @@ typedef struct quiver_frame {
 } quiver_frame;
 void quiver_frame_submit(quiver_mod *m, quiver_metric h, const quiver_frame *fr);
 void quiver_sample(quiver_mod *m, quiver_metric h, int64_t t_qpc, double value);
+/* 1 while the ring is mapped and Quiver reads it (it then wants your records); 0 before,
+ * without a ring, or under a Quiver older than 3.1. One load. */
 int quiver_perf_wanted(const quiver_mod *m);
 
 /* ---- Diagnostics ------------------------------------------------------------------- */
@@ -228,6 +282,9 @@ extern "C" {
 #define QV_MARKS 64
 #define QV_REJ 4096
 #define QV_READ 16384
+#define QV_TOUCH_MAX (QV_MAX_FRAME - 64) /* a layout's JSON, so its message fits a frame */
+#define QV_TOUCH_CTX 1024                 /* the contexts as a JSON array */
+#define QV_VP_REGIONS 8
 #define QV_UNSENT (-1)
 #define QV_REFUSED (-2)
 #define QV_SENT (-3)
@@ -262,6 +319,16 @@ typedef struct qv_buf {
     size_t len, cap, max;
     int over;
 } qv_buf;
+
+/* The ring (quiver-perf's qv_ring_header / qv_record, little-endian x86). */
+#define QV_RING_MAGIC 0x474E495256515551ull /* "QUQVRING" */
+#define QV_RING_HDR 4096
+#define QV_RING_SLOT 128
+#define QV_RING_REQ (4096 + 4096 * 128) /* 4096 slots: ~13 s of 3 records a frame at 100 fps */
+#define QV_COMMIT_BUSY 0x8000000000000000ull
+#define QV_OFF_RESERVE 64
+#define QV_OFF_HEARTBEAT 128
+#define QV_OFF_DROPPED 136
 
 struct quiver_mod {
     int live; /* 0: the no-op handle */
@@ -302,6 +369,24 @@ struct quiver_mod {
     LARGE_INTEGER last_m, last_decl, freq;
     DWORD backoff;
     volatile LONG st_connects, st_sent, st_received, st_dropped;
+    /* the ring (3.1): granted, asked for this connection, mapped (published last), its slot
+     * count, game threads inside a write, Quiver reads it (perf_ctl) */
+    int caps_rings, ring_asked;
+    char *volatile ring;
+    HANDLE ring_map;
+    uint32_t ring_slots;
+    volatile LONG ring_users, perf_wanted;
+    LARGE_INTEGER ring_beat;
+    /* touch (3.2): granted; the latest layout and contexts (under cs) and whether the SDK
+     * thread still has to send them; the callbacks */
+    int caps_touch;
+    char *touch_layout;
+    char touch_ctx[QV_TOUCH_CTX];
+    volatile LONG touch_layout_dirty, touch_ctx_dirty;
+    quiver_on_viewport on_viewport;
+    void *viewport_user;
+    quiver_on_touch_action on_touch_action;
+    void *touch_action_user;
 };
 
 static quiver_mod qv_noop_handle; /* zeroed: not live */
@@ -735,7 +820,7 @@ static void qv_hello(quiver_mod *m, qv_buf *b) {
     qv_put_str(b, QUIVER_MOD_VERSION, 32);
 #endif
     if (m->schema) { qv_puts(b, ",\"schema\":"); qv_put_str(b, m->schema, QV_MAX_FRAME / 2); }
-    qv_puts(b, ",\"caps\":[\"options\",\"metrics\",\"actions\",\"log\"]}");
+    qv_puts(b, ",\"caps\":[\"options\",\"metrics\",\"actions\",\"log\",\"rings\",\"touch\"]}");
 }
 
 /* Deliver a values object (`welcome`/`set`) to the callback; returns the ack's rejected
@@ -925,6 +1010,192 @@ static void qv_action(quiver_mod *m, const char *body, size_t n) {
     if (cb) cb(user, id, has_arg ? arg : 0);
 }
 
+/* ---- touch (3.2) ---- */
+
+/* A JSON number (no CRT: digits, a fraction, an exponent). */
+static int qv_num(qv_js *j, double *out) {
+    double v = 0, scale = 1;
+    int neg = 0, any = 0, e = 0, eneg = 0;
+    qv_ws(j);
+    if (j->p < j->end && *j->p == '-') { neg = 1; j->p++; }
+    while (j->p < j->end && *j->p >= '0' && *j->p <= '9') { v = v * 10 + (*j->p++ - '0'); any = 1; }
+    if (j->p < j->end && *j->p == '.') {
+        j->p++;
+        while (j->p < j->end && *j->p >= '0' && *j->p <= '9') { scale /= 10; v += (*j->p++ - '0') * scale; any = 1; }
+    }
+    if (!any) return 0;
+    if (j->p < j->end && (*j->p == 'e' || *j->p == 'E')) {
+        j->p++;
+        if (j->p < j->end && (*j->p == '+' || *j->p == '-')) { eneg = *j->p == '-'; j->p++; }
+        while (j->p < j->end && *j->p >= '0' && *j->p <= '9') { if (e < 400) e = e * 10 + (*j->p - '0'); j->p++; }
+        while (e-- > 0) v = eneg ? v / 10 : v * 10;
+    }
+    *out = neg ? -v : v;
+    return 1;
+}
+
+/* A number member of a top-level object span, as a float (0 if absent). */
+static float qv_member_float(const char *body, size_t n, const char *name, float dflt) {
+    const char *vs, *ve;
+    qv_js j;
+    double d;
+    if (!qv_member(body, n, name, &vs, &ve)) return dflt;
+    j.p = vs;
+    j.end = ve;
+    return qv_num(&j, &d) ? (float)d : dflt;
+}
+
+/* An object {x, y, w, h[, name]} at j: into r (and name). Returns 0 if malformed. */
+static int qv_rect_obj(qv_js *j, quiver_rect *r, char *name, size_t cap) {
+    int first = 1, k;
+    char key[16];
+    double d;
+    r->x = r->y = r->w = r->h = 0;
+    if (name && cap) name[0] = 0;
+    if (!qv_obj_begin(j)) return 0;
+    while ((k = qv_obj_next(j, &first, key, sizeof key)) == 1) {
+        if (name && qv_streq(key, "name")) { if (!qv_str(j, name, cap)) return 0; continue; }
+        if (qv_streq(key, "x") || qv_streq(key, "y") || qv_streq(key, "w") || qv_streq(key, "h")) {
+            if (!qv_num(j, &d)) return 0;
+            if (key[0] == 'x') r->x = (float)d;
+            else if (key[0] == 'y') r->y = (float)d;
+            else if (key[0] == 'w') r->w = (float)d;
+            else r->h = (float)d;
+            continue;
+        }
+        if (!qv_skip(j, 1)) return 0;
+    }
+    return k == 0;
+}
+
+static void qv_rect_member(const char *body, size_t n, const char *name, quiver_rect *r) {
+    const char *vs, *ve;
+    qv_js j;
+    r->x = r->y = r->w = r->h = 0;
+    if (!qv_member(body, n, name, &vs, &ve)) return;
+    j.p = vs;
+    j.end = ve;
+    qv_rect_obj(&j, r, 0, 0);
+}
+
+/* An array of rects (with names when `names` is given), at most QV_VP_REGIONS. */
+static int qv_rect_list(const char *body, size_t n, const char *name, quiver_rect *out, char (*names)[16]) {
+    const char *vs, *ve;
+    qv_js j;
+    int count = 0;
+    if (!qv_member(body, n, name, &vs, &ve)) return 0;
+    j.p = vs;
+    j.end = ve;
+    if (!qv_lit(&j, '[') || qv_lit(&j, ']')) return 0;
+    do {
+        quiver_rect r;
+        char nm[16];
+        if (!qv_rect_obj(&j, &r, nm, sizeof nm)) break;
+        if (count < QV_VP_REGIONS) {
+            out[count] = r;
+            if (names) qv_copy(names[count], nm, sizeof nm);
+            count++;
+        }
+    } while (qv_lit(&j, ','));
+    return count;
+}
+
+static void qv_viewport(quiver_mod *m, const char *body, size_t n) {
+    const char *vs, *ve;
+    char orientation[24], hand[8], free_names[QV_VP_REGIONS][16], *json;
+    const char *name_ptrs[QV_VP_REGIONS];
+    quiver_rect free_r[QV_VP_REGIONS], reserved[QV_VP_REGIONS], sz;
+    quiver_viewport v;
+    quiver_on_viewport cb;
+    void *user;
+    int i;
+    size_t vn;
+    EnterCriticalSection(&m->cs);
+    cb = m->on_viewport;
+    user = m->viewport_user;
+    LeaveCriticalSection(&m->cs);
+    if (!cb || !qv_member(body, n, "viewport", &vs, &ve)) return;
+    vn = (size_t)(ve - vs);
+    json = (char *)qv_alloc(vn + 1);
+    if (!json) return;
+    qv_copy(json, vs, vn);
+    qv_zero(&v, sizeof v);
+    orientation[0] = 0;
+    hand[0] = 0;
+    v.json = json;
+    if (vn && *vs == '{') {
+        qv_member_str(vs, vn, "orientation", orientation, sizeof orientation);
+        if (!qv_member_str(vs, vn, "hand", hand, sizeof hand)) qv_copy(hand, "both", 5);
+        {
+            const char *ss, *se;
+            if (qv_member(vs, vn, "screen", &ss, &se)) {
+                qv_js j;
+                j.p = ss;
+                j.end = se;
+                qv_rect_obj(&j, &sz, 0, 0);
+                v.screen_w = sz.w;
+                v.screen_h = sz.h;
+            }
+        }
+        v.scale = qv_member_float(vs, vn, "scale", 1.0f);
+        qv_rect_member(vs, vn, "safe", &v.safe);
+        qv_rect_member(vs, vn, "video", &v.video);
+        v.free_count = qv_rect_list(vs, vn, "free", free_r, free_names);
+        for (i = 0; i < v.free_count; i++) name_ptrs[i] = free_names[i];
+        v.free_names = name_ptrs;
+        v.free = free_r;
+        v.reserved_count = qv_rect_list(vs, vn, "reserved", reserved, 0);
+        v.reserved = reserved;
+    } else {
+        hand[0] = 0;
+    }
+    v.orientation = orientation;
+    v.hand = hand;
+    cb(user, &v);
+    qv_free(json);
+}
+
+static void qv_touch_action(quiver_mod *m, const char *body, size_t n) {
+    char id[QV_ID + 1], phase[12];
+    quiver_on_touch_action cb;
+    void *user;
+    quiver_touch_phase p = QUIVER_TOUCH_PRESS;
+    if (!qv_member_str(body, n, "id", id, sizeof id)) return;
+    if (qv_member_str(body, n, "phase", phase, sizeof phase)) {
+        if (qv_streq(phase, "release")) p = QUIVER_TOUCH_RELEASE;
+        else if (qv_streq(phase, "value")) p = QUIVER_TOUCH_VALUE;
+    }
+    EnterCriticalSection(&m->cs);
+    cb = m->on_touch_action;
+    user = m->touch_action_user;
+    LeaveCriticalSection(&m->cs);
+    if (cb) cb(user, id, p, qv_member_float(body, n, "value", 0), qv_member_float(body, n, "x", -1), qv_member_float(body, n, "y", -1));
+}
+
+/* The SDK thread: the latest layout and contexts, once each (protocol 3.2's `touch`). */
+static int qv_touch_flush(quiver_mod *m, qv_buf *b) {
+    if (!m->caps_touch) return 1;
+    if (m->touch_layout_dirty && InterlockedExchange(&m->touch_layout_dirty, 0)) {
+        b->len = 0; b->over = 0;
+        qv_puts(b, "{\"t\":\"touch_layout\",\"layout\":");
+        EnterCriticalSection(&m->cs);
+        if (m->touch_layout) qv_puts(b, m->touch_layout);
+        LeaveCriticalSection(&m->cs);
+        qv_puts(b, "}");
+        if (!qv_send(m, b)) return 0;
+    }
+    if (m->touch_ctx_dirty && InterlockedExchange(&m->touch_ctx_dirty, 0)) {
+        b->len = 0; b->over = 0;
+        qv_puts(b, "{\"t\":\"touch_context\",\"names\":");
+        EnterCriticalSection(&m->cs);
+        qv_puts(b, m->touch_ctx[0] ? m->touch_ctx : "[]");
+        LeaveCriticalSection(&m->cs);
+        qv_puts(b, "}");
+        if (!qv_send(m, b)) return 0;
+    }
+    return 1;
+}
+
 /* Handle one message from Quiver on the thread that delivers callbacks. */
 static void qv_dispatch(quiver_mod *m, const char *body, size_t n) {
     char t[16];
@@ -937,7 +1208,131 @@ static void qv_dispatch(quiver_mod *m, const char *body, size_t n) {
         if (qv_member_int(body, n, "seq", &seq) && qv_member(body, n, "values", &vs, &ve)) qv_deliver_values(m, vs, ve, seq, 1);
     } else if (qv_streq(t, "action")) {
         qv_action(m, body, n);
+    } else if (qv_streq(t, "viewport")) {
+        qv_viewport(m, body, n);
+    } else if (qv_streq(t, "touch_action")) {
+        qv_touch_action(m, body, n);
     }
+}
+
+/* ---- the ring ---- */
+
+static uint64_t qv_ld64(const volatile char *p) { return (uint64_t)InterlockedCompareExchange64((volatile LONG64 *)p, 0, 0); }
+
+/* Map the ring Quiver made (`ring`): the file at path_win, checked like any file someone else
+ * wrote (magic, layout, size, a mod ring, Quiver's nonce), then published for game threads. */
+static void qv_ring_map(quiver_mod *m, const char *body, size_t n) {
+    char path[1024], nonce[40];
+    WCHAR wpath[1024];
+    HANDLE f, map;
+    LARGE_INTEGER size;
+    char *view;
+    uint32_t slots;
+    int i;
+    if (m->ring || !qv_member_str(body, n, "path_win", path, sizeof path)) return;
+    if (!MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, 1024)) return;
+    f = CreateFileW(wpath, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) return;
+    if (!GetFileSizeEx(f, &size) || size.QuadPart < QV_RING_HDR || size.QuadPart > QV_RING_HDR + 8192 * QV_RING_SLOT) { CloseHandle(f); return; }
+    map = CreateFileMappingW(f, NULL, PAGE_READWRITE, 0, 0, NULL);
+    CloseHandle(f);
+    if (!map) return;
+    view = (char *)MapViewOfFile(map, FILE_MAP_WRITE, 0, 0, 0);
+    if (!view) { CloseHandle(map); return; }
+    slots = *(volatile uint32_t *)(view + 16);
+    if (qv_ld64(view) != QV_RING_MAGIC || *(volatile uint16_t *)(view + 8) != 1 || *(volatile uint16_t *)(view + 10) != QV_RING_HDR ||
+        *(volatile uint16_t *)(view + 12) != QV_RING_SLOT || *(volatile uint32_t *)(view + 20) != 2 || slots < 16 || slots > 8192 ||
+        (slots & (slots - 1)) != 0 || (LONGLONG)QV_RING_HDR + (LONGLONG)slots * QV_RING_SLOT > size.QuadPart)
+        goto bad;
+    if (qv_member_str(body, n, "nonce", nonce, sizeof nonce)) {
+        static const char hexd[] = "0123456789abcdef";
+        for (i = 0; i < 16; i++) {
+            unsigned char b = (unsigned char)view[32 + i];
+            if (nonce[2 * i] != hexd[b >> 4] || nonce[2 * i + 1] != hexd[b & 15]) goto bad;
+        }
+    }
+    m->ring_slots = slots;
+    m->ring_map = map;
+    InterlockedExchangePointer((PVOID volatile *)&m->ring, view); /* publish (full barrier) */
+    return;
+bad:
+    UnmapViewOfFile(view);
+    CloseHandle(map);
+}
+
+/* The connection ended: unpublish the ring, wait (briefly) for writers inside it, unmap. A
+ * writer that doesn't leave within a second keeps the view mapped (leaked, never unmapped
+ * under it). */
+static void qv_ring_unmap(quiver_mod *m) {
+    char *view = (char *)InterlockedExchangePointer((PVOID volatile *)&m->ring, NULL);
+    int i;
+    InterlockedExchange(&m->perf_wanted, 0);
+    if (!view) return;
+    for (i = 0; i < 1000 && m->ring_users; i++) Sleep(i < 10 ? 0 : 1);
+    if (m->ring_users) return;
+    UnmapViewOfFile(view);
+    CloseHandle(m->ring_map);
+    m->ring_map = 0;
+}
+
+/* Append one record (16 words; word 0, the commit, is ours). quiver-perf's protocol:
+ * reserve, claim the slot (CAS from an older lap to ours|BUSY, else drop), write, commit. */
+static void qv_ring_push(quiver_mod *m, const uint64_t *w) {
+    char *view;
+    volatile LONG64 *slot;
+    uint64_t i, want, c;
+    int k;
+    InterlockedIncrement(&m->ring_users);
+    view = (char *)InterlockedCompareExchangePointer((PVOID volatile *)&m->ring, NULL, NULL);
+    if (!view) {
+        InterlockedDecrement(&m->ring_users);
+        InterlockedIncrement(&m->st_dropped);
+        return;
+    }
+    i = (uint64_t)InterlockedExchangeAdd64((volatile LONG64 *)(view + QV_OFF_RESERVE), 1);
+    want = (i + 1) & ~QV_COMMIT_BUSY;
+    slot = (volatile LONG64 *)(view + QV_RING_HDR + (size_t)(i & (uint64_t)(m->ring_slots - 1)) * QV_RING_SLOT);
+    c = (uint64_t)InterlockedCompareExchange64(slot, 0, 0);
+    for (;;) {
+        uint64_t prev;
+        if ((c & QV_COMMIT_BUSY) != 0 || c >= want) {
+            InterlockedExchangeAdd64((volatile LONG64 *)(view + QV_OFF_DROPPED), 1);
+            InterlockedDecrement(&m->ring_users);
+            return;
+        }
+        prev = (uint64_t)InterlockedCompareExchange64(slot, (LONG64)(want | QV_COMMIT_BUSY), (LONG64)c);
+        if (prev == c) break;
+        c = prev;
+    }
+    for (k = 1; k < QV_RING_SLOT / 8; k++) slot[k] = (LONG64)w[k];
+    InterlockedExchange64(slot, (LONG64)want); /* commit, after the words (full barrier) */
+    InterlockedDecrement(&m->ring_users);
+}
+
+/* The SDK thread, while connected: ask for the ring once a ring metric was accepted, and
+ * keep its heartbeat (at least once a second). */
+static int qv_ring_tick(quiver_mod *m, qv_buf *b) {
+    int i, nslots = (int)m->nslots, want = 0;
+    LARGE_INTEGER now;
+    if (!m->caps_rings) return 1;
+    if (m->ring) {
+        QueryPerformanceCounter(&now);
+        if (now.QuadPart - m->ring_beat.QuadPart >= m->freq.QuadPart / 2) {
+            m->ring_beat = now;
+            InterlockedExchange64((volatile LONG64 *)(m->ring + QV_OFF_HEARTBEAT), now.QuadPart);
+        }
+        return 1;
+    }
+    if (m->ring_asked) return 1;
+    for (i = 0; i < nslots; i++)
+        if ((m->slots[i].kind == QUIVER_FRAME || m->slots[i].kind == QUIVER_SERIES) && m->slots[i].remote > 0) want = 1;
+    if (!want) return 1;
+    m->ring_asked = 1;
+    b->len = 0; b->over = 0;
+    qv_puts(b, "{\"t\":\"ring_req\",\"bytes\":");
+    qv_put_u64(b, QV_RING_REQ);
+    qv_puts(b, "}");
+    return qv_send(m, b);
 }
 
 /* A message arrived on the SDK thread. Returns 0 to disconnect. */
@@ -949,18 +1344,27 @@ static int qv_received(quiver_mod *m, const char *body, size_t n) {
         int64_t proto = 0;
         m->caps_metrics = qv_has_cap(body, n, "metrics");
         m->caps_options = qv_has_cap(body, n, "options");
+        m->caps_rings = m->caps_metrics && qv_has_cap(body, n, "rings");
+        m->caps_touch = qv_has_cap(body, n, "touch");
         m->proto = qv_member_int(body, n, "proto", &proto) ? (int)proto : 0;
         InterlockedExchange(&m->connected, 1);
         m->backoff = 200;
     } else if (qv_streq(t, "metrics_ok")) {
         qv_metrics_ok(m, body, n);
         return 1;
+    } else if (qv_streq(t, "ring")) {
+        if (m->caps_rings) qv_ring_map(m, body, n);
+        return 1;
+    } else if (qv_streq(t, "perf_ctl")) {
+        char on[8];
+        if (qv_member_str(body, n, "rings", on, sizeof on)) InterlockedExchange(&m->perf_wanted, qv_streq(on, "on"));
+        return 1;
     } else if (qv_streq(t, "bye")) {
         /* Quiver refused us (or is going away): come back much later. */
         m->backoff = 30000;
         return 0;
-    } else if (!qv_streq(t, "set") && !qv_streq(t, "action")) {
-        return 1; /* perf_ctl, ring, newer messages: not used by this SDK */
+    } else if (!qv_streq(t, "set") && !qv_streq(t, "action") && !qv_streq(t, "viewport") && !qv_streq(t, "touch_action")) {
+        return 1; /* newer messages: not used by this SDK */
     }
     if (m->flags & QUIVER_POLL) {
         qv_queue(m, &m->inq, body, n);
@@ -989,6 +1393,8 @@ static int qv_flush(quiver_mod *m, qv_buf *b, int force_m) {
         qv_puts(b, "]}");
         if (!qv_send(m, b)) return 0;
     }
+    /* touch (3.2): the latest layout and contexts */
+    if (!qv_touch_flush(m, b)) return 0;
     /* the stereo layout (protocol 3): the latest word only */
     if (m->stereo_dirty && m->proto >= 3 && InterlockedExchange(&m->stereo_dirty, 0)) {
         static const char *names[] = {"mono", "sbs", "hsbs", "tab", "htab"};
@@ -1126,7 +1532,10 @@ static void qv_session(quiver_mod *m) {
     qv_buf b;
     if (!qv_buf_init(&b, 4096, QV_MAX_FRAME)) return;
     m->rx_len = 0;
-    m->caps_metrics = m->caps_options = 0;
+    m->caps_metrics = m->caps_options = m->caps_rings = m->ring_asked = m->caps_touch = 0;
+    /* a layout and contexts said before hold for the new connection too */
+    if (m->touch_layout) InterlockedExchange(&m->touch_layout_dirty, 1);
+    if (m->touch_ctx[0]) InterlockedExchange(&m->touch_ctx_dirty, 1);
     m->proto = 0;
     /* a stereo layout said before holds for the new connection too */
     if (m->stereo > 0) InterlockedExchange(&m->stereo_dirty, 1);
@@ -1180,6 +1589,7 @@ static void qv_session(quiver_mod *m) {
             }
         }
         if (!qv_flush(m, &b, 0)) goto out;
+        if (!qv_ring_tick(m, &b)) goto out;
     }
     /* stopping: send what's left and say bye (best effort) */
     qv_flush(m, &b, 1);
@@ -1188,6 +1598,8 @@ static void qv_session(quiver_mod *m) {
     qv_send(m, &b);
 out:
     InterlockedExchange(&m->connected, 0);
+    /* Quiver made the ring for this connection; the next one gets a new one. */
+    qv_ring_unmap(m);
     if (pending) {
         CancelIo(m->h);
         GetOverlappedResult(m->h, &rov, &got, TRUE);
@@ -1306,6 +1718,90 @@ void quiver_on_action_cb(quiver_mod *m, quiver_on_action cb, void *user) {
     m->on_action = cb;
     m->action_user = user;
     LeaveCriticalSection(&m->cs);
+}
+
+void quiver_on_viewport_cb(quiver_mod *m, quiver_on_viewport cb, void *user) {
+    if (!QV_LIVE(m)) return;
+    EnterCriticalSection(&m->cs);
+    m->on_viewport = cb;
+    m->viewport_user = user;
+    LeaveCriticalSection(&m->cs);
+}
+
+void quiver_on_touch_action_cb(quiver_mod *m, quiver_on_touch_action cb, void *user) {
+    if (!QV_LIVE(m)) return;
+    EnterCriticalSection(&m->cs);
+    m->on_touch_action = cb;
+    m->touch_action_user = user;
+    LeaveCriticalSection(&m->cs);
+}
+
+int quiver_touch_layout(quiver_mod *m, const char *json) {
+    qv_js j;
+    size_t n = qv_strlen(json);
+    char *copy, *old;
+    if (!json || n == 0 || n > QV_TOUCH_MAX) return 0;
+    /* one JSON object, nothing after it (the bridge would drop a frame that isn't JSON) */
+    j.p = json;
+    j.end = json + n;
+    qv_ws(&j);
+    if (j.p >= j.end || *j.p != '{' || !qv_skip(&j, 0)) return 0;
+    qv_ws(&j);
+    if (j.p != j.end) return 0;
+    if (!QV_LIVE(m)) return 1;
+    copy = qv_strdup(json, QV_TOUCH_MAX);
+    if (!copy) return 0;
+    EnterCriticalSection(&m->cs);
+    old = m->touch_layout;
+    m->touch_layout = copy;
+    LeaveCriticalSection(&m->cs);
+    qv_free(old);
+    InterlockedExchange(&m->touch_layout_dirty, 1);
+    SetEvent(m->wake_ev);
+    return 1;
+}
+
+int quiver_touch_context(quiver_mod *m, const char *names) {
+    char out[QV_TOUCH_CTX];
+    size_t o = 0, i = 0, len = 0;
+    int count = 0;
+    const char *s = names ? names : "";
+    out[o++] = '[';
+    for (;;) {
+        char c = s[i];
+        if (c == ',' || c == 0) {
+            /* trim the name s[i - len .. i) */
+            size_t a = i - len, b = i;
+            while (a < b && (s[a] == ' ' || s[a] == '\t')) a++;
+            while (b > a && (s[b - 1] == ' ' || s[b - 1] == '\t')) b--;
+            if (b > a) {
+                size_t k;
+                if (b - a > 48 || ++count > 16 || o + (b - a) + 4 >= sizeof out) return 0;
+                for (k = a; k < b; k++) {
+                    char ch = s[k];
+                    if (!((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '.' || ch == '-')) return 0;
+                }
+                if (count > 1) out[o++] = ',';
+                out[o++] = '"';
+                for (k = a; k < b; k++) out[o++] = s[k];
+                out[o++] = '"';
+            }
+            len = 0;
+            if (c == 0) break;
+        } else {
+            len++;
+        }
+        i++;
+    }
+    out[o++] = ']';
+    out[o] = 0;
+    if (!QV_LIVE(m)) return 1;
+    EnterCriticalSection(&m->cs);
+    qv_copy(m->touch_ctx, out, o + 1);
+    LeaveCriticalSection(&m->cs);
+    InterlockedExchange(&m->touch_ctx_dirty, 1);
+    SetEvent(m->wake_ev);
+    return 1;
 }
 
 int quiver_handle_option(quiver_mod *m, const char *id) {
@@ -1444,6 +1940,7 @@ void quiver_close(quiver_mod *m) {
     qv_free(m->slots); qv_free(m->opts); qv_free(m->vals); qv_free(m->marks); qv_free(m->rx); qv_free(m->rtmp); qv_free(m->wbuf);
     qv_buf_free(&m->outq); qv_buf_free(&m->inq); qv_buf_free(&m->rej);
     qv_free(m->schema);
+    qv_free(m->touch_layout);
     qv_free(m);
 }
 
@@ -1601,22 +2098,46 @@ int64_t quiver_now(void) {
     return c.QuadPart;
 }
 
+/* The record's metric index, or 0 (drop): the slot's kind and Quiver's 1-based index. */
+static LONG qv_ring_index(quiver_mod *m, quiver_metric h, int kind) {
+    qv_slot *s = qv_slot_of(m, h, kind);
+    LONG r = s ? s->remote : 0;
+    return r > 0 && r <= QV_MAX_METRICS ? r : 0;
+}
+
 void quiver_frame_submit(quiver_mod *m, quiver_metric h, const quiver_frame *fr) {
-    (void)h;
-    (void)fr;
-    if (QV_LIVE(m)) InterlockedIncrement(&m->st_dropped);
+    uint64_t w[QV_RING_SLOT / 8];
+    LONG idx;
+    int nf, k;
+    if (!QV_LIVE(m)) return;
+    idx = qv_ring_index(m, h, QUIVER_FRAME);
+    if (!idx || !fr || !m->ring) { InterlockedIncrement(&m->st_dropped); return; }
+    nf = fr->nfields < 0 ? 0 : fr->nfields > 12 ? 12 : fr->nfields;
+    w[0] = 0;
+    /* metric u16, flags u8 (REAL/GENERATED/NOFG only), nfields u8, swapchain u32 */
+    w[1] = (uint64_t)(uint16_t)idx | ((uint64_t)(fr->flags & 7u) << 16) | ((uint64_t)(unsigned)nf << 24) | ((uint64_t)fr->swapchain << 32);
+    w[2] = fr->key;
+    w[3] = (uint64_t)fr->t;
+    for (k = 0; k < 12; k++) w[4 + k] = k < nf ? (uint64_t)fr->f[k] : 0;
+    qv_ring_push(m, w);
 }
 
 void quiver_sample(quiver_mod *m, quiver_metric h, int64_t t_qpc, double value) {
-    (void)h;
-    (void)t_qpc;
-    (void)value;
-    if (QV_LIVE(m)) InterlockedIncrement(&m->st_dropped);
+    uint64_t w[QV_RING_SLOT / 8];
+    LONG idx;
+    int k;
+    if (!QV_LIVE(m)) return;
+    idx = qv_ring_index(m, h, QUIVER_SERIES);
+    if (!idx || !m->ring || !(value == value)) { InterlockedIncrement(&m->st_dropped); return; }
+    for (k = 0; k < 16; k++) w[k] = 0;
+    w[1] = (uint64_t)(uint16_t)idx | ((uint64_t)1 << 24); /* nfields 1 */
+    w[3] = (uint64_t)t_qpc;
+    qv_copy(&w[4], &value, sizeof value); /* f[0]: the double's bits */
+    qv_ring_push(m, w);
 }
 
 int quiver_perf_wanted(const quiver_mod *m) {
-    (void)m;
-    return 0;
+    return QV_LIVE(m) && m->ring && m->perf_wanted ? 1 : 0;
 }
 
 void quiver_get_stats(const quiver_mod *m, quiver_stats *out) {
