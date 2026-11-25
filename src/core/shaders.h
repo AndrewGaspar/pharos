@@ -21,6 +21,7 @@ enum class ShaderClass : uint8_t {
   Skinning,     // character skinning CS ("SkinningPassCompute_cbuffer"); counted for NPC load stats
   UiSprite, UiPlain, UiRichText, UiTourIntro,  // Origins UI sprite/text shader permutations
   CamEffect,    // PS/CS with its own copy of the camera (SSR, fog, clouds...): per-eye in stereo
+  UiMenu,       // Odyssey's main-menu background (the stereo cursor keeps it at screen depth)
 };
 
 struct ShaderInfo {
@@ -32,7 +33,7 @@ struct ShaderInfo {
 
 // Registry of every shader the game creates, keyed by the D3D object pointer.
 void shaders_register(ID3D11DeviceChild* shader, ShaderKind kind, const void* bytecode, size_t size);
-// Returns 0 if unknown.
+// Returns 0 if unknown. Lock-free.
 uint64_t shader_hash(ID3D11DeviceChild* shader);
 const ShaderInfo* shader_info(ID3D11DeviceChild* shader);
 // Writes <dir>\<hash>.<vs|ps|cs>.dxbc and .asm (via d3dcompiler_47's D3DDisassemble).

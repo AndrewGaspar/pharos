@@ -241,29 +241,66 @@ void transform_screen_pass(F4* c, const Eye& e, float dv) {
 
 // ---- pool --------------------------------------------------------------------------------------
 
+// Deferred contexts' camera constants: a ring of chunks in one buffer, each command list's chunks
+// uploaded (UpdateSubresource) for the eye being drawn just before the list executes.
 constexpr UINT kPoolBytes = 32u << 20;
 constexpr UINT kChunkBytes = 256u << 10;
-// The last 4 MB hold immediate-context slots (2 KB granularity), so an immediate-context bind
-// that outlives a command list's execution is never overwritten by that list's upload.
-constexpr UINT kImmBytes = 4u << 20;
-constexpr UINT kRingBytes = kPoolBytes - kImmBytes;
+constexpr UINT kRingBytes = kPoolBytes;
 
 ID3D11Device* g_dev = nullptr;
 ID3D11DeviceContext* g_imm = nullptr;
 ID3D11Buffer* g_pool = nullptr;
 std::atomic<UINT> g_ring{0};
-UINT g_imm_ring = 0;
-std::mutex g_imm_ring_mutex;
-
-// A slot of the immediate context's ring.
-UINT imm_alloc(UINT bytes) {
-  std::lock_guard lock(g_imm_ring_mutex);
-  if (g_imm_ring + bytes > kImmBytes) g_imm_ring = 0;
-  UINT base = kRingBytes + g_imm_ring;
-  g_imm_ring += bytes;
-  return base;
-}
 bool g_pool_failed = false;
+
+// The immediate context's camera constants go into dynamic buffers of ours, one per binding point,
+// written with Map(WRITE_DISCARD) as the game writes its own: DXVK gives the buffer new storage and
+// nothing is copied on the GPU. They used to be UpdateSubresource calls into the pool, one per
+// bind: ~2,500 transfers a frame (both eyes) between the immediate context's draws in Odyssey,
+// each ending the render pass and adding a barrier (see docs/STEREO.md, Performance). The buffers are a
+// size the camera hooks don't shadow (kPassParamsBytes/kInstanceBytes + 256).
+constexpr int kStages = 6;  // CamStage
+ID3D11Buffer* g_imm_cb[kStages][2] = {};  // [stage][PassParams, InstanceParams]
+struct FxCb {
+  CamStage st;
+  UINT slot, bytes;
+  ID3D11Buffer* buf;
+};
+std::mutex g_fx_cb_mutex;
+std::vector<FxCb> g_fx_cb;  // effect cameras on the immediate context, per (stage, slot, size)
+
+ID3D11Buffer* create_dynamic_cb(UINT bytes) {
+  D3D11_BUFFER_DESC d{};
+  d.ByteWidth = bytes;
+  d.Usage = D3D11_USAGE_DYNAMIC;
+  d.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+  d.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+  ID3D11Buffer* b = nullptr;
+  return SUCCEEDED(g_dev->CreateBuffer(&d, nullptr, &b)) ? b : nullptr;
+}
+
+void release_dynamic_cbs() {
+  for (auto& st : g_imm_cb)
+    for (auto*& b : st)
+      if (b) b->Release(), b = nullptr;
+  std::lock_guard lock(g_fx_cb_mutex);
+  for (auto& f : g_fx_cb) f.buf->Release();
+  g_fx_cb.clear();
+}
+
+// Writes `bytes` of `data` into one of our dynamic buffers through the original Map/Unmap (our
+// hooks would shadow or record it).
+using MapFn = HRESULT(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*, UINT, D3D11_MAP, UINT,
+                                          D3D11_MAPPED_SUBRESOURCE*);
+using UnmapFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*, UINT);
+void write_dynamic_cb(ID3D11DeviceContext* ctx, ID3D11Buffer* buf, const void* data, UINT bytes) {
+  auto map = reinterpret_cast<MapFn>(original(ctx, vt::Context_Map));
+  auto unmap = reinterpret_cast<UnmapFn>(original(ctx, vt::Context_Unmap));
+  D3D11_MAPPED_SUBRESOURCE m{};
+  if (FAILED(map(ctx, buf, 0, D3D11_MAP_WRITE_DISCARD, 0, &m)) || !m.pData) return;
+  memcpy(m.pData, data, bytes);
+  unmap(ctx, buf, 0);
+}
 
 struct Chunk {
   struct RigSlot {
@@ -418,7 +455,7 @@ bool shadow_size(ID3D11Resource* res, UINT* size) {
 // ---- statistics --------------------------------------------------------------------------------
 
 std::atomic<uint64_t> st_pass_main{0}, st_pass_screen{0}, st_pass_other{0}, st_inst_main{0}, st_inst_other{0}, st_nodata{0},
-    st_uploads{0}, st_upload_bytes{0}, st_fx_draws{0}, st_fx_moved{0}, st_fx_nodata{0}, st_fx_nomatch{0}, st_fx_cross{0};
+    st_uploads{0}, st_upload_bytes{0}, st_imm_writes{0}, st_fx_draws{0}, st_fx_moved{0}, st_fx_nodata{0}, st_fx_nomatch{0}, st_fx_cross{0};
 
 // Copies the slot data into a chunk of this context (new chunk if full). Returns the pool offset.
 UINT put_slot(CamCtx* cs, const void* l, const void* r, UINT size) {
@@ -445,6 +482,20 @@ void upload_chunk(ID3D11DeviceContext* imm, const Chunk& ch, int eye) {
   imm->UpdateSubresource(g_pool, 0, &b, bytes, 0, 0);
   st_uploads.fetch_add(1, std::memory_order_relaxed);
   st_upload_bytes.fetch_add(ch.used, std::memory_order_relaxed);
+}
+
+// An immediate-context bind's constants (a one-slot chunk at offset 0) into its dynamic buffer.
+void upload_imm(ID3D11DeviceContext* imm, ID3D11Buffer* buf, const Chunk& ch, int eye) {
+  const uint8_t* bytes = ch.eye[eye].data();
+  thread_local std::vector<uint8_t> projected;
+  if (const auto* view = rig::replay_view(); view && !ch.rig_slots.empty()) {
+    projected.assign(bytes, bytes + ch.used);
+    for (const auto& slot : ch.rig_slots)
+      rig::project(slot.kind, projected.data() + slot.offset, *view, slot.depth_a, slot.depth_b);
+    bytes = projected.data();
+  }
+  write_dynamic_cb(imm, buf, bytes, ch.used);
+  st_imm_writes.fetch_add(1, std::memory_order_relaxed);
 }
 
 // ---- effect cameras ----------------------------------------------------------------------------
@@ -872,6 +923,7 @@ void cam_init(ID3D11Device* dev, ID3D11DeviceContext* imm) {
   g_imm = imm;
   if (g_pool) g_pool->Release();
   g_pool = nullptr;
+  release_dynamic_cbs();
   g_pool_failed = false;
 }
 
@@ -883,6 +935,11 @@ void create_pool() {
   d.Usage = D3D11_USAGE_DEFAULT;
   d.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
   HRESULT hr = dev->CreateBuffer(&d, nullptr, &g_pool);
+  for (auto& st : g_imm_cb) {
+    st[0] = create_dynamic_cb(kPassParamsBytes + 256);
+    st[1] = create_dynamic_cb(kInstanceBytes + 256);
+    if (!st[0] || !st[1]) hr = E_FAIL;
+  }
   g_pool_failed = FAILED(hr);
   ACO_LOG("stereo: camera constant pool %u MB: 0x%08lx", kPoolBytes >> 20, hr);
 }
@@ -953,6 +1010,7 @@ unsigned cam_filter(ID3D11DeviceContext* ctx, CamStage stage, UINT start, UINT n
   // for it in Map): the immediate context's uploads happen after the loop.
   std::unique_lock cs_lock(cs->mutex);
   std::shared_ptr<Chunk> imm_up[16];
+  ID3D11Buffer* imm_buf[16];
   int n_up = 0;
   unsigned mask = 0;
   const Config& cfg = config();
@@ -1110,18 +1168,22 @@ unsigned cam_filter(ID3D11DeviceContext* ctx, CamStage stage, UINT start, UINT n
     }
     (void)nreg;
     UINT poff;
+    ID3D11Buffer* target = g_pool;
     if (ctx == g_imm) {
-      // Immediate context: the bind takes effect now; upload the left eye's version right away
-      // and have the replay upload the right eye's before its copy of this bind.
+      // Immediate context: the bind takes effect now; write the left eye's version into this
+      // binding point's dynamic buffer right away, and have the replay write the right eye's
+      // before its copy of this bind.
       auto ch = std::make_shared<Chunk>();
       UINT bytes = 256 * ((size + 255) / 256);
-      ch->base = imm_alloc(bytes);
+      ch->base = 0;
       ch->eye[0].resize(bytes);
       ch->eye[1].resize(bytes);
       memcpy(ch->eye[0].data(), l, size);
       memcpy(ch->eye[1].data(), r, size);
       ch->used = UINT(ch->eye[0].size());
-      poff = ch->base;
+      poff = 0;
+      target = g_imm_cb[stage][slot == kPassSlot ? 0 : 1];
+      imm_buf[n_up] = target;
       imm_up[n_up++] = std::move(ch);
     } else {
       poff = put_slot(cs, l, r, size);
@@ -1136,7 +1198,7 @@ unsigned cam_filter(ID3D11DeviceContext* ctx, CamStage stage, UINT start, UINT n
       }
       if (b > 0) chunk->rig_slots.push_back({poff - chunk->base, kind, a, b});
     }
-    out_buf[i] = g_pool;
+    out_buf[i] = target;
     out_first[i] = poff / 16;
     out_num[i] = ((size + 255) / 256) * 16;
     mask |= 1u << i;
@@ -1144,9 +1206,10 @@ unsigned cam_filter(ID3D11DeviceContext* ctx, CamStage stage, UINT start, UINT n
   cs_lock.unlock();
   for (int u = 0; u < n_up; ++u) {
     std::shared_ptr<Chunk> ch = imm_up[u];
-    upload_chunk(g_imm, *ch, stereo_eye());
+    ID3D11Buffer* buf = imm_buf[u];
+    upload_imm(g_imm, buf, *ch, stereo_eye());
     if (g_rec_on.load(std::memory_order_relaxed))
-      rec_push([ch](ID3D11DeviceContext* c) { upload_chunk(c, *ch, 1); }, RecKind::Upload);
+      rec_push([ch, buf](ID3D11DeviceContext* c) { upload_imm(c, buf, *ch, 1); }, RecKind::Upload);
   }
   return mask;
 }
@@ -1196,14 +1259,24 @@ void cam_register_effect(ID3D11DeviceChild* sh, uint64_t hash, const void* bc, s
 }
 
 namespace {
-// Immediate context: a slot of the immediate ring holding this eye's version, uploaded now.
-UINT imm_slot(const uint8_t* data, UINT bytes) {
-  UINT base = imm_alloc(bytes);
-  D3D11_BOX bx{base, 0, 0, base + bytes, 1, 1};
-  g_imm->UpdateSubresource(g_pool, 0, &bx, data, 0, 0);
-  st_uploads.fetch_add(1, std::memory_order_relaxed);
-  st_upload_bytes.fetch_add(bytes, std::memory_order_relaxed);
-  return base;
+// Immediate context: this binding point's dynamic buffer, holding this eye's version, written now.
+// (The replay runs the draw's hook again for the right eye.)
+ID3D11Buffer* imm_fx_buffer(CamStage st, UINT slot, const uint8_t* data, UINT bytes) {
+  ID3D11Buffer* buf = nullptr;
+  {
+    std::lock_guard lock(g_fx_cb_mutex);
+    for (const FxCb& f : g_fx_cb)
+      if (f.st == st && f.slot == slot && f.bytes == bytes) buf = f.buf;
+  }
+  if (!buf) {
+    buf = create_dynamic_cb(bytes);
+    if (!buf) return nullptr;
+    std::lock_guard lock(g_fx_cb_mutex);
+    g_fx_cb.push_back({st, slot, bytes, buf});
+  }
+  write_dynamic_cb(g_imm, buf, data, bytes);
+  st_imm_writes.fetch_add(1, std::memory_order_relaxed);
+  return buf;
 }
 }  // namespace
 
@@ -1314,8 +1387,16 @@ void cam_effect_begin(ID3D11DeviceContext* ctx, CamStage st, ID3D11DeviceChild* 
       bd.b->Release();
       continue;
     }
-    if (imm) poff[i] = imm_slot(stereo_eye() ? rb[i].data() : lb[i].data(), pbytes[i]);
-    set_cb(ctx, st, bd.sl->slot, g_pool, poff[i] / 16, pbytes[i] / 16);
+    ID3D11Buffer* target = g_pool;
+    if (imm) {
+      target = imm_fx_buffer(st, bd.sl->slot, stereo_eye() ? rb[i].data() : lb[i].data(), pbytes[i]);
+      if (!target) {
+        bd.b->Release();
+        continue;
+      }
+      poff[i] = 0;
+    }
+    set_cb(ctx, st, bd.sl->slot, target, poff[i] / 16, pbytes[i] / 16);
     fx->s[fx->n++] = {st, bd.sl->slot, bd.b, bd.first, bd.num};  // keeps the reference until cam_effect_end
     st_fx_moved.fetch_add(1, std::memory_order_relaxed);
   }
@@ -1497,10 +1578,11 @@ void cam_on_present(bool stereo_on) {
     ACO_LOG("stereo: effect cameras/frame: draws %.1f, buffers moved %.1f (written on another context %.1f), no data %.1f, fields not the main camera %.1f",
             st_fx_draws.exchange(0) / 300.0, st_fx_moved.exchange(0) / 300.0, st_fx_cross.exchange(0) / 300.0,
             st_fx_nodata.exchange(0) / 300.0, st_fx_nomatch.exchange(0) / 300.0);
-    ACO_LOG("stereo: camera binds/frame: PassParams main %.0f screen %.0f other %.0f, InstanceParams main %.0f other %.0f, no data %.0f; uploads %.0f (%.2f MB)",
+    ACO_LOG("stereo: camera binds/frame: PassParams main %.0f screen %.0f other %.0f, InstanceParams main %.0f other %.0f, no data %.0f; "
+            "command-list uploads %.0f (%.2f MB), immediate-context writes %.0f",
             st_pass_main.exchange(0) / 300.0, st_pass_screen.exchange(0) / 300.0, st_pass_other.exchange(0) / 300.0, st_inst_main.exchange(0) / 300.0,
             st_inst_other.exchange(0) / 300.0, st_nodata.exchange(0) / 300.0, st_uploads.exchange(0) / 300.0,
-            st_upload_bytes.exchange(0) / 300.0 / 1048576.0);
+            st_upload_bytes.exchange(0) / 300.0 / 1048576.0, st_imm_writes.exchange(0) / 300.0);
   }
 }
 

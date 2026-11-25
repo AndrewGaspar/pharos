@@ -20,7 +20,8 @@ void cursor_note_flat_menu();
 void cursor_set_active(bool on);  // at Present, like g_cam_on
 bool cursor_ready(ID3D11Device* dev);
 bool cursor_needs_depth();
-// Only the indexed indirect UI batch contains the cursor.
+// Only the indexed indirect UI batch contains the cursor. The caller asks only when the bound pixel
+// shader is classed UiSprite (the cursor's) or UiMenu (Odyssey's menu background).
 enum class CursorDraw { Game, Hide, Capture };
 CursorDraw cursor_prepare(ID3D11DeviceContext* ctx, ID3D11Buffer* args, UINT off);
 void cursor_save_left(ID3D11DeviceContext* imm);

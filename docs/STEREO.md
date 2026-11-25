@@ -78,6 +78,9 @@ So while stereo runs:
    `k = m00 d / Zc`, giving zero disparity at Zc.
 3. **Uploads pick the eye.** Before a command list executes, its slots get the version of the eye
    being drawn: the left eye for the game's own submission, the right eye for the replay.
+   Binds made on the immediate context itself don't use the pool: each binding point (stage and
+   slot) has a dynamic buffer of ours, written with `Map(WRITE_DISCARD)` at the bind (the left
+   eye) and again by the replay (the right eye). See Performance for why.
 
 The data comes from the same kind of cached shadow (`Map(WRITE_DISCARD)` of those buffer sizes, any
 context).
@@ -256,6 +259,65 @@ detects a stereo output at swapchain creation, disables frame generation for the
 eye's cost is GPU work plus DXVK's CS thread executing the lists again. At 1080p output, DLSS costs
 about half of the 2560x1600 numbers per eye, so 1080p60 at DLSS Performance holds where mono runs
 ~100 fps. In dense crowds (CPU-bound mono ~55 fps) it won't.
+
+### Odyssey (Aegis): stereo at a fifth of mono, and why
+
+The user's RTX 5070 Laptop ran Odyssey's built-in benchmark (High, 1920x1080, 58% render scale,
+hsbs) at 26 fps average in stereo against 133 fps in mono, with the GPU 23–39% busy at half
+clocks. Reproduced on rayblaster (RTX 5090, 1280x720, 66.7% render scale, real clock, no fps cap),
+same session, stereo toggled live: benchmark 35 fps stereo (game CPU 32 ms, GPU 23 ms) against
+193 fps mono (5 ms, 5 ms). Three causes, found with live A/B toggles and a temporary per-hook TSC
+profiler (thread time summed per frame, not kept in the tree):
+
+1. **The stereo cursor's check at every indirect draw (CPU, the largest).** With `cursor=depth`,
+   `cursor_prepare` ran at all ~18,000 `DrawIndexedInstancedIndirect` calls per frame, on every
+   recording thread. Each read the bound VS and PS and looked up two shader hashes under the
+   registry's shared lock: ~3 µs a lookup with eight threads contending, **91 ms of thread time per
+   frame**. Live in the world: 37 fps with `cursor=depth`, 70 fps with `cursor=game`. Now the hook
+   asks only when the bound pixel shader is classed `UiSprite` (the cursor's) or `UiMenu` (Odyssey's
+   menu background, the flat-menu test), and `shader_hash` is a lock-free table: 0.02 ms per frame.
+2. **Immediate-context camera uploads split the GPU work (GPU).** Each redirected `PassParams` /
+   `InstanceParams` bind on the immediate context was an `UpdateSubresource` into the pool: ~800
+   binds per eye per frame in Odyssey, ~2,500 transfers a frame counting the replay's (Origins'
+   immediate context does far less), each between draws, so DXVK ends the render pass and adds a
+   barrier. Stereo with the replay skipped entirely (`[stereo] skip=draw,dispatch,copy,clear,
+   upload,execute`) was still GPU-bound at 69 fps against 112 fps mono. These binds now go to one dynamic buffer per binding point, written with
+   `Map(WRITE_DISCARD)` (renamed by DXVK, no GPU copy): the same skip test became CPU-bound at 86 fps,
+   and full stereo went from 37 to 53 fps with mono at 112–115 (same session conditions).
+   Command lists keep the pool (~80 uploads a frame, between lists).
+3. **Recorded uploads held the recorder's lock while copying (CPU).** `rec_unmap` copied each
+   mapped upload into the real mapping, a mirror and a fresh heap block under the lock the render
+   thread takes for every recorded call; Odyssey uploads two 3–4 MB buffers a frame. The copies now
+   run outside the lock, discards no longer refresh the mirror (it's refreshed lazily before a
+   `NO_OVERWRITE` map), the changed range of a `NO_OVERWRITE` upload is found a block at a time, and
+   large blocks are reused: 4.5 → 1.2 ms of thread time per frame. Learning frames (temporal state)
+   also read the bound views before taking their lock (they cost 100–170 ms each in the benchmark).
+
+Zero separation after the changes: L/R difference 0.21/255 in Odyssey, 0.31/255 in Origins (Giza,
+Discovery Tour), the same noise level as before.
+
+**Measured after** (rayblaster, Kassandra standing on the cliff path of the user's story save,
+1280x720, uncapped, real clock; another Odyssey lab instance shared the GPU for most of the session,
+so pairs were taken back to back and mono varies with its load):
+
+| build | GPU | mono | stereo | stereo / mono |
+|---|---|---|---|---|
+| before | shared | 135–144 fps | 35.5–36.6 fps (CPU-bound, Reflex sleep 0.3 ms) | 0.25 |
+| after | shared | 110–122 fps | 51–57 fps (GPU-bound, Reflex sleep 4.5–6.4 ms) | 0.46 |
+| after | to itself | 183–187 fps (Reflex sleep 0.2–0.3 ms) | 82–83 fps (Reflex sleep 0.2 ms) | 0.45 |
+
+`cursor=game` and `cursor=depth` now run at the same rate (81.7 and 82.4 fps). With the GPU to itself both modes are CPU-bound at this resolution on the 5090; on the laptop GPU
+(mono GPU 8 ms a frame) stereo should land near half of mono, GPU-bound. Not yet re-measured on
+the laptop or with the benchmark.
+
+`perf: reflex sleep` in the log tells the two limits apart: near 0 ms the frame is CPU-bound, several
+ms means the GPU is the limit. The remaining stereo cost on the CPU is the replay (~2.9 ms for ~5,000
+calls) and the camera redirection on the recording threads (~5 ms of thread time spread over them).
+
+**"PassParams main 0" in Odyssey's log** appears only on the benchmark's results screen, where the
+game caps itself at 10 fps (Reflex sleep ~83 ms in mono too) and the scene behind the panel isn't a
+main view. During the benchmark itself ~570 main-view `PassParams` and ~5,000 `InstanceParams` binds
+are redirected per frame (the user's log, 23:05).
 
 ## Predator Bow and tracked markers
 

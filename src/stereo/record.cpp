@@ -597,10 +597,14 @@ namespace {
 // it into the real mapping: one fast write. The shadow is kept per (resource, subresource) along
 // with a mirror of what the real buffer holds, so a WRITE_NO_OVERWRITE map copies (and records)
 // only the bytes that changed.
+//
+// The copies run outside g_mutex: the render thread takes it for every call it records, and a
+// streaming thread's multi-megabyte upload held it for a millisecond or more (Odyssey).
 struct MapShadow {
   Ref<ID3D11Resource> res;
   std::vector<uint8_t> s;  // what the game writes into
   std::vector<uint8_t> m;  // mirror of the real mapping's contents
+  bool m_is_s = false;     // a discard left the real mapping equal to s: m is refreshed lazily
   uint64_t epoch = 0;
   uint64_t last_frame = 0;
 };
@@ -621,6 +625,47 @@ std::condition_variable g_uploaded;
 unsigned g_finishing_maps = 0;
 std::atomic<unsigned> g_detached{0};
 std::map<std::pair<ID3D11Resource*, UINT>, OpenMap> g_open;
+
+// Recorded upload data. Large blocks are reused from frame to frame: Odyssey uploads two 3-4 MB
+// buffers a frame, and fresh allocations of that size cost page faults every frame.
+constexpr size_t kPooledBlob = 64 * 1024;
+constexpr size_t kBlobPoolBytes = 64 * 1024 * 1024;
+std::mutex g_blob_mutex;
+std::vector<std::vector<uint8_t>*> g_blob_pool;
+size_t g_blob_pool_bytes = 0;
+
+void recycle_blob(std::vector<uint8_t>* v) {
+  if (v->capacity() >= kPooledBlob) {
+    std::lock_guard lock(g_blob_mutex);
+    if (g_blob_pool_bytes + v->capacity() <= kBlobPoolBytes) {
+      g_blob_pool_bytes += v->capacity();
+      g_blob_pool.push_back(v);
+      return;
+    }
+  }
+  delete v;
+}
+
+std::shared_ptr<std::vector<uint8_t>> make_blob(const uint8_t* p, size_t n) {
+  std::vector<uint8_t>* v = nullptr;
+  if (n >= kPooledBlob) {
+    std::lock_guard lock(g_blob_mutex);
+    size_t best = g_blob_pool.size();
+    for (size_t i = 0; i < g_blob_pool.size(); ++i)
+      if (g_blob_pool[i]->capacity() >= n &&
+          (best == g_blob_pool.size() || g_blob_pool[i]->capacity() < g_blob_pool[best]->capacity()))
+        best = i;
+    if (best < g_blob_pool.size()) {
+      v = g_blob_pool[best];
+      g_blob_pool_bytes -= v->capacity();
+      g_blob_pool[best] = g_blob_pool.back();
+      g_blob_pool.pop_back();
+    }
+  }
+  if (!v) v = new std::vector<uint8_t>();
+  v->assign(p, p + n);
+  return std::shared_ptr<std::vector<uint8_t>>(v, recycle_blob);
+}
 
 size_t map_size(ID3D11Resource* res, UINT sub, const D3D11_MAPPED_SUBRESOURCE& m) {
   UINT w, h, d;
@@ -651,6 +696,7 @@ bool rec_map(ID3D11Resource* res, UINT sub, D3D11_MAP type, UINT flags, D3D11_MA
     sh.res = Ref<ID3D11Resource>(res);
     sh.s.assign(size, 0);
     sh.m.assign(size, 0);
+    sh.m_is_s = false;
     sh.epoch = g_epoch;
     // The game may rely on what it wrote earlier (NO_OVERWRITE appends): start from the real
     // contents (one slow read, once per buffer).
@@ -658,6 +704,9 @@ bool rec_map(ID3D11Resource* res, UINT sub, D3D11_MAP type, UINT flags, D3D11_MA
       memcpy(sh.s.data(), m->pData, size);
       sh.m = sh.s;
     }
+  } else if (type == D3D11_MAP_WRITE_NO_OVERWRITE && sh.m_is_s) {
+    memcpy(sh.m.data(), sh.s.data(), size);  // before the game changes s
+    sh.m_is_s = false;
   }
   sh.last_frame = g_frame_no;
   g_open[{res, sub}] =
@@ -682,40 +731,56 @@ D3D11_MAP rec_detached_type(ID3D11Resource* res, UINT sub, bool begin_commit) {
 }
 
 bool rec_unmap(ID3D11Resource* res, UINT sub, bool notify, void* destination) {
-  std::lock_guard lock(g_mutex);
-  auto it = g_open.find({res, sub});
-  if (it == g_open.end()) return false;
-  if (!it->second.real)
-    notify = true;  // Counted before the native commit began.
-  else if (notify)
-    ++g_finishing_maps;
-  OpenMap o = it->second;
-  g_open.erase(it);
-  if (!o.real) {
-    --g_detached;
-    o.real = destination;
+  OpenMap o;
+  MapShadow* shp = nullptr;
+  {
+    std::lock_guard lock(g_mutex);
+    auto it = g_open.find({res, sub});
+    if (it == g_open.end()) return false;
+    if (!it->second.real)
+      notify = true;  // Counted before the native commit began.
+    else if (notify)
+      ++g_finishing_maps;
+    o = it->second;
     if (!o.real) {
-      if (g_cur) g_cur->bad = "failed to commit dynamic upload";
+      --g_detached;
+      o.real = it->second.real = destination;
+      if (!o.real) {
+        g_open.erase(it);
+        if (g_cur) g_cur->bad = "failed to commit dynamic upload";
+        return notify;
+      }
+    }
+    auto sit = g_shadows.find({res, sub});
+    if (sit == g_shadows.end()) {
+      g_open.erase(it);
       return notify;
     }
+    // The entry stays in g_open until the copies are done: the shadow isn't dropped meanwhile
+    // (rec_start keeps open ones), and a Present in between sees the upload as unfinished.
+    shp = &sit->second;
   }
-  auto sit = g_shadows.find({res, sub});
-  if (sit == g_shadows.end()) return notify;
-  MapShadow& sh = sit->second;
+  MapShadow& sh = *shp;  // this (resource, subresource) is the caller's until its Unmap returns
   size_t lo = 0, hi = o.size;
+  const uint8_t* a = sh.s.data();
   if (o.type == D3D11_MAP_WRITE_NO_OVERWRITE) {
-    // Changed range against the mirror.
-    const uint8_t* a = sh.s.data();
+    // Changed range against the mirror, compared a block at a time.
     const uint8_t* b = sh.m.data();
+    constexpr size_t kBlock = 256;
+    while (hi - lo >= kBlock && !memcmp(a + lo, b + lo, kBlock)) lo += kBlock;
     while (lo < hi && a[lo] == b[lo]) ++lo;
+    while (hi - lo >= kBlock && !memcmp(a + hi - kBlock, b + hi - kBlock, kBlock)) hi -= kBlock;
     while (hi > lo && a[hi - 1] == b[hi - 1]) --hi;
   }
   if (hi > lo) {
-    memcpy(static_cast<uint8_t*>(o.real) + lo, sh.s.data() + lo, hi - lo);
-    memcpy(sh.m.data() + lo, sh.s.data() + lo, hi - lo);
+    memcpy(static_cast<uint8_t*>(o.real) + lo, a + lo, hi - lo);
+    if (o.type == D3D11_MAP_WRITE_NO_OVERWRITE) memcpy(sh.m.data() + lo, a + lo, hi - lo);
   }
+  if (o.type == D3D11_MAP_WRITE_DISCARD) sh.m_is_s = true;
+  auto blob = make_blob(a + lo, hi - lo);
+  std::lock_guard lock(g_mutex);
+  g_open.erase({res, sub});
   if (!g_cur) return notify;
-  auto blob = std::make_shared<std::vector<uint8_t>>(sh.s.begin() + lo, sh.s.begin() + hi);
   g_cur->bytes += hi - lo;
   {
     auto& u = g_cur->uploads[{o.type == D3D11_MAP_WRITE_DISCARD ? 0 : 1, o.size}];

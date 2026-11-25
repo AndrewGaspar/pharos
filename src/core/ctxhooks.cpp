@@ -224,7 +224,13 @@ void STDMETHODCALLTYPE hk_DrawIndexedInstanced(ID3D11DeviceContext* self, UINT a
 }
 void STDMETHODCALLTYPE hk_DrawIndexedInstancedIndirect(ID3D11DeviceContext* self, ID3D11Buffer* buf, UINT off) {
   if (skip_this_draw(self, off)) return;
-  CursorDraw cursor = cursor_prepare(self, buf, off);
+  // The stereo cursor's sprite and Odyssey's menu background, recognised by their pixel shader's
+  // class before any other work: this runs at every indirect draw on every context.
+  CursorDraw cursor = CursorDraw::Game;
+  if (cursor_needs_depth()) {
+    const ShaderClass ps = ps_class(self);
+    if (ps == ShaderClass::UiSprite || ps == ShaderClass::UiMenu) cursor = cursor_prepare(self, buf, off);
+  }
   if (cursor == CursorDraw::Hide) return;
   if (ACO_REC_WANT(self)) rec_draw_indexed_instanced_indirect(buf, off);
   if constexpr (title::origins) geo_count(0, true);

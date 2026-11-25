@@ -204,11 +204,22 @@ void tmp_init(ID3D11Device* dev, ID3D11DeviceContext* imm) {
   g_imm = imm;
 }
 
+// The views are read before taking g_mutex: every context's draws report here while learning, and
+// with the D3D calls under the lock the game's recording threads ran one at a time (learning
+// frames took 100-170 ms in Odyssey's benchmark).
+static void report_accesses(ID3D11DeviceContext* ctx, const AccessList& seen) {
+  if (seen.empty()) return;
+  std::lock_guard lock(g_mutex);
+  if (!g_learn_frame) return;
+  AccessList& l = list_for(ctx);
+  l.insert(l.end(), seen.begin(), seen.end());
+}
+
 void tmp_on_draw(ID3D11DeviceContext* ctx) {
   if (!g_tmp_learning.load(std::memory_order_relaxed)) return;
   if (g_rec_replaying || g_internal) return;  // the replay repeats what was already seen; our own copies
-  std::lock_guard lock(g_mutex);
-  AccessList& l = list_for(ctx);
+  thread_local AccessList l;
+  l.clear();
   add_views<ID3D11ShaderResourceView>(l, 128, false, [&](ID3D11ShaderResourceView** v) { ctx->PSGetShaderResources(0, 128, v); });
   ID3D11RenderTargetView* rtv[8] = {};
   ID3D11DepthStencilView* dsv = nullptr;
@@ -228,15 +239,17 @@ void tmp_on_draw(ID3D11DeviceContext* ctx) {
       add_view(l, v, true);
       v->Release();
     }
+  report_accesses(ctx, l);
 }
 
 void tmp_on_dispatch(ID3D11DeviceContext* ctx) {
   if (!g_tmp_learning.load(std::memory_order_relaxed)) return;
   if (g_rec_replaying || g_internal) return;  // the replay repeats what was already seen; our own copies
-  std::lock_guard lock(g_mutex);
-  AccessList& l = list_for(ctx);
+  thread_local AccessList l;
+  l.clear();
   add_views<ID3D11ShaderResourceView>(l, 128, false, [&](ID3D11ShaderResourceView** v) { ctx->CSGetShaderResources(0, 128, v); });
   add_views<ID3D11UnorderedAccessView>(l, 8, true, [&](ID3D11UnorderedAccessView** v) { ctx->CSGetUnorderedAccessViews(0, 8, v); });
+  report_accesses(ctx, l);
 }
 
 void tmp_on_copy(ID3D11DeviceContext* ctx, ID3D11Resource* dst, ID3D11Resource* src) {

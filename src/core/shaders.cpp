@@ -42,6 +42,41 @@ inline size_t slot_of(ID3D11DeviceChild* p) {
   return ((reinterpret_cast<uintptr_t>(p) >> 4) * 0x9E3779B97F4A7C15ull >> 20) & (kInterestingCap - 1);
 }
 
+// Every shader's hash, in the same lock-free form, for shader_hash() on hot paths. The stereo
+// cursor and marker checks ask for the bound shaders' hashes at draws on every context. Through
+// the shared lock on g_shaders that was ~3 us a call with the game's recording threads
+// contending: 90 ms of thread time per frame in Odyssey (see docs/STEREO.md, Performance).
+constexpr size_t kHashCap = size_t(1) << 17;  // power of two; filled to half at most
+std::atomic<ID3D11DeviceChild*> g_hash_key[kHashCap];
+std::atomic<uint64_t> g_hash_val[kHashCap];
+size_t g_hash_n = 0;                    // under g_mutex
+std::atomic<bool> g_hash_full{false};  // past capacity: lookups that miss fall back to g_shaders
+
+inline size_t hash_slot_of(ID3D11DeviceChild* p) {
+  return ((reinterpret_cast<uintptr_t>(p) >> 4) * 0x9E3779B97F4A7C15ull >> 20) & (kHashCap - 1);
+}
+
+// Under g_mutex.
+void publish_hash(ID3D11DeviceChild* shader, uint64_t hash) {
+  for (size_t i = hash_slot_of(shader);; i = (i + 1) & (kHashCap - 1)) {
+    ID3D11DeviceChild* k = g_hash_key[i].load(std::memory_order_relaxed);
+    if (k == shader) {  // the address of a released shader, reused
+      g_hash_val[i].store(hash, std::memory_order_release);
+      return;
+    }
+    if (!k) {
+      if (g_hash_n >= kHashCap / 2) {
+        g_hash_full.store(true, std::memory_order_release);
+        return;
+      }
+      g_hash_val[i].store(hash, std::memory_order_relaxed);
+      g_hash_key[i].store(shader, std::memory_order_release);
+      ++g_hash_n;
+      return;
+    }
+  }
+}
+
 bool contains(const std::vector<uint8_t>& bc, const char* needle) {
   size_t n = strlen(needle);
   if (bc.size() < n) return false;
@@ -101,6 +136,7 @@ void shaders_register(ID3D11DeviceChild* shader, ShaderKind kind, const void* by
     if (info.hash == 0x49121071b3b9679aULL) info.cls = ShaderClass::UiRichText;
     if (info.hash == 0x9b14ee478f4adcadULL) info.cls = ShaderClass::UiTourIntro;
     if (info.hash == 0xd0e87cc04dcdc27fULL) info.cls = ShaderClass::UiPlain;
+    if (!title::origins && info.hash == 0xafc3de8b425b3010ULL) info.cls = ShaderClass::UiMenu;
   }
   if (info.cls == ShaderClass::CamEffect) cam_register_effect(shader, info.hash, bytecode, size);
   std::unique_lock lock(g_mutex);
@@ -121,6 +157,7 @@ void shaders_register(ID3D11DeviceChild* shader, ShaderKind kind, const void* by
       ACO_LOG("shader %s: classification table full", hex64(info.hash).c_str());
     }
   }
+  publish_hash(shader, info.hash);
   g_shaders[shader] = std::move(info);
 }
 
@@ -147,12 +184,19 @@ const char* shader_class_name(ShaderClass c) {
     case ShaderClass::Culling: return "Culling";
     case ShaderClass::Skinning: return "Skinning";
     case ShaderClass::CamEffect: return "CamEffect";
+    case ShaderClass::UiMenu: return "UI menu background";
   }
   return "?";
 }
 
 uint64_t shader_hash(ID3D11DeviceChild* shader) {
   if (!shader) return 0;
+  for (size_t i = hash_slot_of(shader);; i = (i + 1) & (kHashCap - 1)) {
+    ID3D11DeviceChild* k = g_hash_key[i].load(std::memory_order_acquire);
+    if (k == shader) return g_hash_val[i].load(std::memory_order_acquire);
+    if (!k) break;
+  }
+  if (!g_hash_full.load(std::memory_order_acquire)) return 0;
   std::shared_lock lock(g_mutex);
   auto it = g_shaders.find(shader);
   return it == g_shaders.end() ? 0 : it->second.hash;
