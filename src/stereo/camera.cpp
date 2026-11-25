@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <wrl/client.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <memory>
@@ -1477,10 +1478,25 @@ struct MarkerTargets {
 };
 
 UINT put_targets(CamCtx* cs) {
-  MarkerTarget positions[kMaxMarkerTargets];
-  const size_t n = marker_targets_read(positions);
+  static thread_local MarkerTarget positions[kMaxMarkerSamples];
+  size_t n = marker_targets_read(positions, kMaxMarkerSamples);
   MarkerTargets block{};
   const F4* vp = cs->marker_vp;
+  float eye[3];
+  {
+    std::lock_guard lock(g_main_mutex);
+    memcpy(eye, g_scene_camera.pos, sizeof(eye));
+  }
+  auto range = [&](const MarkerTarget& p) {
+    return std::sqrt((p.x - eye[0]) * (p.x - eye[0]) + (p.y - eye[1]) * (p.y - eye[1]) +
+                     (p.z - eye[2]) * (p.z - eye[2]));
+  };
+  if (n > kMaxMarkerTargets) {
+    // Busy areas track more positions than the shader takes. Keep the nearest.
+    std::nth_element(positions, positions + kMaxMarkerTargets, positions + n,
+                     [&](const MarkerTarget& a, const MarkerTarget& b) { return range(a) < range(b); });
+    n = kMaxMarkerTargets;
+  }
   for (size_t i = 0; i < n; ++i) {
     const auto& p = positions[i];
     auto project = [&](int row) {
@@ -1490,8 +1506,11 @@ UINT put_targets(CamCtx* cs) {
     float w = project(3);
     if (w <= 0.05f) continue;
     const float x = project(0) / w, y = project(1) / w;
-    const float raised_w = w + 2 * vp[3].z;
-    float lift = raised_w > 0.05f ? (project(1) + 2 * vp[1].z) / raised_w - y : 0;
+    // Icons float above their targets: about 2 m in Origins and 2.2 m above
+    // Odyssey's tour stations. Odyssey's allowance covers the banner's top edge.
+    constexpr float kLift = title::origins ? 2.f : 3.f;
+    const float raised_w = w + kLift * vp[3].z;
+    float lift = raised_w > 0.05f ? (project(1) + kLift * vp[1].z) / raised_w - y : 0;
     block.points[block.count++] = {x, y, 1 / w, lift};
   }
   return put_slot(cs, &block, &block, sizeof(block));
@@ -1505,7 +1524,13 @@ bool cam_bind_marker(ID3D11DeviceContext* ctx, MarkerRole role, bool* record_log
   {
     std::lock_guard lock(cs->mutex);
     if (!cs->marker_view || cs->panel) return false;
-    if (cs->marker_screen) {
+    // Odyssey's flat HUD camera also draws icons of tracked targets and their
+    // distance labels. Only geometry that lines up with a visible tracked target
+    // moves (marker shader, mode 4 for icons and 5 for text).
+    const bool hud_tracked = !title::origins && cs->marker_screen && role != MarkerRole::Reticle;
+    if (hud_tracked) {
+      cs->edge_group = false;
+    } else if (cs->marker_screen) {
       const bool follow = cs->edge_group && (role == MarkerRole::Bracket || role == MarkerRole::Logo);
       cs->edge_group = role == MarkerRole::Edge || role == MarkerRole::EdgeText;
       if (!cs->edge_group && !follow && role != MarkerRole::Reticle) return false;
@@ -1513,13 +1538,14 @@ bool cam_bind_marker(ID3D11DeviceContext* ctx, MarkerRole role, bool* record_log
       cs->edge_group = false;
     }
     const bool label = role == MarkerRole::Label;
-    if (label && !cs->logo_batch) return false;
+    if (label && !hud_tracked && !cs->logo_batch) return false;
     *record_logo = role == MarkerRole::Logo && !cs->marker_screen;
     if (!label) cs->logo_batch = *record_logo;
     if (cs->target_offset == UINT(-1)) cs->target_offset = put_targets(cs);
     target_offset = cs->target_offset;
     MarkerView eyes[] = {cs->marker[0], cs->marker[1]};
     if (cs->marker_screen && role == MarkerRole::EdgeText) eyes[0].scale.w = eyes[1].scale.w = -1;
+    if (hud_tracked) eyes[0].scale.w = eyes[1].scale.w = label ? 5 : 4;
     if ((cs->marker_screen || !title::origins) && role == MarkerRole::Reticle) {
       eyes[0].scale.w = eyes[1].scale.w = 2;
       if (title::origins && (eyes[0].scale.y == 0) != (eyes[1].scale.y == 0)) {

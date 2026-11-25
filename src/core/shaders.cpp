@@ -132,6 +132,9 @@ void shaders_register(ID3D11DeviceChild* shader, ShaderKind kind, const void* by
   if (kind == ShaderKind::PS) {
     if (!title::origins && (info.hash == 0x4a6d099e4d40262bULL || info.hash == 0x97091288f72ad57cULL))
       info.cls = ShaderClass::UiSprite;
+    // Odyssey labels: tracked world icons (397fb1a1) and the flat HUD font (6c582fcd).
+    if (!title::origins && (info.hash == 0x397fb1a12b9ec78aULL || info.hash == 0x6c582fcd1f418a97ULL))
+      info.cls = ShaderClass::UiRichText;
     if (info.hash == 0x068233d2886bf2c8ULL || info.hash == 0xaa384ce949239abeULL) info.cls = ShaderClass::UiSprite;
     if (info.hash == 0x49121071b3b9679aULL) info.cls = ShaderClass::UiRichText;
     if (info.hash == 0x9b14ee478f4adcadULL) info.cls = ShaderClass::UiTourIntro;

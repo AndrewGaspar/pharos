@@ -347,7 +347,9 @@ by the UI. At the Sphinx a 53 m tour label had a native billboard depth of 9.27 
 shader associates the sprite with a projected world target and limits its depth to the first
 visible obstruction. It places an obstructed marker just in front of that surface. Screen-edge
 arrows sample the clamped screen position. An unrecognised target uses the visible surface.
-Transparent objects without depth writes cannot be identified from this buffer. The centered
+Transparent objects without depth writes cannot be identified from this buffer.
+If the controllers report more than the shader's 192 positions, each marker pass keeps the
+nearest 192 (established in code; the Odyssey port exceeded the limit in Athens, see PORTS.md). The centered
 compass distance uses the native HUD plane. At 1280×720 in Alexandria, its left-to-right
 displacement matched the compass icon and city name at −4 packed pixels.
 

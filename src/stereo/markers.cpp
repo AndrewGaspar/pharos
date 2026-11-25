@@ -98,11 +98,30 @@ void main(triangle Vertex vs[3], inout TriangleStream<OUTPUT> outStream) {
   mono.x -= scale.x*(scale.z-nativeInvZ);
   float targetInvZ=0, bestError=1e20;
   bool otherSightEye = scale.w == 3;
-  bool reticle = scale.w >= 2;
+  bool reticle = scale.w >= 2 && scale.w < 4;
+  // Odyssey's flat HUD: icons (4) and their labels (5) move only when they line
+  // up with a visible tracked target. Labels sit beside their icons.
+  bool hud = scale.w >= 4;
+  float hudRadius = scale.w == 5 ? 0.15 : 0.06;
+  bool matched = false;
   // The screen-edge font also draws the range below the middle of the compass.
   // Keep that label on its authored HUD plane along with the compass ticks.
-  bool compassLabel = scale.w == -1 && abs(mono.x) < 0.24 && mono.y > 0.77 && mono.y < 0.90;
-  [loop] for (uint t=0; t<numTargets && !reticle; ++t) {
+  // Odyssey's compass, its top-left tour panel and the bottom control hints
+  // stay on the HUD plane as well.
+  bool compassLabel = (scale.w == -1 || hud) && abs(mono.x) < (hud ? 0.36 : 0.24) && mono.y > (hud ? 0.76 : 0.77) &&
+                      mono.y < (hud ? 1.0 : 0.90);
+  compassLabel = compassLabel || (hud && (mono.y < -0.86 || (mono.x < -0.6 && mono.y > 0.78)));
+  float2 ray = mono;
+  [loop] for (uint h=0; h<numTargets && hud && !compassLabel; ++h) {
+    float4 target=targets[h];
+    float2 diff=mono-target.xy;
+    diff.y -= clamp(diff.y,min(0,target.w),max(0,target.w));
+    float error=dot(diff,diff);
+    if (error<bestError && error<hudRadius*hudRadius) {
+      bestError=error; targetInvZ=target.z; matched=true; ray=target.xy;
+    }
+  }
+  [loop] for (uint t=0; t<numTargets && !reticle && !hud; ++t) {
     float4 target=targets[t];
     float2 direction=target.xy;
     if (scale.w <= 0) {
@@ -117,7 +136,6 @@ void main(triangle Vertex vs[3], inout TriangleStream<OUTPUT> outStream) {
     float error=dot(diff,diff);
     if (error<bestError && error<0.045*0.045) { bestError=error; targetInvZ=target.z; }
   }
-  float2 ray = mono;
   ray.x += scale.y*(scale.z-targetInvZ);
   float surface = surfaceInvZ(ray);
   if (reticle) {
@@ -152,6 +170,7 @@ void main(triangle Vertex vs[3], inout TriangleStream<OUTPUT> outStream) {
   }
   float invZ = otherSightEye ? surface : surface > targetInvZ ? surface*1.005 : targetInvZ;
 #ifdef RICH
+  if (!hud) {
 #ifndef LEVEL
   // Use the projected local origin of the whole text mesh so every glyph chooses
   // the same preceding icon, even where the lettering crosses a depth edge.
@@ -173,10 +192,11 @@ void main(triangle Vertex vs[3], inout TriangleStream<OUTPUT> outStream) {
     float dist = dot(delta,delta) + min(0.0025,wDifference*wDifference*0.0004);
     if (dist < best) { best=dist; invZ=anchor.z; }
   }
+  }
 #endif
   [unroll] for (uint i=0;i<3;i++) {
     Vertex v=vs[i];
-    if (!compassLabel && (!reticle || all(abs(mono) < 0.12))) v.p.x += scale.x*(1-v.p.w*scale.z) + scale.y*v.p.w*(scale.z-invZ);
+    if (!compassLabel && (!reticle || all(abs(mono) < 0.12)) && (!hud || matched)) v.p.x += scale.x*(1-v.p.w*scale.z) + scale.y*v.p.w*(scale.z-invZ);
 #ifdef LOGO
     Recorded rec;
     rec.vertex=v;
@@ -351,10 +371,16 @@ MarkerDraw markers_begin(ID3D11DeviceContext* ctx, ShaderClass shader) {
   ctx->VSGetShader(&vs, nullptr, nullptr);
   const auto hash = shader_hash(vs.Get());
   const bool edge = hash == 0x8495d24fffb60308ULL || hash == 0xd8d8858e469845bcULL;
-  const bool sprite = hash == (title::origins ? 0x12b61097a3a0b0e7ULL : 0x8040438b60d002e2ULL);
+  // Odyssey's icon sprites use two vertex shaders with the same outputs. Its
+  // label font has two vertex permutations with Origins' rich text outputs.
+  const bool sprite = title::origins ? hash == 0x12b61097a3a0b0e7ULL
+                                     : hash == 0x8040438b60d002e2ULL || hash == 0xc2d0ef4d50bd3bcfULL;
   const bool two_colors = !title::origins && hash == 0x76b57ce1598793e5ULL;
+  const bool rich_vs = title::origins ? hash == 0x6d0fb2ea896797e3ULL || hash == 0xf4b81a7a619bd7b3ULL
+                                      : hash == 0xec4421bb1ac101d3ULL || hash == 0x0970382431fed6e6ULL ||
+                                            hash == 0xd0a1f52991574ea0ULL;
   if (plain  ? hash != 0xcab2d4126b8ca082ULL
-      : rich ? (hash != 0x6d0fb2ea896797e3ULL && hash != 0xf4b81a7a619bd7b3ULL)
+      : rich ? !rich_vs
              : !edge && !sprite && !two_colors && hash != 0xb1bcca4dff8812c8ULL)
     return MarkerDraw::Game;
   Layout layout = plain ? Plain : rich ? Rich : Sprite;
@@ -400,9 +426,9 @@ MarkerDraw markers_begin(ID3D11DeviceContext* ctx, ShaderClass shader) {
   const auto mask = label_background ? texture_at(ctx, first_atlas + 1) : D3D11_TEXTURE2D_DESC{};
   const bool logo_mask = page(mask, 128, 128, DXGI_FORMAT_BC1_UNORM) ||
                          (shield && page(mask, 512, 512, DXGI_FORMAT_BC1_UNORM));
-  // This Odyssey material also draws the compass and UI panels. Limit the
-  // depth pass to the world-icon atlas identified while scanning with Ikaros.
-  if (!title::origins && !odyssey_reticle && !(bracket && logo_mask)) return MarkerDraw::Game;
+  // Odyssey draws world icons both with the scene camera and on its flat HUD
+  // camera, where the same materials also draw the compass and the panels.
+  // The camera decides which role applies (cam_bind_marker).
   const bool logo = label_background && logo_mask && shaders[plain ? PlainLogo : Logo] && empty_anchors &&
                     anchor_view && stream_available(ctx);
   bool record = false;
