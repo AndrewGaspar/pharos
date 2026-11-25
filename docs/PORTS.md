@@ -58,6 +58,8 @@ Some fine moving edges still double on dev.6. A 3× HDR pan across a coastal sca
 
 The main Aegis build runs the Pharos D3D11 rendering path with Odyssey's texture slots, constant-buffer ranges, projection layout, config file and game settings path. Its default `aegis.ini` enables DLSS SR and 2× FG. To run stereo, set `[stereo] mode=sbs` before launch. The compositor and per-eye temporal histories use the same scene twice per simulation step. Aegis uses Odyssey’s icon controllers to read the world positions of tracked targets.
 
+Aegis 0.1.0-dev.7 carries the two fixes below: stereo at about half the mono frame rate, and Discovery Tour icons, aimed-marker brackets and distance labels at their targets' depth.
+
 Stereo in Aegis dev.6 ran at about a fifth of the mono frame rate (26 against 133 fps in the user's laptop benchmark). The depth cursor checked every indirect draw under a contended lock, and the immediate context's per-eye camera constants were GPU copies between draws. Both are fixed in the shared renderer. On an RTX 5090 at 1280×720, stereo now reaches 0.45 of the mono frame rate, up from 0.25. docs/STEREO.md (Performance) has the measurements.
 
 Odyssey's temporal pass binds color at t85, packed motion at t86, linear depth at t87, the responsive mask at t88, and history at t89–90. The depth converter's second R32F target carries device depth. The CPU upload mirror reads the original b6 jitter during command recording. The motion shader uses the current camera in b2 and previous object projection in b4. The full-frame DLSS evaluation runs once at the geometry draw and the game still writes its own geometry, sky and dither histories. The UI compositor then samples the DLSS reconstruction underneath the HUD.
